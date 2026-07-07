@@ -1,0 +1,15 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    name: business-service
+  datasource:
+    url: jdbc:sqlite:./data/business-service.db
+    driver-class-name: org.sqlite.JDBC
+    username:
+    password:
+
+logging:
+  level:
+    com.example.business: INFO

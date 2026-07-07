@@ -1,0 +1,6 @@
+* text=auto working-tree-encoding=UTF-8
+*.py text working-tree-encoding=UTF-8
+*.md text working-tree-encoding=UTF-8
+*.java text working-tree-encoding=UTF-8
+*.yml text working-tree-encoding=UTF-8
+*.xml text working-tree-encoding=UTF-8
