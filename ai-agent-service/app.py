@@ -1,14 +1,28 @@
 import os
-from datetime import datetime
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
-from agents.conversation_context import build_conversation_context
 from agents.customer_service_agent import CustomerServiceAgent
+from rag.evaluate import evaluate as evaluate_rag
 from repositories.chat_repository import ChatMessageRepository, ChatSessionRepository
-from schemas.intent_schema import AgentReplyRequest, AnalyzeRequest, ToolCallRequest
+from repositories.evaluation_repository import EvaluationRepository
+from schemas.intent_schema import AgentExecutionJob, AgentReplyRequest, AnalyzeRequest, ToolCallRequest
+from services.agent_execution_queue import AgentExecutionQueue
+from services.agent_execution_service import AgentExecutionAccessDenied, AgentExecutionService
+from services.auth_identity_cache import AuthIdentityCache
+from services.resilient_client import ResilienceError, ResilientClient
+from services.runtime_protection import admission_controller, metrics
+from services.observability import HTTP_LATENCY, HTTP_REQUESTS, set_request_context
+from services.observability import current_context, tracer
+from services.stream_event_service import StreamEventService
 from tools.order_tools import OrderTools
 from tools.ticket_tools import TicketTools
 
@@ -18,6 +32,17 @@ order_tools = OrderTools()
 ticket_tools = TicketTools()
 chat_sessions = ChatSessionRepository()
 chat_messages = ChatMessageRepository(chat_sessions)
+evaluation_repository = EvaluationRepository()
+agent_execution_service = AgentExecutionService(
+    agent=agent,
+    chat_sessions=chat_sessions,
+    chat_messages=chat_messages,
+    evaluation_repository=evaluation_repository,
+)
+agent_execution_queue = AgentExecutionQueue()
+stream_event_service = StreamEventService()
+business_client = ResilientClient(downstream="java_business")
+identity_cache = AuthIdentityCache()
 BUSINESS_SERVICE_URL = os.getenv("BUSINESS_SERVICE_URL", "http://localhost:8081")
 AGENT_INTERNAL_SECRET = os.getenv("AGENT_INTERNAL_SECRET", "enterprise-customer-agent-demo-internal-secret")
 HUMAN_SERVICE_START = os.getenv("HUMAN_SERVICE_START", "09:00")
@@ -26,14 +51,43 @@ HUMAN_SERVICE_END = os.getenv("HUMAN_SERVICE_END", "18:00")
 
 @app.on_event("startup")
 def startup_checks() -> None:
-    """服务启动时只检查外部依赖状态，禁止自动建表、建索引或导入知识库。"""
+    """服务启动时只检查外部依赖状态，禁止在线 API 进程承载评测 Worker。"""
     agent.rag.check_startup()
+
+
+@app.middleware("http")
+async def observe_request(request: Request, call_next):
+    """为每个请求注入 Trace ID 并记录延迟，方便跨 API、Worker 与下游服务排障。"""
+    request_id, trace_id = set_request_context(request.headers.get("X-Request-ID"), request.headers.get("X-Trace-ID"))
+    started = time.perf_counter()
+    try:
+        with tracer.start_as_current_span("agent.api.request") as span:
+            span.set_attribute("http.request.method", request.method)
+            span.set_attribute("url.path", request.url.path)
+            span.set_attribute("agent.request_id", request_id)
+            response = await call_next(request)
+    except Exception:
+        metrics.observe(request.url.path, 500, (time.perf_counter() - started) * 1000)
+        HTTP_REQUESTS.labels(request.url.path, request.method, "500").inc()
+        raise
+    metrics.observe(request.url.path, response.status_code, (time.perf_counter() - started) * 1000)
+    HTTP_REQUESTS.labels(request.url.path, request.method, str(response.status_code)).inc()
+    HTTP_LATENCY.labels(request.url.path, request.method).observe(time.perf_counter() - started)
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Trace-ID"] = trace_id
+    return response
 
 
 @app.get("/health")
 def health() -> dict:
     """提供服务存活检查，便于前端、网关或部署平台判断 Agent 服务是否可用。"""
     return {"status": "ok"}
+
+
+@app.get("/metrics", include_in_schema=False)
+def prometheus_metrics() -> PlainTextResponse:
+    """暴露 Prometheus 抓取端点，避免监控采集依赖业务接口。"""
+    return PlainTextResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/api/agent/status")
@@ -46,13 +100,10 @@ def status() -> dict:
 def login(payload: dict[str, Any]) -> dict:
     """代理 Java 业务系统登录接口，让前端只需要访问 Agent 服务。"""
     try:
-        response = httpx.post(f"{BUSINESS_SERVICE_URL}/api/auth/login", json=payload, timeout=5.0)
-        response.raise_for_status()
+        response = business_client.request_sync("POST", f"{BUSINESS_SERVICE_URL}/api/auth/login", json=payload)
         return response.json()
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(status_code=exc.response.status_code, detail=_response_detail(exc.response)) from exc
-    except httpx.RequestError as exc:
-        raise HTTPException(status_code=503, detail=f"业务登录服务不可用：{exc}") from exc
+    except ResilienceError as exc:
+        raise HTTPException(status_code=exc.status_code or 503, detail=exc.safe_message) from exc
 
 
 @app.get("/api/auth/current-user")
@@ -67,95 +118,177 @@ def analyze(payload: AnalyzeRequest) -> dict:
     return agent.analyze(payload.message).model_dump()
 
 
-@app.post("/api/agent/reply")
-def reply(payload: AgentReplyRequest, authorization: str | None = Header(default=None)) -> dict:
-    """执行完整 Agent 回复流程，使用 Java Token 解析出的客户身份驱动查单和建单。"""
+def _execute_reply(payload: AgentReplyRequest, authorization: str | None = None) -> dict:
+    """兼容内部调用的执行入口；核心业务逻辑已迁移到 AgentExecutionService。"""
     current_user_data = _current_login_user(authorization)
-    # 客户身份以后端认证结果为准，忽略前端伪造或过期的 customer_id。
     payload = payload.model_copy(
         update={
             "customer_id": current_user_data["customer_id"],
             "auth_token": _bearer_token(authorization),
         }
     )
+    try:
+        return agent_execution_service.execute(payload)
+    except AgentExecutionAccessDenied as exc:
+        # 保持历史接口的会话归属鉴权语义。
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
-    session = _get_or_create_session(payload)
-    session_id = session["session_id"]
-    route_target = payload.route_target or "ai"
 
-    if route_target == "human":
-        # 用户显式选择发给人工客服时，只补充到人工队列，不触发智能体回答。
-        return _save_manual_handoff_message(session_id, payload, session)
+def _overload_response() -> dict[str, Any]:
+    """在并发槽位耗尽时返回客户安全话术，不等待模型排队造成请求雪崩。"""
+    metrics.mark_degraded()
+    return {
+        "answer": "当前咨询量较大，您的问题已进入人工客服处理队列，请稍后查看处理进度。",
+        "customer_message": "当前咨询量较大，您的问题已进入人工客服处理队列，请稍后查看处理进度。",
+        "decision_type": "human_takeover",
+        "service_status": "排队等待人工处理",
+        "auto_send": False,
+        "need_human": True,
+        "degraded": True,
+        "retry_after": int(os.getenv("AGENT_OVERLOAD_RETRY_AFTER_SECONDS", "10")),
+    }
 
-    pending_action_request = _latest_pending_action_request(session_id)
-    conversation_context = build_conversation_context(
-        messages=chat_messages.list_by_session(session_id),
-        pending_action_request=pending_action_request,
-        selected_order_no=payload.selected_order_no,
-        selected_ticket_no=payload.selected_ticket_no,
-    )
 
-    # 先保存用户原始问题，确保即使 Agent 失败也能追溯会话输入。
-    chat_messages.save(
-        session_no=session_id,
-        sender_type="customer",
-        sender_id=str(payload.customer_id) if payload.customer_id else None,
-        content=payload.message,
-        extra_data={"route_target": route_target},
-    )
+@app.post("/api/agent/reply", response_model=None)
+def reply(payload: AgentReplyRequest, request: Request, authorization: str | None = Header(default=None), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict | JSONResponse:
+    """同步兼容入口只创建/复用可靠任务并短等待，绝不在 API 进程直接执行 Agent。"""
+    current_user = _current_login_user(authorization)
+    if not agent_execution_queue.enabled:
+        return JSONResponse(status_code=503, content=_overload_response() | {"status": "degraded", "queued": False, "error_code": "QUEUE_UNAVAILABLE"})
+    execution_payload = payload.model_copy(update={"customer_id": current_user["customer_id"], "auth_token": _bearer_token(authorization)})
+    request_id = _enqueue_execution_job(execution_payload, authorization, idempotency_key, "sync")
+    deadline = time.monotonic() + float(os.getenv("AGENT_SYNC_WAIT_SECONDS", "3"))
+    while time.monotonic() < deadline:
+        state = agent_execution_queue.get(request_id) or {}
+        if state.get("status") == "SUCCESS":
+            result = dict(state.get("result") or {})
+            result.setdefault("request_id", request_id)
+            result.setdefault("execution_status", "success")
+            return result
+        if state.get("status") in {"DEGRADED", "FAILED", "DEAD_LETTER"}:
+            return JSONResponse(status_code=202, content=_overload_response() | {"request_id": request_id, "status": "degraded", "queued": False, "error_code": state.get("error_code", "AGENT_UPSTREAM_UNAVAILABLE")})
+        time.sleep(0.05)
+    return JSONResponse(status_code=202, content={"request_id": request_id, "status": "queued", "queued": True, "degraded": False, "retry_after": int(os.getenv("AGENT_QUEUE_RETRY_AFTER_SECONDS", "3")), "customer_message": "您的问题正在为您处理，请稍后查询处理进度。", "service_status": "排队处理中"})
 
-    if route_target == "both":
-        # both 用于“请 AI 回答，同时把原文同步给人工”，坐席端可通过消息扩展字段识别。
-        _ensure_handoff_exists(session_id, session, "synced_by_customer")
 
-    agent_payload = payload.model_copy(
+@app.post("/api/agent/reply/stream/legacy", include_in_schema=False)
+async def reply_stream(payload: AgentReplyRequest, request: Request, authorization: str | None = Header(default=None), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> StreamingResponse:
+    """SSE 回复接口：立即建立连接，在线 Agent 在受控执行槽位中运行。"""
+    import asyncio
+    import json
+
+    subject = _request_subject(request, authorization)
+    # 在进入队列前固定可信身份，Worker 无需也不应依赖 FastAPI 的鉴权函数。
+    current_user_data = _current_login_user(authorization)
+    execution_payload = payload.model_copy(
         update={
-            "session_id": session_id,
-            "pending_action_request": pending_action_request,
-            "conversation_context": conversation_context,
+            "customer_id": current_user_data["customer_id"],
+            "auth_token": _bearer_token(authorization),
         }
     )
-    agent_reply = agent.reply(agent_payload)
-    result = agent_reply.model_dump()
-    result["session_id"] = session_id
 
-    if (result.get("analysis") or {}).get("user_goal") == "human_request":
-        # 用户明确要求人工时创建人工接管请求，而不是创建业务工单。
-        handoff_result = _prepare_handoff_response(session_id)
-        result["answer"] = handoff_result["message"]
-        result["customer_message"] = handoff_result["message"]
-        result["service_status"] = handoff_result["service_status"]
-        result["decision_type"] = "human_takeover"
-        result["need_human"] = True
-        result["auto_send"] = False
-        result["ticket_result"] = None
-        result["handoff_result"] = handoff_result
+    async def event_stream():
+        """分阶段推送状态；当前模型不支持 token stream 时仍可避免 HTTP 长时间无响应。"""
+        yield "event: accepted\ndata: {\"status\": \"accepted\"}\n\n"
+        if agent_execution_queue.enabled:
+            # 生产模式由独立 Agent Worker 执行模型和工具调用，API Pod 只保持 SSE 连接。
+            request_id = _enqueue_execution_job(execution_payload, authorization, idempotency_key, "sse")
+            yield f"event: queued\ndata: {json.dumps({'request_id': request_id}, ensure_ascii=False)}\n\n"
+            deadline = time.monotonic() + float(os.getenv("AGENT_QUEUE_MAX_WAIT_SECONDS", "30"))
+            while time.monotonic() < deadline:
+                state = agent_execution_queue.get(request_id) or {}
+                if state.get("status") == "SUCCESS":
+                    yield f"event: completed\ndata: {json.dumps(state['result'], ensure_ascii=False)}\n\n"
+                    return
+                if state.get("status") in {"DEGRADED", "FAILED", "DEAD_LETTER"}:
+                    yield f"event: degraded\ndata: {json.dumps(_overload_response() | {'request_id': request_id}, ensure_ascii=False)}\n\n"
+                    return
+                await asyncio.sleep(0.25)
+            yield f"event: degraded\ndata: {json.dumps(_overload_response() | {'request_id': request_id}, ensure_ascii=False)}\n\n"
+            return
+        if not admission_controller.try_acquire(subject):
+            yield f"event: degraded\ndata: {json.dumps(_overload_response(), ensure_ascii=False)}\n\n"
+            return
+        try:
+            yield "event: generating\ndata: {\"status\": \"generating\"}\n\n"
+            result = await asyncio.to_thread(agent_execution_service.execute, execution_payload)
+            yield f"event: completed\ndata: {json.dumps(result, ensure_ascii=False)}\n\n"
+        except Exception as exc:
+            # 外部模型或业务工具异常不向客户暴露内部堆栈。
+            metrics.mark_degraded()
+            payload_data = _overload_response() | {"error_code": "AGENT_UPSTREAM_UNAVAILABLE"}
+            yield f"event: degraded\ndata: {json.dumps(payload_data, ensure_ascii=False)}\n\n"
+        finally:
+            admission_controller.release(subject)
 
-    status_value = _resolve_session_status(result)
-    chat_sessions.update_after_agent_reply(session_id, result["analysis"], status_value)
-    chat_messages.save(
-        session_no=session_id,
-        sender_type="ai",
-        sender_id="agent",
-        content=result.get("customer_message") or result["answer"],
-        extra_data={
-            "customer_message": result.get("customer_message"),
-            "internal_suggestion": result.get("internal_suggestion"),
-            "decision_type": result.get("decision_type"),
-            "service_status": result.get("service_status"),
-            "analysis": result["analysis"],
-            "citations": result["citations"],
-            "tool_results": result["tool_results"],
-            "ticket_result": result.get("ticket_result"),
-            "risk_reasons": result["risk_reasons"],
-            "auto_send": result["auto_send"],
-            "need_human": result["need_human"],
-            "handoff_result": result.get("handoff_result"),
-            "pending_action_request": result.get("pending_action_request"),
-            "conversation_context": conversation_context,
-            "context_conflict": (conversation_context.get("debug_context") or {}).get("context_conflict"),
-        },
-    )
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.post("/api/agent/reply/stream")
+async def reply_stream_v2(payload: AgentReplyRequest, request: Request, authorization: str | None = Header(default=None), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> StreamingResponse:
+    """建立可重放的 SSE 订阅；API 只转发事件，不在本进程执行模型。"""
+    import asyncio
+
+    current_user = _current_login_user(authorization)
+    if not agent_execution_queue.enabled:
+        async def unavailable():
+            event = stream_event_service.publish("unavailable", "degraded", _overload_response())
+            yield stream_event_service.to_sse(event)
+        return StreamingResponse(unavailable(), media_type="text/event-stream")
+
+    execution_payload = payload.model_copy(update={"customer_id": current_user["customer_id"], "auth_token": _bearer_token(authorization)})
+    request_id = _enqueue_execution_job(execution_payload, authorization, idempotency_key, "sse")
+    last_event_id = request.headers.get("Last-Event-ID")
+
+    async def event_stream():
+        """先补发 Last-Event-ID 之后的事件，再持续读取 Worker 产生的 token。"""
+        if not last_event_id:
+            accepted = stream_event_service.publish(request_id, "accepted", {"status": "accepted"})
+            queued = stream_event_service.publish(request_id, "queued", {"status": "queued"})
+            yield stream_event_service.to_sse(accepted)
+            yield stream_event_service.to_sse(queued)
+            cursor = queued["event_id"]
+        else:
+            cursor = last_event_id
+        deadline = time.monotonic() + float(os.getenv("AGENT_QUEUE_MAX_WAIT_SECONDS", "30"))
+        next_keepalive = time.monotonic() + float(os.getenv("AGENT_SSE_KEEPALIVE_SECONDS", "5"))
+        while time.monotonic() < deadline:
+            for event in stream_event_service.replay(request_id, cursor):
+                cursor = event["event_id"]
+                yield stream_event_service.to_sse(event)
+                if event["event_type"] in {"completed", "degraded", "error"}:
+                    return
+            state = agent_execution_queue.get(request_id) or {}
+            if state.get("status") in {"SUCCESS", "DEGRADED", "FAILED", "DEAD_LETTER"}:
+                result = state.get("result") or {}
+                event_type = "completed" if state.get("status") == "SUCCESS" else "degraded"
+                event = stream_event_service.publish(request_id, event_type, {"answer": result.get("customer_message") or result.get("answer", ""), "status": state.get("status")})
+                yield stream_event_service.to_sse(event)
+                return
+            # 定期发送 SSE 注释帧，避免浏览器、开发代理或网关把无 token 的检索阶段判为闲置连接。
+            if time.monotonic() >= next_keepalive:
+                yield ": keepalive\n\n"
+                next_keepalive = time.monotonic() + float(os.getenv("AGENT_SSE_KEEPALIVE_SECONDS", "5"))
+            await asyncio.sleep(0.15)
+        # 单次订阅到期只发布非终态 queued；客户端携带相同幂等键和 Last-Event-ID 自动续传。
+        waiting = stream_event_service.publish(request_id, "queued", {
+            "status": (agent_execution_queue.get(request_id) or {}).get("status", "PENDING"),
+            "retry_after": int(os.getenv("AGENT_QUEUE_RETRY_AFTER_SECONDS", "3")),
+            "customer_message": "请求仍在后台处理中，正在继续等待结果。",
+        })
+        yield stream_event_service.to_sse(waiting)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.get("/api/agent/replies/{request_id}")
+def get_queued_reply(request_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """查询 SSE 断线后的排队结果；仅暴露短 TTL 内的客户可见响应。"""
+    result = agent_execution_queue.get(request_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="请求不存在或已过期")
+    if result.get("owner") != _queue_owner(authorization):
+        raise HTTPException(status_code=403, detail="无权读取该请求结果")
     return result
 
 
@@ -195,6 +328,62 @@ def tool_call(payload: ToolCallRequest, authorization: str | None = Header(defau
 def logs(limit: int = 100) -> list[dict]:
     """返回 Agent 工具调用日志，用于客服主管追溯 AI 决策依据。"""
     return agent.list_call_logs(limit)
+
+
+@app.get("/api/staff/rag/evaluation")
+def rag_evaluation(
+    mode: str = "baseline",
+    authorization: str | None = Header(default=None),
+) -> dict:
+    """运行离线 RAG 质量评测，仅向内部坐席开放，避免客户读取内部评测与失败样本。"""
+    _require_staff_user(authorization)
+    data_dir = Path(__file__).resolve().parent / "data"
+    if mode != "baseline":
+        raise HTTPException(status_code=400, detail="真实 Agent 全量评测请通过后台任务接口提交")
+    # 基线报告用于页面首屏和快速回归，不会触发模型或业务工具调用。
+    return evaluate_rag(
+        eval_dir=str(data_dir / "rag_eval"),
+        kb_dir=str(data_dir / "kb_sources"),
+        generation_mode="baseline",
+    )
+
+
+@app.post("/api/staff/rag/evaluation/jobs")
+def create_rag_evaluation_job(payload: dict[str, Any] | None = None, authorization: str | None = Header(default=None)) -> dict:
+    """提交全量真实 Agent 评测任务，接口立即返回，前端通过状态接口轮询结果。"""
+    _require_staff_user(authorization)
+    requested = (payload or {}).get("max_samples")
+    try:
+        max_samples = int(requested) if requested is not None else None
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="样本数必须是正整数") from exc
+    if max_samples is not None and not 1 <= max_samples <= 500:
+        raise HTTPException(status_code=400, detail="样本数必须在 1 到 500 之间")
+    return evaluation_repository.create_job("GOLDEN", {"max_samples": max_samples})
+
+
+@app.get("/api/staff/rag/evaluation/jobs/{job_id}")
+def get_rag_evaluation_job(job_id: str, authorization: str | None = Header(default=None)) -> dict:
+    """查询评测后台任务状态与完成报告，仅允许内部坐席访问。"""
+    _require_staff_user(authorization)
+    job = evaluation_repository.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="评测任务不存在或已过期")
+    return job
+
+
+@app.get("/api/staff/evaluation/online/report")
+def online_evaluation_report(days: int = 7, limit: int = 50, authorization: str | None = Header(default=None)) -> dict:
+    """读取线上采样评测监控报告；该接口不触发任何模型调用。"""
+    _require_staff_user(authorization)
+    return evaluation_repository.online_report(days=days, limit=limit)
+
+
+@app.get("/api/staff/evaluation/queue")
+def online_evaluation_queue(authorization: str | None = Header(default=None)) -> dict:
+    """查询评测队列积压与每日预算消耗，供坐席端监控 Worker 健康度。"""
+    _require_staff_user(authorization)
+    return evaluation_repository.queue_status()
 
 
 @app.get("/api/chat/session/list")
@@ -239,43 +428,22 @@ def delete_chat_session(session_id: str, authorization: str | None = Header(defa
 def get_customer_ticket(ticket_no: str, authorization: str | None = Header(default=None)) -> dict:
     """代理查询客户自己的工单详情，让客户侧页面能刷新 Java 业务系统中的最新状态。"""
     _current_login_user(authorization)
-    try:
-        response = httpx.get(
-            f"{BUSINESS_SERVICE_URL}/api/tickets/{ticket_no}",
-            headers={"Authorization": authorization},
-            timeout=5.0,
-        )
-        response.raise_for_status()
-        return response.json()
-    except httpx.HTTPStatusError as exc:
-        if exc.response.status_code == 400:
-            # 历史会话可能引用了已清理或旧 SQLite 文件中的工单；客户侧降级展示，不把控制台刷成错误。
-            return {
-                "ticketNo": ticket_no,
-                "status": "状态暂不可同步",
-                "source": "HISTORY_FALLBACK",
-            }
-        raise HTTPException(status_code=exc.response.status_code, detail=_response_detail(exc.response)) from exc
-    except httpx.RequestError as exc:
-        raise HTTPException(status_code=503, detail=f"业务工单服务不可用：{exc}") from exc
+    result = ticket_tools.query_ticket_status(ticket_no, _bearer_token(authorization))
+    if result.get("status") == "success":
+        return result["data"]
+    if result.get("error") == "4xx":
+        return {"ticketNo": ticket_no, "status": "状态暂不可同步", "source": "HISTORY_FALLBACK"}
+    raise HTTPException(status_code=503, detail="业务工单服务暂时不可用")
 
 
 @app.get("/api/customer/tickets")
 def list_customer_tickets(authorization: str | None = Header(default=None)) -> list[dict]:
     """代理查询当前客户自己的工单列表，供客户侧工单列表和进度面板使用。"""
     _current_login_user(authorization)
-    try:
-        response = httpx.get(
-            f"{BUSINESS_SERVICE_URL}/api/tickets",
-            headers={"Authorization": authorization},
-            timeout=5.0,
-        )
-        response.raise_for_status()
-        return response.json()
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(status_code=exc.response.status_code, detail=_response_detail(exc.response)) from exc
-    except httpx.RequestError as exc:
-        raise HTTPException(status_code=503, detail=f"业务工单列表服务不可用：{exc}") from exc
+    result = ticket_tools.list_customer_tickets(_bearer_token(authorization))
+    if result.get("status") == "success":
+        return result["data"]
+    raise HTTPException(status_code=503, detail="业务工单列表服务暂时不可用")
 
 
 @app.post("/api/customer/tickets/{ticket_no}/urge")
@@ -286,38 +454,21 @@ def urge_customer_ticket(
 ) -> dict:
     """代理客户催办自己的工单，催办由 Java 按 Token 校验归属并落库。"""
     _current_login_user(authorization)
-    try:
-        response = httpx.post(
-            f"{BUSINESS_SERVICE_URL}/api/tickets/{ticket_no}/urge",
-            json={"reason": str((payload or {}).get("reason") or "客户催办处理进度")},
-            headers={"Authorization": authorization},
-            timeout=5.0,
-        )
-        response.raise_for_status()
-        return response.json()
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(status_code=exc.response.status_code, detail=_response_detail(exc.response)) from exc
-    except httpx.RequestError as exc:
-        raise HTTPException(status_code=503, detail=f"业务工单催办服务不可用：{exc}") from exc
+    key = str((payload or {}).get("idempotency_key") or uuid.uuid4())
+    result = ticket_tools.urge_ticket(ticket_no, str((payload or {}).get("reason") or "客户催办处理进度"), _bearer_token(authorization), key)
+    if result.get("status") == "success":
+        return result["data"]
+    raise HTTPException(status_code=503, detail="业务工单催办服务暂时不可用")
 
 
 @app.get("/api/customer/orders")
 def list_customer_orders(authorization: str | None = Header(default=None)) -> list[dict]:
     """代理查询当前客户订单列表，供客户侧选择订单后发起咨询。"""
     current_user_data = _current_login_user(authorization)
-    try:
-        response = httpx.get(
-            f"{BUSINESS_SERVICE_URL}/api/orders",
-            params={"customerId": current_user_data["customer_id"]},
-            headers={"Authorization": authorization},
-            timeout=5.0,
-        )
-        response.raise_for_status()
-        return response.json()
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(status_code=exc.response.status_code, detail=_response_detail(exc.response)) from exc
-    except httpx.RequestError as exc:
-        raise HTTPException(status_code=503, detail=f"业务订单服务不可用：{exc}") from exc
+    result = order_tools.query_customer_orders(current_user_data["customer_id"], _bearer_token(authorization))
+    if result.get("status") in {"success", "empty"}:
+        return result.get("data", [])
+    raise HTTPException(status_code=503, detail="业务订单服务暂时不可用")
 
 
 @app.post("/api/staff/tickets/{ticket_no}/reply/draft")
@@ -558,16 +709,15 @@ def _load_human_availability() -> dict[str, Any]:
 def _load_staff_members_internal() -> list[dict[str, Any]]:
     """通过 Java 内部接口读取坐席聚合状态，避免客户 Token 越权访问坐席数据。"""
     try:
-        response = httpx.get(
+        response = business_client.request_sync(
+            "GET",
             f"{BUSINESS_SERVICE_URL}/api/internal/staff/availability",
             headers={"X-Agent-Internal-Secret": AGENT_INTERNAL_SECRET},
-            timeout=5.0,
         )
-        response.raise_for_status()
         data = response.json()
         members = data.get("members") if isinstance(data, dict) else data
         return members if isinstance(members, list) else []
-    except (httpx.HTTPStatusError, httpx.RequestError, ValueError):
+    except (ResilienceError, ValueError):
         # 坐席状态服务不可用时按繁忙排队处理，避免误导客户已经有人接入。
         return []
 
@@ -679,21 +829,29 @@ def _get_staff_owned_handoff_session(session_id: str, staff_user: dict[str, Any]
 
 
 def _current_login_user(authorization: str | None) -> dict:
-    """把 Token 交给 Java 业务系统校验，Agent 不自行维护用户登录状态。"""
+    """优先使用短期身份缓存，未命中时仍交给 Java 业务系统做权威 Token 校验。"""
     if not authorization:
         raise HTTPException(status_code=401, detail="请先登录")
     try:
-        response = httpx.get(
-            f"{BUSINESS_SERVICE_URL}/api/auth/current-user",
-            headers={"Authorization": authorization},
-            timeout=5.0,
-        )
-        response.raise_for_status()
-        return response.json()
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(status_code=exc.response.status_code, detail=_response_detail(exc.response)) from exc
-    except httpx.RequestError as exc:
-        raise HTTPException(status_code=503, detail=f"业务认证服务不可用：{exc}") from exc
+        def load_identity() -> dict[str, Any]:
+            """缓存缺失时请求 Java；Authorization 仅用于本次下游校验，不写入 Redis。"""
+            response = business_client.request_sync(
+                "GET",
+                f"{BUSINESS_SERVICE_URL}/api/auth/current-user",
+                headers={"Authorization": authorization},
+            )
+            return response.json()
+
+        token = _bearer_token(authorization)
+        if not token:
+            # 非 Bearer 格式仍交给 Java 校验并保持既有 401 行为，不可共享空 Token 缓存键。
+            return load_identity()
+        return identity_cache.get_or_load(token, load_identity)
+    except ResilienceError as exc:
+        raise HTTPException(status_code=exc.status_code or 503, detail=exc.safe_message) from exc
+    except ValueError as exc:
+        # 身份格式不完整时不信任缓存值，避免发生客户或角色越权。
+        raise HTTPException(status_code=502, detail="身份服务返回异常") from exc
 
 
 def _require_staff_user(authorization: str | None) -> dict:
@@ -707,17 +865,14 @@ def _require_staff_user(authorization: str | None) -> dict:
 def _get_staff_ticket(ticket_no: str, authorization: str | None) -> dict:
     """代理读取坐席视角工单详情，用于生成客户回复草稿时带入最新状态。"""
     try:
-        response = httpx.get(
+        response = business_client.request_sync(
+            "GET",
             f"{BUSINESS_SERVICE_URL}/api/staff/tickets/{ticket_no}",
             headers={"Authorization": authorization},
-            timeout=5.0,
         )
-        response.raise_for_status()
         return response.json()
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(status_code=exc.response.status_code, detail=_response_detail(exc.response)) from exc
-    except httpx.RequestError as exc:
-        raise HTTPException(status_code=503, detail=f"业务工单服务不可用：{exc}") from exc
+    except ResilienceError as exc:
+        raise HTTPException(status_code=exc.status_code or 503, detail=exc.safe_message) from exc
 
 
 def _find_ticket_chat_context(ticket_no: str, ticket: dict | None = None) -> dict:
@@ -762,6 +917,58 @@ def _bearer_token(authorization: str | None) -> str | None:
     if not authorization or not authorization.startswith("Bearer "):
         return None
     return authorization.removeprefix("Bearer ").strip()
+
+
+def _request_subject(request: Request, authorization: str | None) -> str:
+    """生成限流主体；优先使用已认证 Token，匿名请求回退到来源 IP。"""
+    token = _bearer_token(authorization)
+    if token:
+        return f"token:{token[:24]}"
+    client = request.client.host if request.client else "unknown"
+    return f"ip:{client}"
+
+
+def _queue_owner(authorization: str | None) -> str:
+    """保存不可逆的 Token 摘要作为短期队列结果归属校验，不在结果中暴露完整凭证。"""
+    import hashlib
+
+    token = _bearer_token(authorization) or "anonymous"
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:24]
+
+
+def _enqueue_execution_job(payload: AgentReplyRequest, authorization: str | None, idempotency_key: str | None, route_source: str) -> str:
+    """统一创建安全队列任务，使同步接口和 SSE 复用同一幂等与状态协议。"""
+    request_id = f"agent-job-{uuid.uuid4().hex[:16]}"
+    now = datetime.now(timezone.utc)
+    job = AgentExecutionJob(
+        request_id=request_id,
+        customer_id=int(payload.customer_id or 0),
+        message=payload.message,
+        session_id=payload.session_id,
+        selected_order_no=payload.selected_order_no,
+        selected_ticket_no=payload.selected_ticket_no,
+        route_target=payload.route_target,
+        idempotency_key=idempotency_key or f"{route_source}:{request_id}",
+        created_at=now.isoformat(),
+        expires_at=(now + timedelta(seconds=int(os.getenv("AGENT_JOB_TTL_SECONDS", "600")))).isoformat(),
+        route_source=route_source,
+        risk_level="high" if payload.route_target in {"human", "both"} else "normal",
+        trace_id=current_context()["trace_id"],
+        execution_credential=_queue_execution_credential(int(payload.customer_id or 0), request_id),
+    )
+    return agent_execution_queue.enqueue(job, _queue_owner(authorization))
+
+
+def _queue_execution_credential(customer_id: int, request_id: str) -> str:
+    """签发短期内部执行凭证；队列不保存客户 Authorization 原始 Token。"""
+    import hashlib
+    import hmac
+
+    expires_at = int(time.time()) + int(os.getenv("AGENT_JOB_TTL_SECONDS", "600"))
+    content = f"{customer_id}:{request_id}:{expires_at}"
+    secret = os.getenv("AGENT_EXECUTION_SECRET", AGENT_INTERNAL_SECRET)
+    signature = hmac.new(secret.encode("utf-8"), content.encode("utf-8"), hashlib.sha256).hexdigest()[:24]
+    return f"v1.{expires_at}.{signature}"
 
 
 def _response_detail(response: httpx.Response) -> Any:

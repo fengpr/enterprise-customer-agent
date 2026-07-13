@@ -1,3 +1,4 @@
+import os
 import re
 from datetime import datetime
 from typing import Any
@@ -20,6 +21,7 @@ from agents.intent_normalizer import (
 )
 from agents.llm_intent_analyzer import LLMIntentAnalyzer
 from graphs.ticket_process_graph import TicketProcessState, build_ticket_process_graph
+from rag.quality import build_rag_trace, ensure_citation_ids
 from rag.rag_chain import RagChain
 from repositories.agent_call_log_repository import AgentCallLogRepository
 from schemas.intent_schema import AgentReply, AgentReplyRequest, Citation, IntentResult
@@ -39,6 +41,8 @@ class CustomerServiceAgent:
         self.log_repository = AgentCallLogRepository()
         self.llm_init_error: str | None = None
         self.llm_analyzer = self._create_llm_analyzer()
+        # 流式回调只在单次 Worker 执行期间设置，避免跨请求泄露输出。
+        self._stream_delta_callback = None
 
         # 真实 LLM 识别失败时自动降级，保证客服链路不会因模型异常中断。
         self.analyzer_chain = RunnableLambda(self._analyze_with_llm_fallback)
@@ -94,6 +98,23 @@ class CustomerServiceAgent:
         )
 
         customer_message = self._build_customer_message(state)
+        # 记录回答与本轮召回证据的对应关系，供线上审计和离线回归使用。
+        citation_validation = build_rag_trace(
+            request.message,
+            state.get("citations", []),
+            customer_message,
+            intent=state["analysis"].intent,
+            user_goal=state["analysis"].user_goal,
+        )["citation_validation"]
+        if (
+            os.getenv("RAG_ENFORCE_GROUNDEDNESS", "").strip().lower() in {"1", "true", "yes", "on"}
+            and state.get("citations")
+            and citation_validation["hallucination_detected"]
+        ):
+            # 严格模式下，无依据的业务断言不得自动发送，统一降级为人工审核。
+            state["analysis"].need_human = True
+            if "rag_groundedness_failed" not in state["risk_reasons"]:
+                state["risk_reasons"].append("rag_groundedness_failed")
         internal_suggestion = state["answer"]
         decision_type = self._resolve_decision_type(state)
         service_status = self._resolve_service_status(decision_type, state.get("ticket_result"))
@@ -108,6 +129,7 @@ class CustomerServiceAgent:
             need_human=decision_type in {"human_takeover", "review_required"},
             analysis=state["analysis"],
             citations=state.get("citations", []),
+            citation_validation=citation_validation,
             tool_results=state.get("tool_results", []),
             ticket_result=state.get("ticket_result"),
             risk_reasons=state.get("risk_reasons", []),
@@ -161,6 +183,16 @@ class CustomerServiceAgent:
 
         if decision_type == "review_required":
             ticket_text = self._format_customer_ticket_text(state.get("ticket_result"))
+            if state["analysis"].user_goal in {"complaint", "dispute"}:
+                # 投诉、赔付争议属于高风险场景，使用受控模板而不让自由生成补充未被证据支持的处理承诺。
+                citation_marker = self._primary_citation_marker(state.get("citations", []))
+                parts = [
+                    f"已收到您的投诉，相关诉求已转交人工客服进一步核实处理{citation_marker}。",
+                    "后续将由专人跟进，请您稍候。",
+                ]
+                if ticket_text:
+                    parts.append(ticket_text)
+                return "\n\n".join(parts)
             if self._is_deduplicated_ticket(state.get("ticket_result")) and ticket_text:
                 # 重复工单命中时仍交给 LLM 做自然表达，但事实只允许使用已有工单信息。
                 llm_message = self._compose_llm_customer_answer(
@@ -198,7 +230,35 @@ class CustomerServiceAgent:
                 parts.append(ticket_text)
             return "\n\n".join(parts)
 
-        return "已收到您的反馈。该问题已为您转交人工客服处理。\n\n客服会结合订单信息和平台规则进一步核实，请您稍候。"
+        # 模型降级或人工接管分支也必须保留高风险处置依据，不能返回无引用的固定话术。
+        fallback_citation = self._primary_citation_marker(state.get("citations", []))
+        if state["analysis"].user_goal in {"complaint", "dispute"}:
+            return (
+                f"已收到您的投诉，相关诉求已转交人工客服进一步处理{fallback_citation}。\n\n"
+                "后续将由专人跟进，请您稍候。"
+            )
+        return (
+            f"已收到您的反馈。该问题已为您转交人工客服处理{fallback_citation}。\n\n"
+            "后续将由专人跟进，请您稍候。"
+        )
+
+    def reply_with_stream(self, request: AgentReplyRequest, on_delta) -> AgentReply:
+        """执行既有 Agent 图，并把最终生成节点的模型原生 token 回调给 Worker。"""
+        self._stream_delta_callback = on_delta
+        try:
+            return self.reply(request)
+        finally:
+            # 无论模型、工具或图节点是否异常，都不能让后续请求复用旧连接回调。
+            self._stream_delta_callback = None
+
+    @staticmethod
+    def _primary_citation_marker(citations: list[Citation]) -> str:
+        """返回首条真实召回证据的客户可见标记；无证据时不伪造引用。"""
+        if not citations:
+            return ""
+        ensure_citation_ids(citations)
+        citation_id = citations[0].citation_id
+        return f"【来源：{citation_id}】" if citation_id else ""
 
     def _rule_based_analyze(self, message: str) -> IntentResult:
         """使用规则兜底识别用户意图，保障无模型配置时 Demo 仍可运行。"""
@@ -483,7 +543,8 @@ class CustomerServiceAgent:
             reply_mode="out_of_scope",
             service_instruction=(
                 "用户问的是客服业务范围之外的普通低风险问题。先直接、准确地简短回答用户问题，控制在一到两句；"
-                "随后用一句话说明你主要处理订单、物流、售后、工单和发票，并自然邀请用户继续咨询这些业务。"
+                "随后用“不过我主要负责订单、物流、售后、工单和发票等业务问题”这类自然转折说明服务边界。"
+                "不要自我介绍成企业客服助手，不要使用生硬的身份声明。"
                 "不要声称查过知识库，不要转人工，不要创建工单，不要引用当前订单或历史会话中的业务对象。"
             ),
             extra_context={"allowed_scope": ["订单", "物流", "售后", "工单", "发票"]},
@@ -500,12 +561,40 @@ class CustomerServiceAgent:
 
     @staticmethod
     def _ensure_out_of_scope_boundary(answer: str) -> str:
-        """确保越界简答包含客服能力边界，防止模型只回答闲聊内容而偏离服务定位。"""
+        """统一普通越界回复的边界表达，避免模型生成突兀的客服身份声明。"""
         normalized = answer.strip()
-        scope_words = ["订单", "物流", "售后", "工单", "发票"]
-        if any(word in normalized for word in scope_words):
-            return normalized
-        return f"{normalized}\n我主要帮助处理订单、物流、售后、工单和发票问题，您也可以继续告诉我相关诉求。"
+        boundary = "不过我主要负责订单、物流、售后、工单和发票等业务问题。如果您有这些方面的疑问，也可以继续问我。"
+        if not normalized:
+            return boundary
+
+        # 低风险越界回答只保留常识简答，把能力边界收敛成统一自然话术。
+        paragraphs = [item.strip() for item in re.split(r"\n{1,}", normalized) if item.strip()]
+        kept: list[str] = []
+        boundary_terms = [
+            "企业客服助手",
+            "客户服务助手",
+            "客服助手",
+            "主要处理",
+            "主要负责",
+            "主要帮助处理",
+            "订单",
+            "物流",
+            "售后",
+            "工单",
+            "发票",
+            "继续提问",
+            "继续问我",
+        ]
+        for paragraph in paragraphs:
+            # 模型常把边界单独放在第二段；统一替换这类段落，避免客户感到突兀。
+            if any(term in paragraph for term in boundary_terms):
+                continue
+            kept.append(paragraph)
+
+        answer_body = "\n".join(kept).strip()
+        if not answer_body:
+            return boundary
+        return f"{answer_body}\n\n{boundary}"
 
     def _compose_human_request_answer(self, state: TicketProcessState) -> str:
         """处理客户明确转人工请求，避免走知识库缺失模板。"""
@@ -743,7 +832,7 @@ class CustomerServiceAgent:
             ),
         }
         try:
-            answer = self.llm_analyzer.generate_customer_reply(payload)
+            answer = self._generate_llm_reply(payload)
             if not self._is_safe_customer_reply(answer):
                 return ""
             answer = self._sanitize_return_goods_answer(answer)
@@ -886,6 +975,15 @@ class CustomerServiceAgent:
         """校验模型生成的退货规则话术是否适合直接展示给客户。"""
         if not answer or not answer.strip():
             return False
+        # 调用方已经确认存在可用 policy_text；模型若仍声称知识库无规则，属于与检索证据冲突的生成结果。
+        no_policy_phrases = [
+            "当前知识库未找到明确退货规则",
+            "知识库未找到退货规则",
+            "没有找到明确的退货规则",
+            "未检索到退货规则",
+        ]
+        if any(phrase in answer for phrase in no_policy_phrases):
+            return False
         metadata_terms = [
             "适用范围",
             "适合回答",
@@ -982,7 +1080,7 @@ class CustomerServiceAgent:
             "service_instruction": service_instruction,
         }
         try:
-            answer = self.llm_analyzer.generate_customer_reply(payload)
+            answer = self._generate_llm_reply(payload)
             if not self._is_safe_customer_reply(answer):
                 return ""
             if analysis.user_goal == "policy_consult" and analysis.action_type == "return_goods":
@@ -1035,7 +1133,7 @@ class CustomerServiceAgent:
             ),
         }
         try:
-            answer = self.llm_analyzer.generate_customer_reply(payload)
+            answer = self._generate_llm_reply(payload)
             if self._is_safe_customer_reply(answer):
                 self._log(
                     "llm_review_customer_reply",
@@ -1051,6 +1149,12 @@ class CustomerServiceAgent:
                 {"status": "failed", "error_type": self._classify_model_error(exc), "error": str(exc)},
             )
         return ""
+
+    def _generate_llm_reply(self, payload: dict) -> str:
+        """兼容旧 LLM 测试替身；仅真实流式执行时向生成器传入 token 回调。"""
+        if getattr(self, "_stream_delta_callback", None) is None:
+            return self.llm_analyzer.generate_customer_reply(payload)
+        return self.llm_analyzer.generate_customer_reply(payload, on_delta=self._stream_delta_callback)
 
     @staticmethod
     def _is_safe_customer_reply(answer: str) -> bool:
@@ -1526,6 +1630,13 @@ class CustomerServiceAgent:
         """优先调用真实 LLM 做结构化识别，模型失败时降级为转人工结果。"""
         message = payload.get("message") if isinstance(payload, dict) else str(payload)
         conversation_context = payload.get("conversation_context") if isinstance(payload, dict) else None
+        if self._is_return_goods_policy_message(message):
+            # 退货规则是规则可确定识别的低风险意图，无需在 RAG 前再阻塞一次意图 LLM。
+            return self._apply_context_guardrails(
+                message,
+                self._apply_business_guardrails(message, self._rule_based_analyze(message)),
+                conversation_context,
+            )
         llm_message = self._message_for_intent_analysis(message, conversation_context)
         if not self.llm_analyzer:
             if LLMIntentAnalyzer.is_configured():

@@ -1,0 +1,33 @@
+groups:
+  - name: enterprise-customer-agent
+    rules:
+      - alert: AgentApiP95High
+        expr: histogram_quantile(0.95, sum(rate(agent_http_request_duration_seconds_bucket[5m])) by (le)) > 2
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "Agent API P95 超过 2 秒" }
+      - alert: AgentApi5xxHigh
+        expr: sum(rate(agent_http_requests_total{status=~"5.."}[5m])) / sum(rate(agent_http_requests_total[5m])) > 0.02
+        for: 5m
+        labels: { severity: critical }
+        annotations: { summary: "Agent API 5xx 错误率超过 2%" }
+      - alert: AgentQueueBacklog
+        expr: agent_queue_depth > 100
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "Agent 队列持续积压" }
+      - alert: AgentDeadLetterNotEmpty
+        expr: agent_dead_letter_depth > 0
+        for: 1m
+        labels: { severity: critical }
+        annotations: { summary: "Agent 死信队列出现任务" }
+      - alert: AgentLlmFailureHigh
+        expr: sum(rate(agent_downstream_requests_total{downstream="online_llm",outcome=~"timeout|rate_limit_429|circuit_open"}[5m])) > 0.1
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "LLM 超时、429 或熔断异常升高" }
+      - alert: AgentDegradedHigh
+        expr: sum(rate(agent_degraded_total[5m])) > 0.2
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "Agent 安全降级率异常" }

@@ -4,6 +4,7 @@ import com.example.business.entity.SupportTicket;
 import com.example.business.entity.TicketStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.sql.PreparedStatement;
@@ -49,9 +50,15 @@ public class TicketService {
             toLocalDateTime(rs.getTimestamp("updated_at"))
     );
 
-    public TicketService(JdbcTemplate jdbcTemplate) {
+    public TicketService(
+            JdbcTemplate jdbcTemplate,
+            @Value("${spring.datasource.driver-class-name:org.sqlite.JDBC}") String driverClassName
+    ) {
         this.jdbcTemplate = jdbcTemplate;
-        initTables();
+        // PostgreSQL 由 Flyway 管理结构，禁止执行 SQLite 的 AUTOINCREMENT/PRAGMA 兼容逻辑。
+        if (!driverClassName.toLowerCase().contains("postgresql")) {
+            initTables();
+        }
     }
 
     /**

@@ -3,6 +3,7 @@ package com.example.business.service;
 import com.example.business.entity.Customer;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -22,10 +23,13 @@ public class CustomerService {
             rs.getInt("status")
     );
 
-    public CustomerService(JdbcTemplate jdbcTemplate) {
+    public CustomerService(JdbcTemplate jdbcTemplate, @Value("${spring.datasource.driver-class-name:org.sqlite.JDBC}") String driverClassName) {
         this.jdbcTemplate = jdbcTemplate;
-        initTables();
-        seedCustomers();
+        // PostgreSQL profile 的表结构由 Flyway 管理，SQLite 开发模式保留自动建表。
+        if (!driverClassName.toLowerCase().contains("postgresql")) {
+            initTables();
+            seedCustomers();
+        }
     }
 
     /**

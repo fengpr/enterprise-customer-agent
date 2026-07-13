@@ -258,25 +258,147 @@ async function submitQuestion() {
       created_at: new Date().toISOString()
     }
   ]
+  // SSE 建连和首个 token 之间立即显示可见状态，避免客户误以为页面卡死。
+  lastReply.value = {
+    session_id: selectedSessionId.value || 'pending',
+    answer: '正在接收您的问题…',
+    customer_message: '正在接收您的问题…',
+    service_status: '请求已发送',
+    auto_send: false,
+    need_human: false
+  }
   try {
-    const { data } = await customerApi.reply(
-      content,
-      selectedSessionId.value,
-      selectedOrderNo.value,
-      selectedTicketNo.value,
-      routeTarget.value
-    )
-    lastReply.value = data
-    selectedSessionId.value = data.session_id
+    // 同一次提交在所有 SSE 重连中复用幂等键，避免重复执行模型或重复创建工单。
+    const idempotencyKey = `customer-web:${crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`}`
+    const requestPayload = {
+      message: content,
+      session_id: selectedSessionId.value || null,
+      selected_order_no: selectedOrderNo.value || null,
+      selected_ticket_no: selectedTicketNo.value || null,
+      route_target: routeTarget.value
+    }
+    let streamedAnswer = ''
+    let finalReply: AgentReply | null = null
+    let requestId = ''
+    let lastEventId = ''
+    let terminalType = ''
+    const reconnectDeadline = Date.now() + 120_000
+
+    const handleStreamEvent = (event: { event_type: string; payload: Record<string, unknown>; event_id: string }) => {
+        const stageMessages: Record<string, string> = {
+          accepted: '已收到问题，正在准备处理…',
+          queued: '请求已进入处理队列…',
+          retrieving: '正在检索相关知识…',
+          tool_calling: '正在查询相关业务信息…',
+          generating: '已找到相关信息，正在组织回答…'
+        }
+        if (stageMessages[event.event_type] && !streamedAnswer) {
+          const stageMessage = stageMessages[event.event_type]
+          lastReply.value = {
+            session_id: selectedSessionId.value || 'pending',
+            answer: stageMessage,
+            customer_message: stageMessage,
+            service_status: stageMessage,
+            auto_send: false,
+            need_human: false
+          }
+        }
+        if (event.event_type === 'delta') {
+          streamedAnswer += String(event.payload.text || '')
+          lastReply.value = {
+            session_id: selectedSessionId.value || 'pending',
+            answer: streamedAnswer,
+            customer_message: streamedAnswer,
+            auto_send: true,
+            need_human: false
+          }
+        }
+        if (event.event_type === 'completed' || event.event_type === 'degraded' || event.event_type === 'error') {
+          const answer = String(event.payload.answer || event.payload.customer_message || streamedAnswer || '当前服务繁忙，请稍后查询处理进度。')
+          lastReply.value = {
+            session_id: selectedSessionId.value || 'pending',
+            answer,
+            customer_message: answer,
+            service_status: String(event.payload.service_status || ''),
+            auto_send: event.event_type === 'completed' && !Boolean(event.payload.degraded),
+            need_human: event.event_type !== 'completed' || Boolean(event.payload.degraded)
+          }
+        }
+    }
+
+    // 后端单次 SSE 订阅有时限；连接正常结束但任务未完成时自动续传，并用状态查询兜底。
+    while (!terminalType && Date.now() < reconnectDeadline) {
+      try {
+        const streamResult = await customerApi.streamReply(requestPayload, handleStreamEvent, {
+          idempotencyKey,
+          lastEventId: lastEventId || undefined
+        })
+        requestId = streamResult.requestId || requestId
+        lastEventId = streamResult.lastEventId || lastEventId
+        terminalType = streamResult.terminalType || terminalType
+      } catch (error) {
+        // 尚未获得 request_id 时无法安全续传，保留原异常交给外层恢复输入框。
+        if (!requestId) throw error
+      }
+
+      if (requestId) {
+        try {
+          const { data: state } = await customerApi.replyResult(requestId)
+          if (['SUCCESS', 'DEGRADED', 'FAILED', 'DEAD_LETTER'].includes(state.status)) {
+            finalReply = state.result || null
+            terminalType = state.status === 'SUCCESS' ? 'completed' : 'degraded'
+            if (finalReply) {
+              lastReply.value = finalReply
+            }
+            break
+          }
+        } catch {
+          // 临时网络错误不应删除用户问题；下一轮仍用同一 request_id 和事件游标恢复。
+        }
+      }
+      if (!terminalType) {
+        lastReply.value = {
+          session_id: selectedSessionId.value || 'pending',
+          answer: streamedAnswer || '请求仍在后台处理中，正在继续等待结果…',
+          customer_message: streamedAnswer || '请求仍在后台处理中，正在继续等待结果…',
+          service_status: '后台处理中',
+          auto_send: false,
+          need_human: false
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 500))
+      }
+    }
+
+    // 两分钟内仍未结束时保留临时消息和 request_id 状态，不能回刷成提问前的旧会话。
+    if (!terminalType) {
+      ElMessage.info('请求仍在后台处理中，可稍后刷新会话查看结果')
+      return
+    }
+
+    // 终态事件可能先于查询响应到达，统一再读取一次持久化结果。
+    if (requestId && !finalReply) {
+      try {
+        const { data: state } = await customerApi.replyResult(requestId)
+        finalReply = state.result || null
+      } catch {
+        // SSE 已提供客户可见终态时，即使结果查询临时失败也保留该回复。
+      }
+    }
+    const data = finalReply || lastReply.value
+    if (!data) throw new Error('未收到客服回复')
+    selectedSessionId.value = data.session_id || selectedSessionId.value
     const ticketChanged = mergeReplyTicket(data)
-    await loadSessions(true)
+    if (finalReply) {
+      await loadSessions(true)
+    }
     if (ticketChanged) {
       // 只有建单或工单状态发生变化时才后台刷新，普通 AI 回复不再触发工单接口。
       void loadTickets().catch(() => undefined)
     }
-    lastReply.value = null
-    // 会话消息已经从后端重新加载后，不再额外叠加临时回复，避免聊天窗口出现重复 AI 消息。
-    lastReply.value = null
+    // 只有确认后端已持久化结果后才清理临时回复，避免 DLQ/网络异常让回答从页面消失。
+    if (finalReply) {
+      lastReply.value = null
+    }
     showReplySubmitFeedback(data)
   } catch (error) {
     messages.value = messages.value.filter((item) => item.id !== tempMessageId)

@@ -4,6 +4,7 @@ import com.example.business.dto.OrderView;
 import com.example.business.entity.OrderInfo;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
@@ -47,10 +48,13 @@ public class OrderService {
             rs.getString("after_sale_status")
     );
 
-    public OrderService(JdbcTemplate jdbcTemplate) {
+    public OrderService(JdbcTemplate jdbcTemplate, @Value("${spring.datasource.driver-class-name:org.sqlite.JDBC}") String driverClassName) {
         this.jdbcTemplate = jdbcTemplate;
-        initTables();
-        seedOrders();
+        // PostgreSQL 结构由 Flyway 创建，避免执行 SQLite 方言 DDL。
+        if (!driverClassName.toLowerCase().contains("postgresql")) {
+            initTables();
+            seedOrders();
+        }
     }
 
     /**

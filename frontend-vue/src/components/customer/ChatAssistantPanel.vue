@@ -69,7 +69,11 @@ const markdown = new MarkdownIt({
 })
 
 function normalizeAssistantMarkdown(content: string) {
-  const normalized = String(content || '').replace(/\r\n?/g, '\n').trim()
+  // 客户侧不展示裸知识库 citation_id；后端仍保留结构化 citations 供评测、Trace 和坐席诊断使用。
+  const normalized = String(content || '')
+    .replace(/【(?:来源|引用)[:：]\s*kb-[^】]+】/g, '')
+    .replace(/\r\n?/g, '\n')
+    .trim()
   if (!normalized) return ''
 
   const lines = normalized.split('\n')

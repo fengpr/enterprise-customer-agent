@@ -2,6 +2,49 @@ import { agentHttp } from './http'
 import type { AgentReply, AgentStatus, ChatSession, ChatSessionDetail, CustomerOrder, RouteTarget, Ticket } from '@/types/api'
 
 export const customerApi = {
+  async streamReply(
+    body: Record<string, unknown>,
+    onEvent: (event: { event_type: string; payload: Record<string, unknown>; event_id: string }) => void,
+    options: { lastEventId?: string; idempotencyKey: string }
+  ) {
+    /** 使用同一幂等键重连 POST SSE，确保断线续传不会重复执行 Agent 或重复建单。 */
+    const token = localStorage.getItem('eca_token') || ''
+    const response = await fetch('/api/agent/reply/stream', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: token ? `Bearer ${token}` : '',
+        'Idempotency-Key': options.idempotencyKey,
+        ...(options.lastEventId ? { 'Last-Event-ID': options.lastEventId } : {})
+      },
+      body: JSON.stringify(body)
+    })
+    if (!response.ok || !response.body) throw new Error('流式回复连接失败')
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    let requestId = ''
+    let terminalType = ''
+    let lastEventId = options.lastEventId || ''
+    while (true) {
+      const part = await reader.read()
+      if (part.done) break
+      buffer += decoder.decode(part.value, { stream: true })
+      const frames = buffer.split('\n\n')
+      buffer = frames.pop() || ''
+      frames.forEach((frame) => {
+        const data = frame.split('\n').find((line) => line.startsWith('data: '))?.slice(6)
+        if (data) {
+          const event = JSON.parse(data) as { request_id?: string; event_type: string; payload: Record<string, unknown>; event_id: string }
+          requestId = event.request_id || requestId
+          lastEventId = event.event_id || lastEventId
+          if (['completed', 'degraded', 'error'].includes(event.event_type)) terminalType = event.event_type
+          onEvent(event)
+        }
+      })
+    }
+    return { requestId, terminalType, lastEventId }
+  },
   agentStatus() {
     return agentHttp.get<AgentStatus>('/agent/status')
   },
@@ -37,6 +80,9 @@ export const customerApi = {
       selected_ticket_no: selectedTicketNo || null,
       route_target: routeTarget
     })
+  },
+  replyResult(requestId: string) {
+    return agentHttp.get<{ status: string; result?: AgentReply }>(`/agent/replies/${requestId}`)
   },
   ticket(ticketNo: string) {
     return agentHttp.get<Ticket>(`/customer/tickets/${ticketNo}`)

@@ -1,20 +1,22 @@
 import json
 import os
-import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from repositories.database import DatabaseAdapter, DatabaseConfig
 
 
 class AgentCallLogRepository:
     """Agent 调用日志仓储，负责把模型调用和工具调用审计记录持久化到 SQLite。"""
 
-    def __init__(self, db_path: str | None = None) -> None:
+    def __init__(self, db_path: str | None = None, database: DatabaseAdapter | None = None) -> None:
         """初始化日志数据库路径，并确保 agent_call_log 表存在。"""
         default_path = Path(__file__).resolve().parents[1] / "data" / "agent_logs.db"
         self.db_path = Path(db_path or os.getenv("AGENT_LOG_DB_PATH", str(default_path)))
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_table()
+        self.database = database or DatabaseAdapter(DatabaseConfig.from_env(self.db_path))
+        if not self.database.is_postgres:
+            self._init_table()
 
     def save(self, tool_name: str, input_data: dict[str, Any], output_data: dict[str, Any]) -> dict[str, Any]:
         """保存一条 Agent 调用日志，返回带主键的日志记录供内存兼容使用。"""
@@ -95,11 +97,9 @@ class AgentCallLogRepository:
                 """
             )
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self):
         """每次操作使用独立连接，避免 FastAPI 多请求下共享连接导致线程问题。"""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+        return self.database.connection()
 
     def _to_json(self, value: dict[str, Any]) -> str:
         """把调用入参和出参序列化为 JSON 字符串，便于后续落 MySQL 时平滑迁移。"""

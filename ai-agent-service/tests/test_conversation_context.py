@@ -596,10 +596,24 @@ class ConversationContextTest(unittest.TestCase):
         )
 
         self.assertIn("程序员", answer)
-        self.assertIn("订单、物流、售后、工单和发票", answer)
+        self.assertIn("不过我主要负责订单、物流、售后、工单和发票等业务问题", answer)
         self.assertEqual(captured_payloads[0]["reply_mode"], "out_of_scope")
         self.assertIsNone(captured_payloads[0]["order"])
         self.assertIsNone(captured_payloads[0]["logistics"])
+
+    def test_out_of_scope_boundary_is_normalized_without_question_specific_patch(self):
+        """普通越界回复应统一替换突兀身份声明，而不是只修补某个具体问题。"""
+        raw_answer = (
+            "天空看起来是蓝色，是因为太阳光穿过大气层时，波长较短的蓝光被空气分子散射得更多。\n\n"
+            "我是您的企业客服助手，主要处理订单、物流、售后、工单和发票相关问题。如果您有这些方面的疑问，欢迎继续提问。"
+        )
+
+        answer = CustomerServiceAgent._ensure_out_of_scope_boundary(raw_answer)
+
+        self.assertIn("天空看起来是蓝色", answer)
+        self.assertIn("不过我主要负责订单、物流、售后、工单和发票等业务问题", answer)
+        self.assertNotIn("我是您的企业客服助手", answer)
+        self.assertNotIn("欢迎继续提问", answer)
 
     def test_human_request_takes_over_conversation_without_ticket(self):
         """明确转人工请求只接管当前会话，不创建业务工单。"""

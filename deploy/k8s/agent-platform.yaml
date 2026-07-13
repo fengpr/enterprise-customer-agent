@@ -1,0 +1,120 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-runtime-config
+data:
+  BUSINESS_SERVICE_URL: http://business-service:8081
+  REDIS_URL: redis://redis:6379/0
+  EVALUATION_EMBEDDED_DISPATCHER: "false"
+  AGENT_MAX_CONCURRENCY: "20"
+  AGENT_PER_SUBJECT_CONCURRENCY: "2"
+  AGENT_ADMISSION_TTL_SECONDS: "90"
+  AGENT_EXECUTION_QUEUE_ENABLED: "true"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: agent-runtime-secrets
+type: Opaque
+stringData:
+  # 部署时由 CI/CD 或密钥管理系统替换，禁止提交真实值。
+  DEEPSEEK_API_KEY: CHANGE_ME
+  RAG_DATABASE_URL: postgresql://CHANGE_ME
+  AGENT_INTERNAL_SECRET: CHANGE_ME
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: agent-api }
+  template:
+    metadata:
+      labels: { app: agent-api }
+    spec:
+      containers:
+        - name: api
+          image: enterprise-customer-agent/agent-service:latest
+          envFrom: [{ configMapRef: { name: agent-runtime-config } }, { secretRef: { name: agent-runtime-secrets } }]
+          ports: [{ containerPort: 8000 }]
+          resources:
+            requests: { cpu: "500m", memory: "768Mi" }
+            limits: { cpu: "2", memory: "2Gi" }
+          readinessProbe: { httpGet: { path: /health, port: 8000 }, initialDelaySeconds: 8 }
+          livenessProbe: { httpGet: { path: /health, port: 8000 }, initialDelaySeconds: 20 }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-api
+spec:
+  selector: { app: agent-api }
+  ports: [{ port: 80, targetPort: 8000 }]
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: agent-api
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: agent-api }
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 65 } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: agent-worker }
+  template:
+    metadata:
+      labels: { app: agent-worker }
+    spec:
+      containers:
+        - name: worker
+          image: enterprise-customer-agent/agent-service:latest
+          command: ["python", "-m", "rag.agent_execution_worker"]
+          envFrom: [{ configMapRef: { name: agent-runtime-config } }, { secretRef: { name: agent-runtime-secrets } }]
+          resources:
+            requests: { cpu: "500m", memory: "1Gi" }
+            limits: { cpu: "2", memory: "3Gi" }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: evaluation-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: evaluation-worker }
+  template:
+    metadata:
+      labels: { app: evaluation-worker }
+    spec:
+      containers:
+        - name: worker
+          image: enterprise-customer-agent/agent-service:latest
+          command: ["python", "-m", "rag.evaluation_worker", "--interval", "2"]
+          envFrom: [{ configMapRef: { name: agent-runtime-config } }, { secretRef: { name: agent-runtime-secrets } }]
+          resources:
+            requests: { cpu: "500m", memory: "1Gi" }
+            limits: { cpu: "2", memory: "3Gi" }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: agent-api
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: agent-api, port: { number: 80 } } }

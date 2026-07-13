@@ -5,8 +5,26 @@ import type {
   StaffMemberAvailabilityRequest,
   StaffMemberStatus,
   StaffReplyDraft,
+  RagEvaluationReport,
+  RagEvaluationJob,
+  OnlineEvaluationReport,
   Ticket
 } from '@/types/api'
+
+export const ragEvaluationApi = {
+  report() {
+    return agentHttp.get<RagEvaluationReport>('/staff/rag/evaluation')
+  },
+  createJob(maxSamples: number | null) {
+    return agentHttp.post<RagEvaluationJob>('/staff/rag/evaluation/jobs', { max_samples: maxSamples })
+  },
+  getJob(jobId: string) {
+    return agentHttp.get<RagEvaluationJob>(`/staff/rag/evaluation/jobs/${jobId}`)
+  },
+  onlineReport(days = 7) {
+    return agentHttp.get<OnlineEvaluationReport>('/staff/evaluation/online/report', { params: { days } })
+  }
+}
 
 export const staffTicketApi = {
   list(status: string) {

@@ -1,0 +1,61 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: customer_agent
+      POSTGRES_USER: customer_agent
+      POSTGRES_PASSWORD: change-me
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U customer_agent -d customer_agent"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  business-service:
+    build: ./business-service
+    environment:
+      SPRING_PROFILES_ACTIVE: postgres
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/customer_agent
+      SPRING_DATASOURCE_USERNAME: customer_agent
+      SPRING_DATASOURCE_PASSWORD: change-me
+    depends_on:
+      postgres:
+        condition: service_healthy
+  agent-api:
+    build: ./ai-agent-service
+    environment:
+      BUSINESS_SERVICE_URL: http://business-service:8081
+      REDIS_URL: redis://redis:6379/0
+      EVALUATION_EMBEDDED_DISPATCHER: "false"
+      AGENT_EXECUTION_QUEUE_ENABLED: "true"
+      RAG_DATABASE_URL: postgresql://customer_agent:change-me@postgres:5432/customer_agent
+    depends_on:
+      redis:
+        condition: service_healthy
+  evaluation-worker:
+    build: ./ai-agent-service
+    command: ["python", "-m", "rag.evaluation_worker", "--interval", "2"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      RAG_DATABASE_URL: postgresql://customer_agent:change-me@postgres:5432/customer_agent
+    depends_on:
+      redis:
+        condition: service_healthy
+  agent-worker:
+    build: ./ai-agent-service
+    command: ["python", "-m", "rag.agent_execution_worker"]
+    environment:
+      BUSINESS_SERVICE_URL: http://business-service:8081
+      REDIS_URL: redis://redis:6379/0
+      AGENT_EXECUTION_QUEUE_ENABLED: "true"
+      RAG_DATABASE_URL: postgresql://customer_agent:change-me@postgres:5432/customer_agent
+    depends_on:
+      redis:
+        condition: service_healthy

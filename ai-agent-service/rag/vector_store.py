@@ -1,5 +1,6 @@
 import math
 import re
+import hashlib
 from datetime import datetime
 from typing import Any
 
@@ -151,6 +152,8 @@ def is_customer_visible_chunk(paragraph: str, heading_path: list[str] | tuple[st
 def _to_citation(chunk: KnowledgeChunk, *, score: float, bm25_score: float, query: str) -> Citation:
     """把内部 chunk 转换为 Agent 使用的引用对象。"""
     return Citation(
+        # 使用内容哈希生成稳定片段标识，模型和评测均只能引用本次实际召回的 ID。
+        citation_id=_citation_id(chunk),
         doc_name=chunk.doc_name,
         version=chunk.version,
         paragraph=chunk.paragraph,
@@ -174,6 +177,12 @@ def _to_citation(chunk: KnowledgeChunk, *, score: float, bm25_score: float, quer
             "embedding_version": chunk.embedding_version,
         },
     )
+
+
+def _citation_id(chunk: KnowledgeChunk) -> str:
+    """生成跨请求稳定的知识片段标识，供回答引用和后置校验使用。"""
+    source = "|".join([chunk.doc_name, chunk.version, str(chunk.chunk_index), chunk.paragraph])
+    return f"kb-{hashlib.sha256(source.encode('utf-8')).hexdigest()[:12]}"
 
 
 def _default_chunks() -> list[KnowledgeChunk]:

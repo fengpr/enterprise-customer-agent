@@ -133,6 +133,46 @@ export interface StaffReplyDraft {
   draft_message: string
 }
 
+export interface RagCitationValidation {
+  groundedness: number
+  citation_precision: number
+  citation_recall: number
+  hallucination_detected: boolean
+  unsupported_claims: Array<{ claim: string; reason: string }>
+}
+
+export interface RagEvaluationRow {
+  sample: { query: string; expected_doc: string; business_scope: string }
+  failures: string[]
+  generated_answer: string
+  citation_validation: RagCitationValidation
+  missing_required_facts: string[]
+}
+
+export interface RagEvaluationReport {
+  evaluation_mode?: 'baseline' | 'agent' | string
+  metrics: Record<string, number | null>
+  failures: RagEvaluationRow[]
+}
+
+export interface RagEvaluationJob {
+  job_id: string
+  status: 'PENDING' | 'PROCESSING' | 'SUCCEEDED' | 'FAILED'
+  created_at: string
+  started_at: string | null
+  finished_at: string | null
+  report: RagEvaluationReport | null
+  error: string | null
+  payload?: { max_samples?: number | null }
+}
+
+export interface OnlineEvaluationReport {
+  queue: { counts: Record<string, number>; daily_budget: number; budget_used: number }
+  metrics: Record<string, number | null>
+  items: Array<{ trace_id: string; status: string; sampling_reason: string; created_at: string; result: { failures?: string[]; reasons?: Record<string, string> } }>
+  failures: Array<{ trace_id: string; status: string; sampling_reason: string; created_at: string; result: { failures?: string[]; reasons?: Record<string, string> } }>
+}
+
 export interface StaffHandoffSession {
   session_id: string
   customer_id: number

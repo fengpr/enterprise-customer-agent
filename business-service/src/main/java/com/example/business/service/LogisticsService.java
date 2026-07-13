@@ -4,6 +4,7 @@ import com.example.business.dto.LogisticsTraceView;
 import com.example.business.dto.LogisticsView;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.sql.Timestamp;
@@ -37,10 +38,13 @@ public class LogisticsService {
             toLocalDateTime(rs.getTimestamp("occurred_at"))
     );
 
-    public LogisticsService(JdbcTemplate jdbcTemplate) {
+    public LogisticsService(JdbcTemplate jdbcTemplate, @Value("${spring.datasource.driver-class-name:org.sqlite.JDBC}") String driverClassName) {
         this.jdbcTemplate = jdbcTemplate;
-        initTables();
-        seedLogistics();
+        // PostgreSQL profile 下由 Flyway 管理物流表，SQLite profile 保持本地初始化。
+        if (!driverClassName.toLowerCase().contains("postgresql")) {
+            initTables();
+            seedLogistics();
+        }
     }
 
     /**

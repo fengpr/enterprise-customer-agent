@@ -1,76 +1,90 @@
-import os
+"""工单 Tool：通过统一韧性客户端访问 Java 业务系统。"""
 
-import httpx
+import os
+import uuid
+import hashlib
+
+from services.resilient_client import ResilienceError, ResilientClient
+from services.cache_service import CacheService
+from services.observability import current_context
 
 
 class TicketTools:
-    """工单工具，封装 Agent 对 Java 业务系统的受控调用。"""
+    """封装工单查询和受控写操作，写操作仅在携带幂等键时允许重试。"""
 
-    def __init__(self) -> None:
-        """读取业务服务地址和 Agent 内部密钥，便于不同环境切换。"""
+    def __init__(self, client: ResilientClient | None = None, cache: CacheService | None = None) -> None:
         self.base_url = os.getenv("BUSINESS_SERVICE_URL", "http://localhost:8081")
         self.internal_secret = os.getenv("AGENT_INTERNAL_SECRET", "enterprise-customer-agent-demo-internal-secret")
+        self.client = client or ResilientClient(downstream="java_ticket")
+        self.cache = cache or CacheService(namespace="business")
 
     def create_ticket(self, payload: dict, auth_token: str | None = None) -> dict:
-        """创建客服工单，写入动作必须携带客户 Token 让 Java 校验身份。"""
+        """创建工单，生成并透传幂等键后才允许网络重试。"""
+        key = str(payload.get("idempotency_key") or payload.get("idempotencyKey") or uuid.uuid4())
         try:
-            # 工单创建是受控写入动作，客户身份以 Java Token 为准。
-            headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
-            response = httpx.post(f"{self.base_url}/api/tickets", json=payload, headers=headers, timeout=5.0)
-            response.raise_for_status()
-            return {"status": "success", "data": response.json()}
-        except Exception as exc:
-            return {"status": "failed", "error": str(exc)}
+            response = self.client.request_sync("POST", f"{self.base_url}/api/tickets", json=payload, headers=self._headers(auth_token, key), idempotency_key=key)
+            data = response.json(); self._invalidate_ticket(auth_token, data.get("ticketNo")); return {"status": "success", "data": data}
+        except ResilienceError as exc:
+            return self._failure(exc)
 
     def list_customer_tickets(self, auth_token: str | None = None) -> dict:
-        """查询当前客户工单列表，用于动作建单前做幂等检查。"""
+        """查询当前客户工单列表，属于可重试只读操作。"""
         try:
-            # 工单列表由 Java 根据 Token 限定当前客户，Agent 不信任前端 customer_id。
-            headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
-            response = httpx.get(f"{self.base_url}/api/tickets", headers=headers, timeout=5.0)
-            response.raise_for_status()
-            return {"status": "success", "data": response.json()}
-        except Exception as exc:
-            return {"status": "failed", "error": str(exc)}
+            key = self.cache.key("ticket-list", customer=self._customer_key(auth_token))
+            return {"status": "success", "data": self.cache.get_or_load(key, int(os.getenv("TICKET_CACHE_TTL_SECONDS", "60")), lambda: self.client.request_sync("GET", f"{self.base_url}/api/tickets", headers=self._headers(auth_token)).json(), metric="ticket_cache_hit")}
+        except ResilienceError as exc:
+            return self._failure(exc)
 
     def query_ticket_status(self, ticket_no: str, auth_token: str | None = None) -> dict:
-        """查询当前客户自己的工单状态，供客户询问处理进度时使用。"""
+        """查询工单状态，Java 负责客户归属权限校验。"""
         try:
-            # 工单详情由 Java 校验客户归属，避免客户查询他人工单。
-            headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
-            response = httpx.get(f"{self.base_url}/api/tickets/{ticket_no}", headers=headers, timeout=5.0)
-            response.raise_for_status()
-            return {"status": "success", "query_type": "ticket_status", "data": response.json()}
-        except Exception as exc:
-            return {"status": "failed", "query_type": "ticket_status", "ticket_no": ticket_no, "error": str(exc)}
+            key = self._ticket_key(auth_token, ticket_no)
+            data = self.cache.get_or_load(key, int(os.getenv("TICKET_CACHE_TTL_SECONDS", "60")), lambda: self.client.request_sync("GET", f"{self.base_url}/api/tickets/{ticket_no}", headers=self._headers(auth_token)).json(), metric="ticket_cache_hit")
+            return {"status": "success", "query_type": "ticket_status", "data": data}
+        except ResilienceError as exc:
+            return {**self._failure(exc), "query_type": "ticket_status", "ticket_no": ticket_no}
 
-    def urge_ticket(self, ticket_no: str, reason: str | None = None, auth_token: str | None = None) -> dict:
-        """客户催办自己的工单，Java 会落库催办记录并更新最近催办摘要。"""
+    def urge_ticket(self, ticket_no: str, reason: str | None = None, auth_token: str | None = None, idempotency_key: str | None = None) -> dict:
+        """催办为写操作，调用方未提供幂等键时禁止自动重试。"""
         try:
-            # 催办属于客户侧低风险写入动作，但仍必须由 Java 按 Token 校验工单归属。
-            headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
-            response = httpx.post(
-                f"{self.base_url}/api/tickets/{ticket_no}/urge",
-                json={"reason": reason or "客户催办处理进度"},
-                headers=headers,
-                timeout=5.0,
-            )
-            response.raise_for_status()
-            return {"status": "success", "query_type": "ticket_urge", "data": response.json()}
-        except Exception as exc:
-            return {"status": "failed", "query_type": "ticket_urge", "ticket_no": ticket_no, "error": str(exc)}
+            response = self.client.request_sync("POST", f"{self.base_url}/api/tickets/{ticket_no}/urge", json={"reason": reason or "客户催办处理进度"}, headers=self._headers(auth_token, idempotency_key), idempotency_key=idempotency_key)
+            data = response.json(); self._invalidate_ticket(auth_token, ticket_no); return {"status": "success", "query_type": "ticket_urge", "data": data}
+        except ResilienceError as exc:
+            return {**self._failure(exc), "query_type": "ticket_urge", "ticket_no": ticket_no}
 
-    def auto_assign_ticket(self, ticket_no: str) -> dict:
-        """Agent 建单成功后触发 Java 内部自动派单，最终处理人仍由业务系统规则决定。"""
+    def auto_assign_ticket(self, ticket_no: str, idempotency_key: str | None = None) -> dict:
+        """内部自动派单同样遵守幂等键重试约束。"""
         try:
-            # 自动派单是内部受控动作，使用共享密钥而不是客户 Token 调用坐席接口。
-            headers = {"X-Agent-Internal-Secret": self.internal_secret}
-            response = httpx.post(
-                f"{self.base_url}/api/internal/tickets/{ticket_no}/auto-assign",
-                headers=headers,
-                timeout=5.0,
-            )
-            response.raise_for_status()
+            response = self.client.request_sync("POST", f"{self.base_url}/api/internal/tickets/{ticket_no}/auto-assign", headers={"X-Agent-Internal-Secret": self.internal_secret, **({"Idempotency-Key": idempotency_key} if idempotency_key else {})}, idempotency_key=idempotency_key)
             return {"status": "success", "data": response.json()}
-        except Exception as exc:
-            return {"status": "failed", "error": str(exc)}
+        except ResilienceError as exc:
+            return self._failure(exc)
+
+    @staticmethod
+    def _headers(auth_token: str | None, idempotency_key: str | None = None) -> dict[str, str]:
+        """构造客户身份和可选幂等键请求头。"""
+        context = current_context()
+        headers = {"X-Request-ID": context["request_id"], "X-Trace-ID": context["trace_id"]}
+        if auth_token:
+            headers["Authorization"] = f"Bearer {auth_token}"
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
+        return headers
+
+    @staticmethod
+    def _failure(error: ResilienceError) -> dict:
+        """将统一异常投影为 Agent 可消费的工具失败结果。"""
+        return {"status": "failed", "error": error.error_type, "downstream": error.downstream, "retryable": error.retryable}
+
+    @staticmethod
+    def _customer_key(auth_token: str | None) -> str:
+        """使用 Token 摘要隔离客户工单缓存。"""
+        return hashlib.sha256((auth_token or "anonymous").encode()).hexdigest()[:16]
+
+    def _ticket_key(self, auth_token: str | None, ticket_no: str | None) -> str:
+        """构造客户与工单共同参与的详情缓存 key。"""
+        return self.cache.key("ticket", customer=self._customer_key(auth_token), ticket_no=ticket_no or "")
+
+    def _invalidate_ticket(self, auth_token: str | None, ticket_no: str | None) -> None:
+        """写成功后删除详情和列表缓存，读缓存不参与写路径。"""
+        self.cache.delete(self._ticket_key(auth_token, ticket_no), self.cache.key("ticket-list", customer=self._customer_key(auth_token)))

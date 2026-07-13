@@ -70,6 +70,26 @@ class ReturnGoodsPolicyGuardrailTest(unittest.TestCase):
         self.assertFalse(result.order_related)
         self.assertNotIn("low_confidence", result.risk_reasons)
 
+    def test_return_goods_policy_uses_rule_fast_path_before_intent_llm(self):
+        """明确的退货规则问法应跳过意图 LLM，缩短首个流式 token 前的等待。"""
+        class UnexpectedIntentLLM:
+            """若快路径失效则立即让测试失败。"""
+
+            def invoke(self, _message):
+                raise AssertionError("退货规则不应调用意图 LLM")
+
+        agent = object.__new__(CustomerServiceAgent)
+        agent.llm_analyzer = UnexpectedIntentLLM()
+        agent.log_repository = _FakeLogRepository()
+        agent.call_logs = []
+
+        result = agent._analyze_with_llm_fallback({"message": "查询退货规则", "conversation_context": None})
+
+        self.assertEqual(result.intent, "refund")
+        self.assertEqual(result.user_goal, "policy_consult")
+        self.assertEqual(result.action_type, "return_goods")
+        self.assertFalse(result.need_human)
+
     def test_order_status_query_can_use_order_context(self):
         """只有明确询问具体订单能否退货时，才进入订单状态查询。"""
         agent = object.__new__(CustomerServiceAgent)
@@ -476,6 +496,56 @@ class ReturnGoodsPolicyGuardrailTest(unittest.TestCase):
         self.assertNotIn("适用范围", answer)
         self.assertNotIn("典型表达", answer)
         self.assertNotIn("EC202606220001", answer)
+
+    def test_return_goods_policy_rejects_false_no_policy_llm_answer(self):
+        """已召回明确退货规则时，模型不得误报“知识库未找到规则”。"""
+        agent = object.__new__(CustomerServiceAgent)
+        agent.llm_analyzer = _FakeReplyLLM(answer="当前知识库未找到明确退货规则。")
+        agent.log_repository = _FakeLogRepository()
+        agent.call_logs = []
+        analysis = IntentResult(
+            intent="refund",
+            user_goal="policy_consult",
+            emotion="normal",
+            order_related=False,
+            order_no=[],
+            product_name=None,
+            need_order_query=False,
+            need_ticket=False,
+            need_human=False,
+            priority="medium",
+            confidence=0.9,
+            summary="查询退货规则",
+            risk_reasons=[],
+            action_type="return_goods",
+        )
+        citations = [
+            Citation(
+                doc_name="return_goods_policy",
+                version="V1.1",
+                paragraph="签收后 7 天内且商品完好、不影响二次销售时，可在订单售后页面提交退货申请；最终是否通过以售后审核结果为准。",
+                score=0.86,
+                collection="return_policy",
+                business_scope="return_goods",
+                heading_path=["退货规则", "客户可见规则"],
+                risk_level="medium",
+                answerable_intents=["refund", "consult"],
+            )
+        ]
+
+        answer = agent._compose_return_goods_policy_answer(
+            {
+                "message": "查询退货规则",
+                "analysis": analysis,
+                "citations": citations,
+                "tool_results": [],
+            },
+            citations,
+        )
+
+        self.assertIn("签收后 7 天内", answer)
+        self.assertIn("最终是否通过以售后审核结果为准", answer)
+        self.assertNotIn("当前知识库未找到明确退货规则", answer)
 
     def test_return_goods_policy_rejects_order_followup_llm_answer(self):
         """纯退货规则咨询不能接受索要订单号或建议人工核实的 LLM 回复。"""

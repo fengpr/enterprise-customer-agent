@@ -7,6 +7,7 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from agents.intent_normalizer import infer_user_goal
 from schemas.intent_schema import IntentResult, LLMIntentDraft
+from services.resilient_client import ResilientInvoker
 
 load_dotenv()
 
@@ -23,6 +24,8 @@ class LLMIntentAnalyzer:
         self.timeout = float(os.getenv("LLM_TIMEOUT", "25"))
         self.api_key = self._resolve_api_key()
         self.base_url = self._resolve_base_url()
+        # 在线推理与 DeepEval Judge 使用不同 downstream，避免评测抢占客户回复舱壁。
+        self.resilient_invoker = ResilientInvoker()
         self.chain = self._build_chain()
 
     @classmethod
@@ -36,12 +39,12 @@ class LLMIntentAnalyzer:
 
     def invoke(self, message: str) -> IntentResult:
         """调用真实 LLM 输出结构化意图结果，缺少可推导字段时由本地规则补齐。"""
-        result = self.chain.invoke({"message": message})
+        result = self.resilient_invoker.invoke(lambda: self.chain.invoke({"message": message}))
         payload = self._parse_json_payload(result)
         draft = LLMIntentDraft.model_validate(payload)
         return self._complete_intent_result(message, draft)
 
-    def generate_customer_reply(self, payload: dict) -> str:
+    def generate_customer_reply(self, payload: dict, on_delta=None) -> str:
         """基于可信业务证据生成客户侧回复，不允许模型自行编造政策、订单或物流节点。"""
         prompt = ChatPromptTemplate.from_messages(
             [
@@ -64,8 +67,11 @@ class LLMIntentAnalyzer:
 10. reply_mode=collect_slots 时，只追问 extra_context 中要求补充的信息，不要解释整套政策，也不要说已经建单。
 11. reply_mode=deduplicated_ticket 时，直接说明客户之前已经提交过相关申请，引用 ticket.ticketNo 和 ticket.status，不要说本次新建了工单。
 12. 控制在 80-180 字，语气自然、专业、有人味。
-13. reply_mode=out_of_scope 时是唯一的常识回答例外：可以使用模型掌握的稳定、低风险通用知识，先用一到两句直接回答问题，
-    再说明主要能力是订单、物流、售后、工单和发票。不得查询或引用订单、物流、工单、知识库和历史业务上下文，
+13. 当使用知识库中的政策、条件、时效或流程事实时，必须紧跟对应的 citation_id，格式为【来源：kb-xxxxxxxxxxxx】；
+   citation_id 必须来自输入 citations，不能虚构。没有足够证据时，明确说明暂无法确认，不得补充具体事实。
+14. reply_mode=out_of_scope 时是唯一的常识回答例外：可以使用模型掌握的稳定、低风险通用知识，先用一到两句直接回答问题，
+    再用“不过我主要负责订单、物流、售后、工单和发票等业务问题”这类自然转折说明边界；不要自我介绍成“企业客服助手”。
+    不得查询或引用订单、物流、工单、知识库和历史业务上下文，
     不得自动转人工或声称已创建工单；医疗、法律、金融投资和危险操作不得在此模式下给出具体建议。
 """,
                 ),
@@ -87,11 +93,26 @@ class LLMIntentAnalyzer:
                 ),
             ]
         )
-        result = (prompt | self._build_llm(self.response_temperature)).invoke(payload)
-        content = getattr(result, "content", result)
-        if isinstance(content, list):
-            content = "".join(str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in content)
-        text = str(content).strip()
+        reply_chain = prompt | self._build_llm(self.response_temperature)
+        # SSE 场景直接消费模型原生 stream；非流式调用仍保持既有 invoke 语义。
+        if on_delta is None:
+            result = self.resilient_invoker.invoke(lambda: reply_chain.invoke(payload))
+            content = getattr(result, "content", result)
+            if isinstance(content, list):
+                content = "".join(str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in content)
+            text = str(content).strip()
+        else:
+            pieces: list[str] = []
+            for chunk in self.resilient_invoker.stream(lambda: reply_chain.stream(payload)):
+                content = getattr(chunk, "content", chunk)
+                if isinstance(content, list):
+                    content = "".join(str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in content)
+                delta = str(content)
+                if delta:
+                    pieces.append(delta)
+                    # 仅发送模型文本片段，不发送 LangChain 消息对象或供应商元数据。
+                    on_delta(delta)
+            text = "".join(pieces).strip()
         # 回复节点只允许返回纯客户话术，剥离模型偶发产生的代码块包裹。
         return re.sub(r"^```(?:text|markdown)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
 

@@ -116,9 +116,40 @@ class AgentReplyRequest(BaseModel):
     conversation_context: dict[str, Any] | None = None
 
 
+class AgentExecutionJob(BaseModel):
+    """Redis Stream 中的安全任务结构，不保存客户 Authorization 原始 Token。"""
+
+    request_id: str
+    customer_id: int
+    message: str
+    session_id: str | None = None
+    selected_order_no: str | None = None
+    selected_ticket_no: str | None = None
+    route_target: Literal["ai", "human", "both"] = "ai"
+    idempotency_key: str
+    created_at: str | None = None
+    expires_at: str | None = None
+    route_source: str = "api"
+    risk_level: str = "normal"
+    trace_id: str | None = None
+    execution_credential: str | None = None
+
+    def to_request(self) -> AgentReplyRequest:
+        """转换为执行服务所需请求；凭证仅代表内部执行身份，不是客户原始 Token。"""
+        return AgentReplyRequest(
+            message=self.message,
+            session_id=self.session_id,
+            customer_id=self.customer_id,
+            selected_order_no=self.selected_order_no,
+            selected_ticket_no=self.selected_ticket_no,
+            route_target=self.route_target,
+        )
+
+
 class Citation(BaseModel):
     """知识库引用片段，用于证明 AI 回复的业务依据。"""
 
+    citation_id: str | None = None
     doc_name: str
     version: str
     paragraph: str
@@ -145,6 +176,7 @@ class AgentReply(BaseModel):
     need_human: bool
     analysis: IntentResult
     citations: list[Citation] = Field(default_factory=list)
+    citation_validation: dict[str, Any] = Field(default_factory=dict)
     tool_results: list[dict[str, Any]] = Field(default_factory=list)
     ticket_result: dict[str, Any] | None = None
     risk_reasons: list[str] = Field(default_factory=list)

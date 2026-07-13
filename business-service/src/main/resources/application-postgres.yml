@@ -1,0 +1,22 @@
+# PostgreSQL 生产配置：连接池参数通过环境变量覆盖，开发环境仍使用默认 SQLite 配置。
+spring:
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/enterprise_customer_agent}
+    username: ${DB_USERNAME:enterprise_agent}
+    password: ${DB_PASSWORD:change-me}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: ${DB_POOL_MAX_SIZE:20}
+      minimum-idle: ${DB_POOL_MIN_IDLE:5}
+      connection-timeout: ${DB_CONNECTION_TIMEOUT_MS:3000}
+      validation-timeout: ${DB_VALIDATION_TIMEOUT_MS:1000}
+  flyway:
+    # PostgreSQL 环境统一由版本化迁移管理；首次接入已有库时允许建立基线记录。
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+server:
+  tomcat:
+    threads:
+      max: ${SERVER_MAX_THREADS:200}
+    accept-count: ${SERVER_ACCEPT_COUNT:100}

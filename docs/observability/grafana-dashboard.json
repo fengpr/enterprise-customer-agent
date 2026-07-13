@@ -1,0 +1,11 @@
+{
+  "title": "Enterprise Customer Agent",
+  "schemaVersion": 39,
+  "panels": [
+    {"title": "Agent 总览：QPS / P95 / 错误率", "type": "timeseries", "targets": [{"expr": "sum(rate(agent_http_requests_total[1m]))"}, {"expr": "histogram_quantile(0.95, sum(rate(agent_http_request_duration_seconds_bucket[5m])) by (le))"}]},
+    {"title": "队列与 Worker", "type": "timeseries", "targets": [{"expr": "agent_queue_depth"}, {"expr": "agent_queue_pending"}, {"expr": "agent_dead_letter_depth"}, {"expr": "sum(rate(agent_worker_jobs_total[1m])) by (status)"}]},
+    {"title": "LLM 与 Java 工具", "type": "timeseries", "targets": [{"expr": "histogram_quantile(0.95, sum(rate(agent_downstream_duration_seconds_bucket[5m])) by (le, downstream))"}, {"expr": "sum(rate(agent_downstream_requests_total[5m])) by (downstream, outcome)"}]},
+    {"title": "缓存与 SSE", "type": "timeseries", "targets": [{"expr": "sum(rate(agent_cache_operations_total[5m])) by (cache, outcome)"}, {"expr": "agent_sse_active_connections"}, {"expr": "sum(rate(agent_sse_events_total[1m])) by (event_type)"}]},
+    {"title": "业务服务数据库", "type": "timeseries", "targets": [{"expr": "hikaricp_connections_active"}, {"expr": "hikaricp_connections_max"}, {"expr": "jdbc_connections_active"}]}
+  ]
+}

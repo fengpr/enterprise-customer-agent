@@ -3,6 +3,7 @@ package com.example.business.service;
 import com.example.business.entity.Product;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -23,10 +24,13 @@ public class ProductService {
             rs.getInt("status")
     );
 
-    public ProductService(JdbcTemplate jdbcTemplate) {
+    public ProductService(JdbcTemplate jdbcTemplate, @Value("${spring.datasource.driver-class-name:org.sqlite.JDBC}") String driverClassName) {
         this.jdbcTemplate = jdbcTemplate;
-        initTables();
-        seedProducts();
+        // SQLite 继续使用 Demo 建表；PostgreSQL 只允许 Flyway 维护 schema。
+        if (!driverClassName.toLowerCase().contains("postgresql")) {
+            initTables();
+            seedProducts();
+        }
     }
 
     /**

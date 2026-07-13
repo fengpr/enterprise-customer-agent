@@ -3,6 +3,7 @@ package com.example.business.service;
 import com.example.business.entity.Employee;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.sql.ResultSet;
@@ -37,10 +38,13 @@ public class EmployeeService {
             toLocalDateTime(rs.getTimestamp("updated_at"))
     );
 
-    public EmployeeService(JdbcTemplate jdbcTemplate) {
+    public EmployeeService(JdbcTemplate jdbcTemplate, @Value("${spring.datasource.driver-class-name:org.sqlite.JDBC}") String driverClassName) {
         this.jdbcTemplate = jdbcTemplate;
-        initTables();
-        seedEmployees();
+        // PostgreSQL profile 禁止服务层 DDL，统一由 Flyway migration 建表。
+        if (!driverClassName.toLowerCase().contains("postgresql")) {
+            initTables();
+            seedEmployees();
+        }
     }
 
     /**

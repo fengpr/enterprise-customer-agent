@@ -1,20 +1,22 @@
 import json
 import os
-import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from repositories.database import DatabaseAdapter, DatabaseConfig
 
 
 class ChatSessionRepository:
     """会话仓储，负责客服会话的创建、状态更新和按客户隔离查询。"""
 
-    def __init__(self, db_path: str | None = None) -> None:
+    def __init__(self, db_path: str | None = None, database: DatabaseAdapter | None = None) -> None:
         """初始化会话数据库，并确保会话表和消息表存在。"""
         default_path = Path(__file__).resolve().parents[1] / "data" / "customer_agent.db"
         self.db_path = Path(db_path or os.getenv("CHAT_DB_PATH", str(default_path)))
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_tables()
+        self.database = database or DatabaseAdapter(DatabaseConfig.from_env(self.db_path))
+        if not self.database.is_postgres:
+            self._init_tables()
 
     def create(self, customer_id: int | None, title: str) -> dict[str, Any]:
         """创建新客服会话，customer_id 来自登录态，用于后续数据隔离。"""
@@ -328,20 +330,18 @@ class ChatSessionRepository:
                 """
             )
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self):
         """每次数据库操作使用独立连接，避免多请求共享连接带来的线程问题。"""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+        return self.database.connection()
 
-    def _ensure_column(self, conn: sqlite3.Connection, table_name: str, column_name: str, column_type: str) -> None:
+    def _ensure_column(self, conn, table_name: str, column_name: str, column_type: str) -> None:
         """为旧 SQLite 数据库补充新增字段，避免历史 Demo 数据启动失败。"""
         rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
         if any(row["name"] == column_name for row in rows):
             return
         conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
 
-    def _row_to_session(self, row: sqlite3.Row) -> dict[str, Any]:
+    def _row_to_session(self, row) -> dict[str, Any]:
         """把 SQLite 行转换为接口返回字典。"""
         return {
             "id": row["id"],
@@ -525,11 +525,9 @@ class ChatMessageRepository:
             }
         return None
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self):
         """每次消息操作使用独立连接，保证 Streamlit 多次请求下稳定读写。"""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+        return self.session_repository.database.connection()
 
     def _load_extra(self, value: str | None) -> dict[str, Any]:
         """还原消息扩展 JSON，解析失败时返回空对象避免接口异常。"""

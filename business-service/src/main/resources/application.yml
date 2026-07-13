@@ -9,7 +9,22 @@ spring:
     driver-class-name: org.sqlite.JDBC
     username:
     password:
+  # SQLite 是已有本地开发库，表结构仍由本地初始化逻辑维护，不能执行 PostgreSQL Flyway 脚本。
+  flyway:
+    enabled: false
 
 logging:
   level:
     com.example.business: INFO
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      show-details: when_authorized
+  metrics:
+    tags:
+      application: business-service
