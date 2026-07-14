@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, generate_latest
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
@@ -93,7 +93,47 @@ def prometheus_metrics() -> PlainTextResponse:
 @app.get("/api/agent/status")
 def status() -> dict:
     """返回 Agent 和 LLM 配置状态，用于排查前端无输出问题。"""
-    return {"status": "ok", "llm": agent.llm_status()}
+    return {
+        "status": "ok",
+        "llm": agent.llm_status(),
+        "queue": {
+            "enabled": agent_execution_queue.enabled,
+            "active_worker": agent_execution_queue.has_active_worker() if agent_execution_queue.enabled else False,
+        },
+    }
+
+
+@app.get("/api/staff/system/monitor")
+def staff_system_monitor(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """返回坐席端轻量系统监控快照；局部指标读取失败不能影响页面整体可用性。"""
+    _require_staff_user(authorization)
+    queue_snapshot = agent_execution_queue.snapshot()
+    metric_snapshot = _system_metric_snapshot()
+    return {
+        "agent_status": {
+            "status": "ok",
+            "llm": agent.llm_status(),
+        },
+        "queue": {
+            "available": queue_snapshot.get("available", False),
+            "enabled": queue_snapshot.get("enabled", False),
+            "stream_depth": queue_snapshot.get("stream_depth"),
+            "pending": queue_snapshot.get("pending"),
+            "running": queue_snapshot.get("running"),
+            "retrying": queue_snapshot.get("retrying"),
+            "error": queue_snapshot.get("error"),
+        },
+        "worker": {
+            "active": queue_snapshot.get("active_worker", False),
+        },
+        "dlq": {
+            "count": queue_snapshot.get("dead_letter"),
+        },
+        "llm": metric_snapshot["llm"],
+        "cache": metric_snapshot["cache"],
+        "degraded": metric_snapshot["degraded"],
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @app.post("/api/auth/login")
@@ -149,12 +189,30 @@ def _overload_response() -> dict[str, Any]:
     }
 
 
+def _worker_unavailable_response() -> dict[str, Any]:
+    """后台 Worker 未就绪时返回明确终态，避免客户侧长时间停留在排队中。"""
+    metrics.mark_degraded()
+    return {
+        "answer": "当前智能客服服务暂时不可用，请稍后重试，或转人工客服处理。",
+        "customer_message": "当前智能客服服务暂时不可用，请稍后重试，或转人工客服处理。",
+        "decision_type": "human_takeover",
+        "service_status": "智能客服暂不可用",
+        "auto_send": False,
+        "need_human": True,
+        "degraded": True,
+        "retry_after": int(os.getenv("AGENT_WORKER_RETRY_AFTER_SECONDS", "10")),
+        "error_code": "AGENT_WORKER_UNAVAILABLE",
+    }
+
+
 @app.post("/api/agent/reply", response_model=None)
 def reply(payload: AgentReplyRequest, request: Request, authorization: str | None = Header(default=None), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict | JSONResponse:
     """同步兼容入口只创建/复用可靠任务并短等待，绝不在 API 进程直接执行 Agent。"""
     current_user = _current_login_user(authorization)
     if not agent_execution_queue.enabled:
         return JSONResponse(status_code=503, content=_overload_response() | {"status": "degraded", "queued": False, "error_code": "QUEUE_UNAVAILABLE"})
+    if not agent_execution_queue.has_active_worker():
+        return JSONResponse(status_code=503, content=_worker_unavailable_response() | {"status": "degraded", "queued": False})
     execution_payload = payload.model_copy(update={"customer_id": current_user["customer_id"], "auth_token": _bearer_token(authorization)})
     request_id = _enqueue_execution_job(execution_payload, authorization, idempotency_key, "sync")
     deadline = time.monotonic() + float(os.getenv("AGENT_SYNC_WAIT_SECONDS", "3"))
@@ -235,6 +293,11 @@ async def reply_stream_v2(payload: AgentReplyRequest, request: Request, authoriz
             event = stream_event_service.publish("unavailable", "degraded", _overload_response())
             yield stream_event_service.to_sse(event)
         return StreamingResponse(unavailable(), media_type="text/event-stream")
+    if not agent_execution_queue.has_active_worker():
+        async def worker_unavailable():
+            event = stream_event_service.publish("unavailable", "degraded", _worker_unavailable_response())
+            yield stream_event_service.to_sse(event)
+        return StreamingResponse(worker_unavailable(), media_type="text/event-stream")
 
     execution_payload = payload.model_copy(update={"customer_id": current_user["customer_id"], "auth_token": _bearer_token(authorization)})
     request_id = _enqueue_execution_job(execution_payload, authorization, idempotency_key, "sse")
@@ -977,6 +1040,83 @@ def _response_detail(response: httpx.Response) -> Any:
         return response.json()
     except ValueError:
         return response.text
+
+
+def _system_metric_snapshot() -> dict[str, Any]:
+    """聚合当前进程 Prometheus 指标，供内部监控页以 JSON 方式展示关键异常与缓存命中率。"""
+    try:
+        llm_errors = {
+            outcome: int(_sum_metric("agent_downstream_requests_total", {"outcome": outcome}, downstream_contains="llm"))
+            for outcome in ("timeout", "rate_limit_429", "circuit_open")
+        }
+        return {
+            "llm": llm_errors,
+            "cache": {
+                "rag": _cache_metric("rag_cache_hit"),
+                "order": _cache_metric("order_cache_hit"),
+                "ticket": _cache_metric("ticket_cache_hit"),
+                "identity": _cache_metric("identity_cache_hit"),
+                "session": _cache_metric("session_cache_hit"),
+            },
+            # 兼容早期 RuntimeMetrics 的降级计数；新 Prometheus Counter 有 reason 标签。
+            "degraded": {
+                "total": int(metrics.degraded + _sum_metric("agent_degraded_total")),
+                "by_reason": _labeled_counter("agent_degraded_total", "reason"),
+            },
+        }
+    except Exception:
+        return {
+            "llm": {"timeout": None, "rate_limit_429": None, "circuit_open": None},
+            "cache": {},
+            "degraded": {"total": None, "by_reason": {}},
+        }
+
+
+def _metric_samples(metric_name: str) -> list[Any]:
+    """从默认 Registry 读取指定样本；只读指标名与标签，不接触请求体或鉴权信息。"""
+    samples: list[Any] = []
+    for family in REGISTRY.collect():
+        for sample in family.samples:
+            if sample.name == metric_name:
+                samples.append(sample)
+    return samples
+
+
+def _sum_metric(metric_name: str, labels: dict[str, str] | None = None, downstream_contains: str | None = None) -> float:
+    """按标签聚合 Prometheus Counter/Gauge，用于把文本指标转换为页面需要的数字。"""
+    total = 0.0
+    labels = labels or {}
+    for sample in _metric_samples(metric_name):
+        sample_labels = sample.labels or {}
+        if any(sample_labels.get(key) != value for key, value in labels.items()):
+            continue
+        if downstream_contains and downstream_contains not in sample_labels.get("downstream", "").lower():
+            continue
+        total += float(sample.value)
+    return total
+
+
+def _labeled_counter(metric_name: str, label_name: str) -> dict[str, int]:
+    """按单个标签拆分 Counter，便于页面显示降级原因分布。"""
+    values: dict[str, int] = {}
+    for sample in _metric_samples(metric_name):
+        label = (sample.labels or {}).get(label_name, "unknown")
+        values[label] = values.get(label, 0) + int(sample.value)
+    return values
+
+
+def _cache_metric(cache_name: str) -> dict[str, Any]:
+    """计算缓存命中率；没有 hit/miss 分母时返回 null，避免展示伪精确百分比。"""
+    hit = int(_sum_metric("agent_cache_operations_total", {"cache": cache_name, "outcome": "hit"}))
+    miss = int(_sum_metric("agent_cache_operations_total", {"cache": cache_name, "outcome": "miss"}))
+    error = int(_sum_metric("agent_cache_operations_total", {"cache": cache_name, "outcome": "error"}))
+    denominator = hit + miss
+    return {
+        "hit": hit,
+        "miss": miss,
+        "error": error,
+        "hit_rate": round(hit / denominator, 4) if denominator else None,
+    }
 
 
 def _get_or_create_session(payload: AgentReplyRequest) -> dict:

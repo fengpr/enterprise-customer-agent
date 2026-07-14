@@ -2,6 +2,7 @@
 
 import time
 import inspect
+import threading
 from services.observability import WORKER_DURATION, WORKER_JOBS, set_request_context
 from dotenv import load_dotenv
 from typing import Any
@@ -87,6 +88,22 @@ def _retry_or_publish_terminal(
     })
 
 
+def start_heartbeat_loop(queue: AgentExecutionQueue) -> threading.Event:
+    """启动独立心跳线程，避免长时间模型调用期间 Worker 被误判为离线。"""
+    stop_event = threading.Event()
+    interval = max(1.0, float(getattr(queue, "worker_heartbeat_ttl", 20)) / 3)
+
+    def beat() -> None:
+        """后台刷新 Redis 心跳；心跳失败只影响运维判断，不中断任务执行。"""
+        while not stop_event.is_set():
+            queue.heartbeat()
+            stop_event.wait(interval)
+
+    thread = threading.Thread(target=beat, name="agent-worker-heartbeat", daemon=True)
+    thread.start()
+    return stop_event
+
+
 def main() -> None:
     """常驻消费可靠队列，API 进程只维护 SSE 连接而不执行模型。"""
     # 支持从命令行单独启动 Worker；必须在创建队列前加载本地运行配置。
@@ -96,11 +113,14 @@ def main() -> None:
         raise RuntimeError("Agent Worker 无法连接 Redis 队列：请检查 REDIS_URL、AGENT_EXECUTION_QUEUE_ENABLED=true，以及 Redis 服务是否返回 PONG")
     execution_service = AgentExecutionService()
     event_service = StreamEventService()
+    heartbeat_stop = start_heartbeat_loop(queue)
     while True:
-        # 每轮刷新一次心跳；若模型调用卡住，心跳会自然过期，便于启动脚本拉起替代 Worker。
-        queue.heartbeat()
-        run_once(queue, execution_service, event_service)
-        time.sleep(0.01)
+        try:
+            run_once(queue, execution_service, event_service)
+            time.sleep(0.01)
+        except KeyboardInterrupt:
+            heartbeat_stop.set()
+            raise
 
 
 if __name__ == "__main__":

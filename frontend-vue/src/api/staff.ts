@@ -8,6 +8,7 @@ import type {
   RagEvaluationReport,
   RagEvaluationJob,
   OnlineEvaluationReport,
+  SystemMonitorSnapshot,
   Ticket
 } from '@/types/api'
 
@@ -23,6 +24,12 @@ export const ragEvaluationApi = {
   },
   onlineReport(days = 7) {
     return agentHttp.get<OnlineEvaluationReport>('/staff/evaluation/online/report', { params: { days } })
+  }
+}
+
+export const systemMonitorApi = {
+  snapshot() {
+    return agentHttp.get<SystemMonitorSnapshot>('/staff/system/monitor')
   }
 }
 

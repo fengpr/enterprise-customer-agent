@@ -202,6 +202,7 @@ onMounted(async () => {
         <h2>我的工单</h2>
         <div class="header-actions">
           <el-button plain @click="router.push('/staff/rag-evaluation')">RAG 评测</el-button>
+          <el-button plain @click="router.push('/staff/system-monitor')">系统监控</el-button>
           <el-button :icon="SwitchButton" plain @click="logout">退出</el-button>
         </div>
       </div>

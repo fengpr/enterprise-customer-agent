@@ -87,6 +87,49 @@ class AgentExecutionQueue:
         except Exception:
             return False
 
+    def snapshot(self) -> dict[str, Any]:
+        """返回内部监控页需要的队列实时快照；Redis 异常时只标记不可用，不影响业务接口。"""
+        if not self.enabled:
+            return {
+                "enabled": False,
+                "available": False,
+                "active_worker": False,
+                "stream_depth": None,
+                "pending": None,
+                "dead_letter": None,
+                "running": None,
+                "retrying": None,
+                "error": "redis_queue_disabled",
+            }
+        try:
+            # 先刷新 Prometheus Gauge，再直接读取 Redis 当前状态，避免页面看到进程内旧值。
+            self._refresh_metrics()
+            pending = self._redis.xpending(self.stream_key, self.group_name)
+            running, retrying = self._status_counts()
+            return {
+                "enabled": True,
+                "available": True,
+                "active_worker": self.has_active_worker(),
+                "stream_depth": int(self._redis.xlen(self.stream_key)),
+                "pending": int(pending.get("pending", 0) if isinstance(pending, dict) else pending[0]),
+                "dead_letter": int(self._redis.xlen(self.dead_letter_key)),
+                "running": running,
+                "retrying": retrying,
+                "error": None,
+            }
+        except Exception:
+            return {
+                "enabled": True,
+                "available": False,
+                "active_worker": False,
+                "stream_depth": None,
+                "pending": None,
+                "dead_letter": None,
+                "running": None,
+                "retrying": None,
+                "error": "redis_queue_unavailable",
+            }
+
     def claim(self, block_ms: int = 1000) -> tuple[str, str, AgentExecutionJob, int] | None:
         """通过 XREADGROUP 领取新消息并将状态切换为 RUNNING。"""
         self._require_enabled()
@@ -175,16 +218,21 @@ class AgentExecutionQueue:
             DLQ_DEPTH.set(int(self._redis.xlen(self.dead_letter_key)))
             pending = self._redis.xpending(self.stream_key, self.group_name)
             QUEUE_PENDING.set(int(pending.get("pending", 0) if isinstance(pending, dict) else pending[0]))
-            running = retries = 0
-            for key in self._redis.scan_iter(match="agent:execution:status:*"):
-                raw = self._redis.get(key)
-                state = json.loads(raw) if raw else {}
-                running += int(state.get("status") == "RUNNING")
-                retries += int(state.get("status") == "PENDING" and int(state.get("attempt", 0)) > 0)
+            running, retries = self._status_counts()
             QUEUE_RUNNING.set(running)
             QUEUE_RETRIES.set(retries)
         except Exception:
             pass
+
+    def _status_counts(self) -> tuple[int, int]:
+        """扫描短 TTL 状态 Key，统计执行中与重试中的任务数量。"""
+        running = retrying = 0
+        for key in self._redis.scan_iter(match="agent:execution:status:*"):
+            raw = self._redis.get(key)
+            state = json.loads(raw) if raw else {}
+            running += int(state.get("status") == "RUNNING")
+            retrying += int(state.get("status") == "PENDING" and int(state.get("attempt", 0)) > 0)
+        return running, retrying
 
     def _save_status(self, request_id: str, value: dict[str, Any], preserve_owner: bool = False) -> None:
         """设置带 TTL 的状态记录，并在状态迁移时保留结果归属摘要。"""

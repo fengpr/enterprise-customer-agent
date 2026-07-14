@@ -553,7 +553,9 @@ class ConversationContextTest(unittest.TestCase):
         self.assertTrue(result["auto_send"])
         self.assertIsNone(result["ticket_result"])
         self.assertIn("蓝色光", result["answer"])
-        self.assertIn("订单、物流、售后、工单和发票", result["answer"])
+        self.assertIn("订单", result["answer"])
+        self.assertIn("物流", result["answer"])
+        self.assertIn("售后", result["answer"])
         self.assertEqual(captured_payloads[0]["reply_mode"], "out_of_scope")
         self.assertIsNone(captured_payloads[0]["order"])
         self.assertEqual(captured_payloads[0]["citations"], [])
@@ -566,6 +568,8 @@ class ConversationContextTest(unittest.TestCase):
         class FakeLLM:
             def generate_customer_reply(self, payload):
                 captured_payloads.append(payload)
+                if payload["reply_mode"] == "out_of_scope_boundary":
+                    return "如果后面想看订单进度、物流状态或售后处理，我也可以继续帮您查。"
                 return "可以：为什么程序员喜欢深色模式？因为光会吸引 bug。"
 
         agent.llm_analyzer = FakeLLM()
@@ -596,10 +600,24 @@ class ConversationContextTest(unittest.TestCase):
         )
 
         self.assertIn("程序员", answer)
-        self.assertIn("不过我主要负责订单、物流、售后、工单和发票等业务问题", answer)
+        self.assertIn("如果后面想看订单进度、物流状态或售后处理", answer)
+        self.assertNotIn("不过我主要负责", answer)
         self.assertEqual(captured_payloads[0]["reply_mode"], "out_of_scope")
+        self.assertEqual(captured_payloads[1]["reply_mode"], "out_of_scope_boundary")
         self.assertIsNone(captured_payloads[0]["order"])
         self.assertIsNone(captured_payloads[0]["logistics"])
+
+    def test_natural_llm_out_of_scope_boundary_is_preserved(self):
+        """模型生成了自然业务边界时应直接保留，不强行替换成固定模板。"""
+        raw_answer = (
+            "海洋偏蓝主要和水体对不同波长光的吸收、散射有关，红橙光更容易被吸收，蓝色光更容易留下来被看见。"
+            "如果后面想查订单进度、物流状态或售后处理，我也可以继续帮您看。"
+        )
+
+        answer = CustomerServiceAgent._ensure_out_of_scope_boundary(raw_answer)
+
+        self.assertEqual(answer, raw_answer)
+        self.assertNotIn("不过我主要负责", answer)
 
     def test_out_of_scope_boundary_is_normalized_without_question_specific_patch(self):
         """普通越界回复应统一替换突兀身份声明，而不是只修补某个具体问题。"""
@@ -611,9 +629,24 @@ class ConversationContextTest(unittest.TestCase):
         answer = CustomerServiceAgent._ensure_out_of_scope_boundary(raw_answer)
 
         self.assertIn("天空看起来是蓝色", answer)
-        self.assertIn("不过我主要负责订单、物流、售后、工单和发票等业务问题", answer)
+        self.assertNotIn("不过我主要负责订单、物流、售后、工单和发票等业务问题", answer)
         self.assertNotIn("我是您的企业客服助手", answer)
         self.assertNotIn("欢迎继续提问", answer)
+
+    def test_out_of_scope_boundary_cleanup_keeps_answer_in_same_paragraph(self):
+        """模型把答案和身份边界写在同一段时，也只能移除边界句，不能丢掉答案。"""
+        raw_answer = (
+            "海洋看起来是蓝色的，主要因为海水和大气对不同颜色光的吸收、散射程度不同。"
+            "我是自助客服助手，主要处理订单、物流、售后、工单和发票相关的问题。如果您有这方面的需要，欢迎继续问我。"
+        )
+
+        answer = CustomerServiceAgent._ensure_out_of_scope_boundary(raw_answer)
+
+        self.assertIn("海洋看起来是蓝色", answer)
+        self.assertIn("吸收、散射程度不同", answer)
+        self.assertNotIn("不过我主要负责订单、物流、售后、工单和发票等业务问题", answer)
+        self.assertNotIn("我是自助客服助手", answer)
+        self.assertNotIn("欢迎继续问我", answer)
 
     def test_human_request_takes_over_conversation_without_ticket(self):
         """明确转人工请求只接管当前会话，不创建业务工单。"""

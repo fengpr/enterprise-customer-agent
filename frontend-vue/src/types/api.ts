@@ -21,6 +21,10 @@ export interface AgentStatus {
     base_url?: string | null
     timeout?: number
   }
+  queue?: {
+    enabled?: boolean
+    active_worker?: boolean
+  }
 }
 
 export interface ChatSession {
@@ -171,6 +175,46 @@ export interface OnlineEvaluationReport {
   metrics: Record<string, number | null>
   items: Array<{ trace_id: string; status: string; sampling_reason: string; created_at: string; result: { failures?: string[]; reasons?: Record<string, string> } }>
   failures: Array<{ trace_id: string; status: string; sampling_reason: string; created_at: string; result: { failures?: string[]; reasons?: Record<string, string> } }>
+}
+
+export interface SystemMonitorCacheMetric {
+  hit: number
+  miss: number
+  error: number
+  hit_rate: number | null
+}
+
+export interface SystemMonitorSnapshot {
+  agent_status: {
+    status: string
+    llm?: AgentStatus['llm']
+  }
+  queue: {
+    available: boolean
+    enabled: boolean
+    stream_depth: number | null
+    pending: number | null
+    running: number | null
+    retrying: number | null
+    error?: string | null
+  }
+  worker: {
+    active: boolean
+  }
+  dlq: {
+    count: number | null
+  }
+  llm: {
+    timeout: number | null
+    rate_limit_429: number | null
+    circuit_open: number | null
+  }
+  cache: Record<string, SystemMonitorCacheMetric>
+  degraded: {
+    total: number | null
+    by_reason: Record<string, number>
+  }
+  updated_at: string
 }
 
 export interface StaffHandoffSession {

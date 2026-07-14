@@ -543,15 +543,22 @@ class CustomerServiceAgent:
             reply_mode="out_of_scope",
             service_instruction=(
                 "用户问的是客服业务范围之外的普通低风险问题。先直接、准确地简短回答用户问题，控制在一到两句；"
-                "随后用“不过我主要负责订单、物流、售后、工单和发票等业务问题”这类自然转折说明服务边界。"
-                "不要自我介绍成企业客服助手，不要使用生硬的身份声明。"
+                "随后由你自然生成一句服务边界提醒，不要套用固定模板；可以换用“如果后面想查订单、物流或售后进度，我也可以继续帮您看”这类柔和说法。"
+                "边界提醒必须覆盖订单、物流、售后、工单、发票中的至少两个业务范围，但不要自我介绍成企业客服助手，不要使用生硬的身份声明。"
                 "不要声称查过知识库，不要转人工，不要创建工单，不要引用当前订单或历史会话中的业务对象。"
             ),
             extra_context={"allowed_scope": ["订单", "物流", "售后", "工单", "发票"]},
             use_business_context=False,
         )
         if llm_answer:
-            return self._ensure_out_of_scope_boundary(llm_answer)
+            cleaned_answer = self._ensure_out_of_scope_boundary(llm_answer)
+            if self._has_natural_out_of_scope_boundary(cleaned_answer):
+                return cleaned_answer
+            dynamic_boundary = self._compose_llm_out_of_scope_boundary(state, cleaned_answer)
+            if dynamic_boundary:
+                return f"{cleaned_answer}\n\n{dynamic_boundary}" if cleaned_answer else dynamic_boundary
+            fallback_boundary = self._fallback_out_of_scope_boundary()
+            return f"{cleaned_answer}\n\n{fallback_boundary}" if cleaned_answer else fallback_boundary
 
         # 模型未配置或调用失败时保留安全兜底，但不伪装成已经回答了用户问题。
         return (
@@ -561,17 +568,24 @@ class CustomerServiceAgent:
 
     @staticmethod
     def _ensure_out_of_scope_boundary(answer: str) -> str:
-        """统一普通越界回复的边界表达，避免模型生成突兀的客服身份声明。"""
+        """清理普通越界回复中的生硬身份声明；不再在这里追加固定模板。"""
         normalized = answer.strip()
-        boundary = "不过我主要负责订单、物流、售后、工单和发票等业务问题。如果您有这些方面的疑问，也可以继续问我。"
         if not normalized:
-            return boundary
+            return ""
 
-        # 低风险越界回答只保留常识简答，把能力边界收敛成统一自然话术。
-        paragraphs = [item.strip() for item in re.split(r"\n{1,}", normalized) if item.strip()]
-        kept: list[str] = []
+        # 模型可能把“常识答案 + 客服边界”写在同一段，先剥离突兀身份前缀，再判断是否可直接保留。
+        normalized = re.sub(r"\s+", " ", normalized)
+        normalized = re.sub(
+            r"我(?:是|作为)?(?:您的)?[^。！？!?；;，,]*(?:客服助手|客户服务助手|企业客服助手|自助客服助手)[，,]?",
+            "",
+            normalized,
+        )
+        if CustomerServiceAgent._has_natural_out_of_scope_boundary(normalized):
+            return normalized.strip()
+
         boundary_terms = [
             "企业客服助手",
+            "自助客服助手",
             "客户服务助手",
             "客服助手",
             "主要处理",
@@ -585,16 +599,77 @@ class CustomerServiceAgent:
             "继续提问",
             "继续问我",
         ]
-        for paragraph in paragraphs:
-            # 模型常把边界单独放在第二段；统一替换这类段落，避免客户感到突兀。
-            if any(term in paragraph for term in boundary_terms):
-                continue
-            kept.append(paragraph)
 
-        answer_body = "\n".join(kept).strip()
-        if not answer_body:
+        kept: list[str] = []
+        sentences = re.findall(r"[^。！？!?；;]+[。！？!?；;]?", normalized)
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            # 只丢弃边界句，保留前面的普通常识回答。
+            if any(term in sentence for term in boundary_terms):
+                continue
+            kept.append(sentence)
+
+        answer_body = "".join(kept).strip()
+        return answer_body
+
+    def _compose_llm_out_of_scope_boundary(self, state: TicketProcessState, answer_body: str) -> str:
+        """让大模型单独生成服务边界句，避免低风险越界回复每次落到固定模板。"""
+        if not getattr(self, "llm_analyzer", None):
+            return ""
+        analysis = state["analysis"]
+        payload = {
+            "message": state["message"],
+            "intent": analysis.intent,
+            "user_goal": analysis.user_goal,
+            "summary": analysis.summary,
+            "reply_mode": "out_of_scope_boundary",
+            "citations": [],
+            "order": None,
+            "logistics": None,
+            "ticket": None,
+            "extra_context": {
+                "answer_body": answer_body,
+                "allowed_scope": ["订单", "物流", "售后", "工单", "发票"],
+            },
+            "service_instruction": (
+                "不要回答原问题，不要重复前面的常识解释。只生成一句自然的服务范围提醒，语气轻一点，"
+                "覆盖订单、物流、售后、工单、发票中的至少两个业务范围。"
+                "不要使用“我是/作为/客服助手/主要负责/主要处理”这类身份声明，也不要承诺转人工或创建工单。"
+            ),
+        }
+        try:
+            boundary = self._generate_llm_reply(payload)
+        except Exception as exc:
+            self._log(
+                "llm_out_of_scope_boundary",
+                {"intent": analysis.intent, "user_goal": analysis.user_goal},
+                {"status": "failed", "error_type": self._classify_model_error(exc), "error": str(exc)},
+            )
+            return ""
+        boundary = self._ensure_out_of_scope_boundary(boundary)
+        if boundary and self._has_natural_out_of_scope_boundary(boundary):
             return boundary
-        return f"{answer_body}\n\n{boundary}"
+        return ""
+
+    @staticmethod
+    def _fallback_out_of_scope_boundary() -> str:
+        """模型不可用时的最后兜底；正常在线链路优先使用 LLM 生成的边界句。"""
+        return "如果后面想查订单进度、物流状态、售后处理、工单或发票信息，我也可以继续帮您看。"
+
+    @staticmethod
+    def _has_natural_out_of_scope_boundary(answer: str) -> bool:
+        """判断模型是否已经生成自然的服务边界，避免每次都套固定收尾。"""
+        scope_words = ["订单", "物流", "售后", "工单", "发票"]
+        scope_hits = sum(1 for word in scope_words if word in answer)
+        if scope_hits < 2:
+            return False
+        stiff_markers = ["我是", "作为", "客服助手", "客户服务助手", "企业客服助手", "自助客服助手", "主要处理", "主要负责", "主要帮助处理"]
+        if any(marker in answer for marker in stiff_markers):
+            return False
+        friendly_markers = ["如果", "可以", "也能", "也可以", "继续", "帮您", "帮你", "这方面", "相关"]
+        return any(marker in answer for marker in friendly_markers)
 
     def _compose_human_request_answer(self, state: TicketProcessState) -> str:
         """处理客户明确转人工请求，避免走知识库缺失模板。"""

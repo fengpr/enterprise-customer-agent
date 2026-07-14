@@ -17,9 +17,10 @@ class FakeQueue:
 
     enabled = True
 
-    def __init__(self, state):
+    def __init__(self, state, active_worker: bool = True):
         self.state = state
         self.jobs = []
+        self.active_worker = active_worker
 
     def enqueue(self, job, owner):
         self.jobs.append((job, owner))
@@ -27,6 +28,9 @@ class FakeQueue:
 
     def get(self, request_id):
         return self.state
+
+    def has_active_worker(self):
+        return self.active_worker
 
 
 def _request():
@@ -61,6 +65,20 @@ def test_sync_reply_timeout_returns_202_queue_status(monkeypatch):
     assert b'"queued":true' in result.body
 
 
+def test_sync_reply_returns_terminal_degraded_when_worker_missing(monkeypatch):
+    """没有活跃 Worker 时不能继续返回排队中，避免客户请求长期悬挂。"""
+    queue = FakeQueue({"status": "PENDING"}, active_worker=False)
+    monkeypatch.setattr(app, "agent_execution_queue", queue)
+    monkeypatch.setattr(app, "_current_login_user", lambda _: {"customer_id": 8})
+
+    result = app.reply(AgentReplyRequest(message="查询订单"), _request(), "Bearer token", "same-key")
+
+    assert isinstance(result, JSONResponse)
+    assert result.status_code == 503
+    assert b"AGENT_WORKER_UNAVAILABLE" in result.body
+    assert queue.jobs == []
+
+
 def test_result_query_rejects_other_owner(monkeypatch):
     """结果查询必须校验 Token 摘要归属，不能跨客户读取请求状态。"""
     queue = FakeQueue({"status": "PENDING", "owner": "other-owner"})
@@ -93,3 +111,25 @@ def test_sse_wait_window_returns_reconnectable_queued_event(monkeypatch):
     assert 'event: queued' in response.text
     assert '请求仍在后台处理中' in response.text
     assert queue.jobs[0][0].idempotency_key == "same-stream-key"
+
+
+def test_sse_returns_degraded_when_worker_missing(monkeypatch):
+    """SSE 在无 Worker 时应立即返回 degraded 终态，而不是生成不可消费的队列任务。"""
+    queue = FakeQueue({"status": "PENDING"}, active_worker=False)
+    events = StreamEventService(redis_client=False)
+    events._memory_events.clear()
+    monkeypatch.setattr(app, "agent_execution_queue", queue)
+    monkeypatch.setattr(app, "stream_event_service", events)
+    monkeypatch.setattr(app, "_current_login_user", lambda _: {"customer_id": 8})
+
+    with TestClient(app.app) as client:
+        response = client.post(
+            "/api/agent/reply/stream",
+            json={"message": "查询退货规则"},
+            headers={"Authorization": "Bearer token", "Idempotency-Key": "same-stream-key"},
+        )
+
+    assert response.status_code == 200
+    assert "event: degraded" in response.text
+    assert "AGENT_WORKER_UNAVAILABLE" in response.text
+    assert queue.jobs == []
