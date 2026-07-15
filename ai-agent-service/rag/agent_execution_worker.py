@@ -1,25 +1,32 @@
 """独立 Agent Worker：执行可靠队列任务并把客户可见流式事件写入 Redis。"""
 
-import time
 import inspect
 import threading
-from services.observability import WORKER_DURATION, WORKER_JOBS, set_request_context
-from dotenv import load_dotenv
+import time
 from typing import Any
 
+from dotenv import load_dotenv
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
+
 from services.agent_execution_queue import AgentExecutionQueue
-from services.agent_execution_service import AgentExecutionService
+from services.observability import WORKER_DURATION, WORKER_JOBS, set_request_context
 from services.resilient_client import ResilienceError
 from services.stream_event_service import StreamEventService
 
 
 def run_once(
     queue: AgentExecutionQueue,
-    execution_service: AgentExecutionService,
+    execution_service: Any,
     event_service: StreamEventService | None = None,
 ) -> bool:
     """消费一个任务；客户端断开不会中止模型执行或最终结果持久化。"""
-    claimed = queue.recover_pending() or queue.claim()
+    try:
+        claimed = queue.recover_pending() or queue.claim()
+    except (RedisTimeoutError, RedisConnectionError):
+        # Redis Stream 长轮询超时或短暂断连属于基础设施抖动，常驻 Worker 应保留并继续重连。
+        WORKER_JOBS.labels("redis_transient_error").inc()
+        return False
     if not claimed:
         return False
     stream_id, request_id, job, attempt = claimed
@@ -92,6 +99,8 @@ def start_heartbeat_loop(queue: AgentExecutionQueue) -> threading.Event:
     """启动独立心跳线程，避免长时间模型调用期间 Worker 被误判为离线。"""
     stop_event = threading.Event()
     interval = max(1.0, float(getattr(queue, "worker_heartbeat_ttl", 20)) / 3)
+    # 某些模型或向量库导入阶段会较长时间占用解释器，先同步写入较长的初始化心跳。
+    queue.heartbeat(ttl_seconds=max(int(getattr(queue, "worker_heartbeat_ttl", 20)), 120))
 
     def beat() -> None:
         """后台刷新 Redis 心跳；心跳失败只影响运维判断，不中断任务执行。"""
@@ -111,16 +120,21 @@ def main() -> None:
     queue = AgentExecutionQueue()
     if not queue.enabled:
         raise RuntimeError("Agent Worker 无法连接 Redis 队列：请检查 REDIS_URL、AGENT_EXECUTION_QUEUE_ENABLED=true，以及 Redis 服务是否返回 PONG")
-    execution_service = AgentExecutionService()
-    event_service = StreamEventService()
+    # 队列连接成功后立即发布心跳；Agent/RAG 初始化较慢时，请求仍可安全进入 Stream 等待消费。
     heartbeat_stop = start_heartbeat_loop(queue)
-    while True:
-        try:
-            run_once(queue, execution_service, event_service)
-            time.sleep(0.01)
-        except KeyboardInterrupt:
-            heartbeat_stop.set()
-            raise
+    try:
+        # AgentExecutionService 会加载 Agent、RAG 和模型组件，延迟导入可让 Worker 先建立可观测心跳。
+        from services.agent_execution_service import AgentExecutionService
+
+        execution_service = AgentExecutionService()
+        event_service = StreamEventService()
+        while True:
+            processed = run_once(queue, execution_service, event_service)
+            # 空队列和 Redis 暂态异常时稍作退避，避免断连期间形成高频重连风暴。
+            time.sleep(0.01 if processed else 0.1)
+    finally:
+        # 正常退出、初始化失败或 Ctrl+C 都要停止后台心跳，避免短时间内误报 Worker 存活。
+        heartbeat_stop.set()
 
 
 if __name__ == "__main__":

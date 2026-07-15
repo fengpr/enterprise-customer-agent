@@ -185,8 +185,10 @@ need_human, priority, confidence, summary, risk_reasons, action_type, action_slo
 16. summary 用中文概括用户问题，不超过 120 字。
 17. action_request 必须给出 action_type 和 action_slots；政策咨询和操作步骤咨询不要进入动作闭环。
 18. “我要退货/帮我换货/申请维修/开一张发票”是 action_request；“怎么退货/退货规则是什么/发票怎么开”不是 action_request。
-19. 槽位命名使用通用字段：order_no, product_name, description, after_sale_reason, fault_description, invoice_title, invoice_type, tax_no, evidence_hint。
-20. 信息不全时 next_action=collect_slots；信息齐全且当前无专用业务 Tool 时 next_action=create_ticket。
+19. 槽位命名使用通用字段：order_no, product_name, description, after_sale_reason, return_method, pickup_time_window, fault_description, invoice_title, invoice_type, tax_no, evidence_hint。
+20. 退货时必须从整条消息一次提取全部已提供信息：原因写入 after_sale_reason；“上门取件”写 return_method=pickup；“自行寄回/自己寄回”写 return_method=self_ship；客户提供的取件时间只截取时间短语写入 pickup_time_window。
+21. “商品有问题、用不上了、不合适、不喜欢”等可以作为 after_sale_reason，但单独出现时不代表客户已经授权创建退货工单；是否执行由后端状态机判断。
+22. 信息不全时 next_action=collect_slots；信息齐全时可以建议 create_ticket，但最终是否查单或建单只能由后端确定性规则决定。
 
 JSON 示例：
 {{

@@ -13,11 +13,12 @@ export default defineConfig({
   server: {
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
+        // 固定 IPv4，避免 Windows/Node 对 localhost 的双栈解析在后端启动阶段产生 AggregateError。
+        target: 'http://127.0.0.1:8000',
         changeOrigin: true
       },
       '/business-api': {
-        target: 'http://localhost:8081',
+        target: 'http://127.0.0.1:8081',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/business-api/, '/api')
       }

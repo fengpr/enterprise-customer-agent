@@ -6,7 +6,7 @@ import hashlib
 
 from services.resilient_client import ResilienceError, ResilientClient
 from services.cache_service import CacheService
-from services.observability import current_context
+from services.downstream_identity import build_business_headers, identity_cache_key
 
 
 class TicketTools:
@@ -26,6 +26,44 @@ class TicketTools:
             data = response.json(); self._invalidate_ticket(auth_token, data.get("ticketNo")); return {"status": "success", "data": data}
         except ResilienceError as exc:
             return self._failure(exc)
+
+    def append_ticket_information(
+        self,
+        ticket_no: str,
+        payload: dict,
+        auth_token: str | None = None,
+    ) -> dict:
+        """向既有工单追加客户补充信息；Java 根据工单和取件状态决定是否直接更新履约偏好。"""
+        idempotency_key = str(payload.get("idempotency_key") or "").strip()
+        if not idempotency_key:
+            return {
+                "status": "failed",
+                "error": "missing_idempotency_key",
+                "retryable": False,
+            }
+        body = {
+            "content": payload.get("content"),
+            "afterSaleReason": payload.get("afterSaleReason"),
+            "returnMethod": payload.get("returnMethod"),
+            "pickupTimeWindow": payload.get("pickupTimeWindow"),
+        }
+        try:
+            response = self.client.request_sync(
+                "POST",
+                f"{self.base_url}/api/tickets/{ticket_no}/supplements",
+                json=body,
+                headers=self._headers(auth_token, idempotency_key),
+                idempotency_key=idempotency_key,
+            )
+            data = response.json()
+            self._invalidate_ticket(auth_token, ticket_no)
+            return {"status": "success", "query_type": "ticket_supplement", "data": data}
+        except ResilienceError as exc:
+            return {
+                **self._failure(exc),
+                "query_type": "ticket_supplement",
+                "ticket_no": ticket_no,
+            }
 
     def list_customer_tickets(self, auth_token: str | None = None) -> dict:
         """查询当前客户工单列表，属于可重试只读操作。"""
@@ -62,11 +100,8 @@ class TicketTools:
 
     @staticmethod
     def _headers(auth_token: str | None, idempotency_key: str | None = None) -> dict[str, str]:
-        """构造客户身份和可选幂等键请求头。"""
-        context = current_context()
-        headers = {"X-Request-ID": context["request_id"], "X-Trace-ID": context["trace_id"]}
-        if auth_token:
-            headers["Authorization"] = f"Bearer {auth_token}"
+        """构造客户登录身份或 Worker 短期执行身份及可选幂等键请求头。"""
+        headers = build_business_headers(auth_token)
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
         return headers
@@ -79,7 +114,7 @@ class TicketTools:
     @staticmethod
     def _customer_key(auth_token: str | None) -> str:
         """使用 Token 摘要隔离客户工单缓存。"""
-        return hashlib.sha256((auth_token or "anonymous").encode()).hexdigest()[:16]
+        return hashlib.sha256(identity_cache_key(auth_token).encode()).hexdigest()[:16]
 
     def _ticket_key(self, auth_token: str | None, ticket_no: str | None) -> str:
         """构造客户与工单共同参与的详情缓存 key。"""

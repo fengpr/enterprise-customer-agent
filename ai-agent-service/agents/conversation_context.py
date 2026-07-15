@@ -1,6 +1,8 @@
 import re
 from typing import Any
 
+from agents.order_context import build_order_context_record, extract_order_no
+
 
 ORDER_NO_PATTERN = re.compile(r"(?<![A-Za-z])(?:EC)?\d{10,18}", flags=re.IGNORECASE)
 TICKET_NO_PATTERN = re.compile(r"T\d{12,24}", flags=re.IGNORECASE)
@@ -12,6 +14,7 @@ def build_conversation_context(
     pending_action_request: dict[str, Any] | None,
     selected_order_no: str | None,
     selected_ticket_no: str | None,
+    login_user_context: dict[str, Any] | None = None,
     max_messages: int = 12,
 ) -> dict[str, Any]:
     """从同一会话最近消息中提取安全上下文，供 Agent 解析多轮指代。"""
@@ -21,6 +24,7 @@ def build_conversation_context(
         "last_product": None,
         "last_ticket": None,
         "last_action": None,
+        "order_context": None,
         "safe_context_summary": "",
         "debug_context": {
             "message_window": [message.get("id") for message in recent_messages],
@@ -29,13 +33,27 @@ def build_conversation_context(
     }
 
     _apply_history_context(context, recent_messages)
+    safe_login_user = _safe_login_user_context(login_user_context)
+    session_memory = _build_session_memory(recent_messages, safe_login_user)
+    session_memory["pending_action"] = _build_pending_action_memory(pending_action_request)
+    order_context = _build_order_context(recent_messages, allow_historical_selected=bool(selected_order_no))
+    context["login_user_context"] = safe_login_user
+    context["session_memory"] = session_memory
+    context["order_context"] = order_context
     if selected_order_no:
+        context["order_context"] = build_order_context_record(
+            order_no=selected_order_no,
+            source="selected_by_user",
+            confirmed_at=None,
+            last_used_at=None,
+            confidence=0.98,
+        )
         _set_context_value(
             context,
             "last_order",
             selected_order_no,
-            source="selected_order",
-            confidence=0.85,
+            source="selected_by_user",
+            confidence=0.98,
             evidence={"kind": "selected_order"},
         )
     if selected_ticket_no:
@@ -50,6 +68,26 @@ def build_conversation_context(
     _apply_pending_context(context, pending_action_request)
     context["safe_context_summary"] = _build_safe_summary(context)
     return context
+
+
+def _build_pending_action_memory(pending: dict[str, Any] | None) -> dict[str, Any] | None:
+    """把当前会话待完成动作投影为安全短期记忆，不复制原始消息或工具结果。"""
+    if not pending or pending.get("completed") or pending.get("status") in {"completed", "cancelled"}:
+        return None
+    slots = pending.get("collected_slots") or pending.get("action_slots") or {}
+    return {
+        "action_type": pending.get("action_type"),
+        "issue_type": pending.get("issue_type"),
+        "order_no": pending.get("order_no") or slots.get("order_no"),
+        "missing_slots": list(pending.get("missing_slots") or []),
+        "collected_slots": dict(slots),
+        "status": pending.get("status"),
+        "created_at": pending.get("created_at"),
+        "updated_at": pending.get("updated_at"),
+        "expires_at": pending.get("expires_at") or pending.get("expire_at"),
+        "source": pending.get("source"),
+        "confidence": pending.get("confidence"),
+    }
 
 
 def _apply_history_context(context: dict[str, Any], messages: list[dict[str, Any]]) -> None:
@@ -81,6 +119,60 @@ def _apply_history_context(context: dict[str, Any], messages: list[dict[str, Any
         ticket_result = extra_data.get("ticket_result")
         if ticket_result:
             _extract_ticket_result(context, ticket_result, message_id)
+
+
+def _build_order_context(messages: list[dict[str, Any]], *, allow_historical_selected: bool) -> dict[str, Any] | None:
+    """从当前会话中提取最近订单上下文，明确选择/提及优先于工具推断。"""
+    inferred: dict[str, Any] | None = None
+    for message in reversed(messages):
+        extra_data = message.get("extra_data") or {}
+        created_at = message.get("created_at")
+        if message.get("sender_type") == "customer":
+            selected_order_no = extra_data.get("selected_order_no")
+            if selected_order_no and allow_historical_selected:
+                # 当前前端仍保持选中态时，历史选中才可延续；取消选中后不能继续继承旧订单。
+                return build_order_context_record(
+                    order_no=str(selected_order_no),
+                    source="selected_by_user",
+                    confirmed_at=created_at,
+                    last_used_at=created_at,
+                    confidence=0.98,
+                )
+            mentioned_order_no = extract_order_no(str(message.get("content") or ""))
+            if mentioned_order_no:
+                return build_order_context_record(
+                    order_no=mentioned_order_no,
+                    source="mentioned_by_user",
+                    confirmed_at=created_at,
+                    last_used_at=created_at,
+                    confidence=0.92,
+                )
+            continue
+
+        for tool_result in extra_data.get("tool_results") or []:
+            candidate = _order_no_from_tool_result(tool_result)
+            if candidate and inferred is None:
+                inferred = build_order_context_record(
+                    order_no=candidate,
+                    source="inferred_from_context",
+                    confirmed_at=None,
+                    last_used_at=created_at,
+                    confidence=0.6,
+                )
+    return inferred
+
+
+def _order_no_from_tool_result(result: dict[str, Any]) -> str | None:
+    """从工具结果中提取订单候选；工具推断来源使用前必须结合时间窗口确认。"""
+    if result.get("status") != "success":
+        return None
+    data = result.get("data")
+    if isinstance(data, dict):
+        return data.get("orderNo") or result.get("order_no")
+    if isinstance(data, list) and data:
+        first = data[0] or {}
+        return first.get("orderNo")
+    return None
 
 
 def _apply_pending_context(context: dict[str, Any], pending: dict[str, Any] | None) -> None:
@@ -132,6 +224,97 @@ def _extract_user_entities(context: dict[str, Any], content: str, message_id: An
             confidence=0.55,
             evidence={"kind": "user_ticket", "message_id": message_id},
         )
+
+
+def _build_session_memory(messages: list[dict[str, Any]], login_user_context: dict[str, Any]) -> dict[str, Any]:
+    """从当前会话客户可见消息中生成短期记忆，只用于多轮连续对话和称呼。"""
+    user_messages: list[dict[str, Any]] = []
+    ai_messages: list[dict[str, Any]] = []
+    preferred_name: str | None = None
+    self_claimed_name: str | None = None
+
+    for message in messages:
+        sender_type = message.get("sender_type")
+        content = _safe_message_text(message.get("content"))
+        if not content:
+            continue
+        item = {
+            "message_id": message.get("id"),
+            "content": content,
+            "created_at": message.get("created_at"),
+        }
+        if sender_type == "customer":
+            user_messages.append(item)
+            extracted = _extract_self_claimed_name(content)
+            if extracted:
+                self_claimed_name = extracted
+                preferred_name = extracted
+        elif sender_type == "ai":
+            # AI 消息只保留客户侧实际可见内容，不把内部建议、工具结果或风控字段送入会话记忆。
+            extra_data = message.get("extra_data") or {}
+            visible = _safe_message_text(extra_data.get("customer_message") or content)
+            if visible:
+                item["content"] = visible
+                ai_messages.append(item)
+
+    display_name = _normalize_name(login_user_context.get("display_name"))
+    claimed = _normalize_name(self_claimed_name or preferred_name)
+    return {
+        "recent_user_messages": user_messages[-5:],
+        "recent_ai_messages": ai_messages[-5:],
+        "last_user_question": (user_messages[-1]["content"] if user_messages else None),
+        "last_ai_answer": (ai_messages[-1]["content"] if ai_messages else None),
+        "preferred_name": preferred_name,
+        "self_claimed_name": self_claimed_name,
+        # 冲突标记仅供后端确定性逻辑使用，传给 LLM 或前端时会被过滤。
+        "identity_conflict": bool(display_name and claimed and display_name != claimed),
+    }
+
+
+def _safe_login_user_context(login_user_context: dict[str, Any] | None) -> dict[str, Any]:
+    """保留登录态中的安全身份字段，避免 Authorization 或 customer_id 进入模型上下文。"""
+    raw = login_user_context or {}
+    display_name = _safe_message_text(raw.get("display_name"), max_length=40)
+    role = _safe_message_text(raw.get("role"), max_length=30) or "customer"
+    source = _safe_message_text(raw.get("source"), max_length=30) or "java_auth"
+    return {
+        "display_name": display_name,
+        "role": role,
+        "verified": bool(raw.get("verified", True)),
+        "source": source,
+    }
+
+
+def _extract_self_claimed_name(content: str) -> str | None:
+    """识别“我叫/我是/以后叫我”等会话称呼表达，不把它当作认证身份。"""
+    patterns = [
+        r"(?:我叫|我是|本人叫|我的名字叫)\s*([\u4e00-\u9fa5A-Za-z][\u4e00-\u9fa5A-Za-z·]{1,11})",
+        r"(?:以后|之后)?(?:请)?(?:叫我|称呼我为|喊我)\s*([\u4e00-\u9fa5A-Za-z][\u4e00-\u9fa5A-Za-z·]{1,11})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, content)
+        if not match:
+            continue
+        name = match.group(1).strip(" ，,。！？!；;：:")
+        # 排除“我是客户/会员/人工”等角色词，避免把普通身份描述误当姓名。
+        if name and name not in {"客户", "用户", "会员", "客服", "人工", "本人"}:
+            return name[:12]
+    return None
+
+
+def _safe_message_text(value: Any, max_length: int = 200) -> str:
+    """清洗客户可见文本，避免凭证和过长内容进入短期记忆。"""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"Bearer\s+[A-Za-z0-9._\-]+", "[AUTH_REDACTED]", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text)
+    return text[:max_length]
+
+
+def _normalize_name(value: Any) -> str:
+    """归一化姓名用于冲突判断，不改变原始称呼展示。"""
+    return re.sub(r"\s+", "", str(value or "").strip()).lower()
 
 
 def _extract_tool_result(context: dict[str, Any], result: dict[str, Any], message_id: Any) -> None:

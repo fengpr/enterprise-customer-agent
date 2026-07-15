@@ -213,7 +213,7 @@ def reply(payload: AgentReplyRequest, request: Request, authorization: str | Non
         return JSONResponse(status_code=503, content=_overload_response() | {"status": "degraded", "queued": False, "error_code": "QUEUE_UNAVAILABLE"})
     if not agent_execution_queue.has_active_worker():
         return JSONResponse(status_code=503, content=_worker_unavailable_response() | {"status": "degraded", "queued": False})
-    execution_payload = payload.model_copy(update={"customer_id": current_user["customer_id"], "auth_token": _bearer_token(authorization)})
+    execution_payload = payload.model_copy(update={"customer_id": current_user["customer_id"], "auth_token": _bearer_token(authorization), "login_user_context": _safe_login_user_context(current_user)})
     request_id = _enqueue_execution_job(execution_payload, authorization, idempotency_key, "sync")
     deadline = time.monotonic() + float(os.getenv("AGENT_SYNC_WAIT_SECONDS", "3"))
     while time.monotonic() < deadline:
@@ -242,6 +242,7 @@ async def reply_stream(payload: AgentReplyRequest, request: Request, authorizati
         update={
             "customer_id": current_user_data["customer_id"],
             "auth_token": _bearer_token(authorization),
+            "login_user_context": _safe_login_user_context(current_user_data),
         }
     )
 
@@ -299,7 +300,7 @@ async def reply_stream_v2(payload: AgentReplyRequest, request: Request, authoriz
             yield stream_event_service.to_sse(event)
         return StreamingResponse(worker_unavailable(), media_type="text/event-stream")
 
-    execution_payload = payload.model_copy(update={"customer_id": current_user["customer_id"], "auth_token": _bearer_token(authorization)})
+    execution_payload = payload.model_copy(update={"customer_id": current_user["customer_id"], "auth_token": _bearer_token(authorization), "login_user_context": _safe_login_user_context(current_user)})
     request_id = _enqueue_execution_job(execution_payload, authorization, idempotency_key, "sse")
     last_event_id = request.headers.get("Last-Event-ID")
 
@@ -1018,8 +1019,19 @@ def _enqueue_execution_job(payload: AgentReplyRequest, authorization: str | None
         risk_level="high" if payload.route_target in {"human", "both"} else "normal",
         trace_id=current_context()["trace_id"],
         execution_credential=_queue_execution_credential(int(payload.customer_id or 0), request_id),
+        login_user_context=payload.login_user_context,
     )
     return agent_execution_queue.enqueue(job, _queue_owner(authorization))
+
+
+def _safe_login_user_context(current_user: dict[str, Any]) -> dict[str, Any]:
+    """把 Java 登录态转换为可进入队列和 Agent 上下文的安全身份摘要。"""
+    return {
+        "display_name": str(current_user.get("display_name") or "").strip()[:40],
+        "role": str(current_user.get("role") or "customer").strip()[:30],
+        "verified": True,
+        "source": "java_auth",
+    }
 
 
 def _queue_execution_credential(customer_id: int, request_id: str) -> str:

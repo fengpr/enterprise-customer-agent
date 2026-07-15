@@ -3,6 +3,7 @@
 import os
 import sys
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -75,6 +76,295 @@ class ConversationContextTest(unittest.TestCase):
         self.assertEqual(result.user_goal, "policy_consult")
         self.assertFalse(result.need_order_query)
 
+    def test_session_memory_keeps_recent_visible_turns_and_login_identity(self):
+        """当前会话记忆应保留最近客户可见问答，并携带安全登录态身份。"""
+        context = build_conversation_context(
+            messages=[
+                {"id": 1, "sender_type": "customer", "content": "查询退货规则", "extra_data": {}, "created_at": "t1"},
+                {"id": 2, "sender_type": "ai", "content": "退货规则说明", "extra_data": {"customer_message": "商品保持完好可申请退货"}, "created_at": "t2"},
+            ],
+            pending_action_request=None,
+            selected_order_no=None,
+            selected_ticket_no=None,
+            login_user_context={"display_name": "张三", "role": "customer", "verified": True, "source": "java_auth"},
+        )
+
+        self.assertEqual(context["login_user_context"]["display_name"], "张三")
+        self.assertEqual(context["session_memory"]["last_user_question"], "查询退货规则")
+        self.assertEqual(context["session_memory"]["last_ai_answer"], "商品保持完好可申请退货")
+        self.assertFalse(context["session_memory"]["identity_conflict"])
+
+    def test_session_memory_contains_current_pending_action(self):
+        """当前会话记忆应包含安全 pending 摘要，供多轮流程优先级判断。"""
+        pending = {
+            "pending_id": "PA-MEMORY",
+            "status": "waiting_for_user_input",
+            "action_type": "return_goods",
+            "issue_type": "return",
+            "order_no": "EC202606220001",
+            "action_slots": {"order_no": "EC202606220001"},
+            "collected_slots": {"order_no": "EC202606220001"},
+            "missing_slots": ["return_reason"],
+            "created_at": "2026-07-15T10:00:00",
+            "updated_at": "2026-07-15T10:01:00",
+            "expires_at": "2026-07-15T10:31:00",
+            "source": "current_session_explicit",
+            "confidence": 0.95,
+            "completed": False,
+        }
+
+        context = build_conversation_context(
+            messages=[],
+            pending_action_request=pending,
+            selected_order_no=None,
+            selected_ticket_no=None,
+        )
+
+        memory = context["session_memory"]["pending_action"]
+        self.assertEqual(memory["action_type"], "return_goods")
+        self.assertEqual(memory["missing_slots"], ["return_reason"])
+        self.assertEqual(memory["collected_slots"]["order_no"], "EC202606220001")
+
+    def test_session_memory_marks_self_claim_conflict_without_overriding_login(self):
+        """用户自称姓名与登录名不同只能标记冲突，不能覆盖登录态身份。"""
+        context = build_conversation_context(
+            messages=[
+                {"id": 1, "sender_type": "customer", "content": "我叫李四", "extra_data": {}, "created_at": "t1"},
+            ],
+            pending_action_request=None,
+            selected_order_no=None,
+            selected_ticket_no=None,
+            login_user_context={"display_name": "张三", "role": "customer", "verified": True, "source": "java_auth"},
+        )
+
+        self.assertEqual(context["login_user_context"]["display_name"], "张三")
+        self.assertEqual(context["session_memory"]["preferred_name"], "李四")
+        self.assertTrue(context["session_memory"]["identity_conflict"])
+
+    def test_unselected_current_request_does_not_inherit_historical_selected_order(self):
+        """当前前端未选中订单时，不能继承历史 selected_by_user 订单上下文。"""
+        context = build_conversation_context(
+            messages=[
+                {
+                    "id": 1,
+                    "sender_type": "customer",
+                    "content": "我要退货",
+                    "extra_data": {"selected_order_no": "EC202606220001"},
+                    "created_at": (datetime.utcnow() - timedelta(minutes=3)).isoformat(),
+                },
+            ],
+            pending_action_request=None,
+            selected_order_no=None,
+            selected_ticket_no=None,
+            login_user_context=None,
+        )
+
+        self.assertIsNone(context["order_context"])
+
+    def test_mentioned_order_context_survives_without_current_selection(self):
+        """用户文本明确提到过订单号时，即使当前未选中，也可作为当前会话近期上下文。"""
+        context = build_conversation_context(
+            messages=[
+                {
+                    "id": 1,
+                    "sender_type": "customer",
+                    "content": "订单 EC202606220001 我要退货",
+                    "extra_data": {},
+                    "created_at": (datetime.utcnow() - timedelta(minutes=3)).isoformat(),
+                },
+            ],
+            pending_action_request=None,
+            selected_order_no=None,
+            selected_ticket_no=None,
+            login_user_context=None,
+        )
+
+        self.assertEqual((context["order_context"] or {}).get("order_no"), "EC202606220001")
+        self.assertEqual((context["order_context"] or {}).get("source"), "mentioned_by_user")
+
+    def test_user_identity_answer_prefers_login_identity_when_claim_conflicts(self):
+        """“我是谁”必须优先回答登录态身份，并说明会话称呼不能用于校验。"""
+        agent = object.__new__(CustomerServiceAgent)
+        analysis = _status_analysis(intent="consult", user_goal="info_query", order_related=False, need_order_query=False)
+        answer = agent._compose_answer(
+            {
+                "message": "我是谁",
+                "analysis": analysis,
+                "citations": [],
+                "tool_results": [],
+                "conversation_context": {
+                    "login_user_context": {"display_name": "张三", "role": "customer", "verified": True, "source": "java_auth"},
+                    "session_memory": {"preferred_name": "李四", "self_claimed_name": "李四", "identity_conflict": True},
+                },
+            }
+        )
+
+        self.assertIn("当前登录账号显示为张三", answer)
+        self.assertIn("称呼为李四", answer)
+        self.assertIn("以当前登录账号为准", answer)
+        self.assertNotIn("identity_conflict", answer)
+
+    def test_session_memory_question_returns_previous_user_message(self):
+        """“我刚刚问了什么”应读取当前 session 的上一条用户问题。"""
+        agent = object.__new__(CustomerServiceAgent)
+        analysis = _status_analysis(intent="consult", user_goal="info_query", order_related=False, need_order_query=False)
+        answer = agent._compose_answer(
+            {
+                "message": "我刚刚问了什么问题",
+                "analysis": analysis,
+                "citations": [],
+                "tool_results": [],
+                "conversation_context": {
+                    "session_memory": {"last_user_question": "查询退货规则", "recent_user_messages": [{"content": "查询退货规则"}]},
+                },
+            }
+        )
+
+        self.assertIn("查询退货规则", answer)
+
+    def test_self_claimed_name_cannot_drive_order_query(self):
+        """本轮自称姓名不能作为订单查询身份，必须阻断订单工具路由。"""
+        agent = object.__new__(CustomerServiceAgent)
+        result = _status_analysis(order_no=[], need_order_query=True, order_related=True)
+
+        guarded = agent._apply_context_guardrails(
+            "我是李四，帮我查订单",
+            result,
+            {
+                "login_user_context": {"display_name": "张三", "role": "customer", "verified": True, "source": "java_auth"},
+                "session_memory": {},
+            },
+        )
+
+        self.assertFalse(guarded.need_order_query)
+        self.assertFalse(guarded.order_related)
+        self.assertEqual(guarded.user_goal, "info_query")
+
+    def test_preferred_name_cannot_be_used_as_order_query_identity(self):
+        """preferred_name 只用于称呼，不能让“查李四的订单”绕过登录态身份。"""
+        agent = object.__new__(CustomerServiceAgent)
+        result = _status_analysis(order_no=[], need_order_query=True, order_related=True)
+
+        guarded = agent._apply_context_guardrails(
+            "帮我查李四的订单",
+            result,
+            {
+                "login_user_context": {"display_name": "张三", "role": "customer", "verified": True, "source": "java_auth"},
+                "session_memory": {"preferred_name": "李四", "self_claimed_name": "李四", "identity_conflict": True},
+            },
+        )
+
+        self.assertFalse(guarded.need_order_query)
+        self.assertEqual(guarded.user_goal, "info_query")
+
+    def test_graph_does_not_query_history_order_for_bare_return_request(self):
+        """未选中订单且未指代时，图节点不能用历史 last_order 调订单详情。"""
+        calls: list[str] = []
+        analysis = IntentResult(
+            intent="refund",
+            user_goal="action_request",
+            emotion="normal",
+            order_related=True,
+            order_no=[],
+            product_name=None,
+            need_order_query=False,
+            need_ticket=False,
+            need_human=False,
+            priority="medium",
+            confidence=0.9,
+            summary="我要退货",
+            risk_reasons=[],
+            action_type="return_goods",
+        )
+        graph = build_ticket_process_graph(
+            analyzer_chain=RunnableLambda(lambda _: analysis),
+            retrieve_knowledge=lambda state: [],
+            query_order=lambda order_no, auth_token: calls.append(order_no) or {"status": "success", "query_type": "order_detail", "data": {"orderNo": order_no}},
+            query_customer_orders=lambda customer_id, auth_token: {"status": "empty", "query_type": "customer_orders", "data": []},
+            query_order_logistics=lambda order_no, auth_token: {"status": "empty"},
+            create_ticket=lambda payload, auth_token: {"status": "skipped"},
+            auto_assign_ticket=lambda ticket_no: {"status": "skipped"},
+            list_customer_tickets=lambda auth_token: {"status": "empty", "data": []},
+            query_ticket_status=lambda ticket_no, auth_token: {"status": "empty"},
+            urge_ticket=lambda ticket_no, reason, auth_token: {"status": "empty"},
+            prepare_action=lambda state: {
+                "analysis": enrich_action_analysis(
+                    state["analysis"],
+                    message=state["message"],
+                    selected_order_no=state.get("selected_order_no"),
+                    pending_action_request=state.get("pending_action_request"),
+                    conversation_context=state.get("conversation_context"),
+                )[0]
+            },
+            compose_answer=lambda state: "ok",
+            log_tool_call=lambda tool_name, input_data, output_data: None,
+        )
+
+        result = graph.invoke(
+            {
+                "message": "我要退货",
+                "customer_id": 7,
+                "selected_order_no": None,
+                "conversation_context": {
+                    "last_order": {
+                        "value": "EC202606220001",
+                        "source": "tool_customer_orders",
+                        "confidence": 0.9,
+                    }
+                },
+                "tool_results": [],
+                "citations": [],
+            }
+        )
+
+        self.assertEqual(calls, [])
+        self.assertIn("order_no", result["analysis"].missing_slots)
+
+    def test_stale_but_not_expired_order_context_prompts_confirmation(self):
+        """5-30 分钟订单上下文只用于确认追问，不直接查询或执行动作。"""
+        agent = object.__new__(CustomerServiceAgent)
+        confirmed_at = (datetime.utcnow() - timedelta(minutes=20)).isoformat()
+        analysis = _status_analysis(intent="refund", user_goal="info_query", order_related=False, need_order_query=False)
+
+        answer = agent._compose_answer(
+            {
+                "message": "这个能退吗",
+                "analysis": analysis,
+                "citations": [],
+                "tool_results": [],
+                "conversation_context": {
+                    "order_context": {
+                        "order_no": "EC202606220001",
+                        "source": "selected_by_user",
+                        "confirmed_at": confirmed_at,
+                        "last_used_at": confirmed_at,
+                        "confidence": 0.98,
+                    }
+                },
+            }
+        )
+
+        self.assertIn("请确认", answer)
+        self.assertIn("EC202606220001", answer)
+
+    def test_missing_valid_order_context_prompts_user_to_select_order(self):
+        """没有有效订单上下文时，模糊订单问题应提示选择订单或提供订单号。"""
+        agent = object.__new__(CustomerServiceAgent)
+        analysis = _status_analysis(intent="refund", user_goal="info_query", order_related=False, need_order_query=False)
+
+        answer = agent._compose_answer(
+            {
+                "message": "这个订单怎么样了",
+                "analysis": analysis,
+                "citations": [],
+                "tool_results": [],
+                "conversation_context": {},
+            }
+        )
+
+        self.assertIn("选择订单", answer)
+        self.assertIn("订单号", answer)
+
     def test_context_builder_extracts_tool_facts_without_raw_history(self):
         """上下文从工具结果提取高可信事实，但安全摘要不包含历史原文和内部字段。"""
         messages = [
@@ -124,8 +414,16 @@ class ConversationContextTest(unittest.TestCase):
 
     def test_intent_analysis_uses_safe_context_order(self):
         """用户用“刚才那个订单”指代时，规则兜底识别会补入上下文订单号。"""
+        confirmed_at = (datetime.utcnow() - timedelta(minutes=3)).isoformat()
         context = {
             "last_order": {"value": "EC202606220001", "source": "tool_order_detail", "confidence": 0.95},
+            "order_context": {
+                "order_no": "EC202606220001",
+                "source": "selected_by_user",
+                "confirmed_at": confirmed_at,
+                "last_used_at": confirmed_at,
+                "confidence": 0.98,
+            },
             "safe_context_summary": "最近关联订单号为 EC202606220001，来源 tool_order_detail，置信度 0.95",
         }
 
@@ -245,6 +543,144 @@ class ConversationContextTest(unittest.TestCase):
             }
         )
         self.assertIn("取消", answer)
+
+    def test_logistics_query_switches_away_from_return_pending(self):
+        """客户明确查询物流时应结束退货补槽，并按本轮物流意图继续处理。"""
+        pending = {
+            "pending_id": "PA-SWITCH-LOGISTICS",
+            "status": "waiting_for_user_input",
+            "action_type": "return_goods",
+            "action_slots": {"order_no": "EC202606220001"},
+            "missing_slots": ["return_reason"],
+            "next_action": "collect_slots",
+            "updated_at": datetime.utcnow().isoformat(),
+            "expires_at": (datetime.utcnow() + timedelta(minutes=30)).isoformat(),
+            "completed": False,
+        }
+        analysis = _status_analysis(intent="logistics", user_goal="status_query")
+
+        normalized, cancelled = enrich_action_analysis(
+            analysis,
+            message="查一下物流",
+            selected_order_no="EC202606220001",
+            pending_action_request=pending,
+        )
+
+        self.assertEqual(normalized.user_goal, "status_query")
+        self.assertEqual(normalized.intent, "logistics")
+        self.assertIsNone(normalized.action_type)
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["cancel_reason"], "non_action_intent")
+
+    def test_not_received_followup_cannot_restart_expired_return_action(self):
+        """“我没收到”属于物流状态反馈，不能被宽泛短句兜底保存成过期退货原因。"""
+        expired = {
+            "pending_id": "PA-EXPIRED-RETURN",
+            "status": "waiting_for_user_input",
+            "action_type": "return_goods",
+            "action_slots": {"order_no": "EC202606220001"},
+            "missing_slots": ["after_sale_reason"],
+            "updated_at": (datetime.utcnow() - timedelta(minutes=31)).isoformat(),
+            "expires_at": (datetime.utcnow() - timedelta(minutes=1)).isoformat(),
+            "completed": False,
+        }
+
+        normalized, restarted = enrich_action_analysis(
+            _status_analysis(intent="logistics", user_goal="status_query"),
+            message="我没收到",
+            selected_order_no=None,
+            pending_action_request=expired,
+        )
+
+        self.assertEqual(normalized.intent, "logistics")
+        self.assertEqual(normalized.user_goal, "status_query")
+        self.assertIsNone(normalized.action_type)
+        self.assertIsNone(restarted)
+
+    def test_signed_but_not_received_creates_logistics_exception_ticket(self):
+        """Java 显示签收但客户反馈未收到时，应进入异常核实并建一次物流工单。"""
+        created_payloads: list[dict] = []
+        active_tickets: list[dict] = []
+
+        def prepare_action(state):
+            normalized, pending = enrich_action_analysis(
+                state["analysis"],
+                message=state["message"],
+                selected_order_no=state.get("selected_order_no"),
+                pending_action_request=state.get("pending_action_request"),
+                conversation_context=state.get("conversation_context"),
+            )
+            return {"analysis": normalized, "pending_action_request": pending}
+
+        def create_ticket(payload, auth_token):
+            created_payloads.append(payload)
+            ticket = {
+                "ticketNo": "T-LOGISTICS-EXCEPTION",
+                "ticketType": "logistics",
+                "orderNo": "EC202606220001",
+                "status": "PENDING_ASSIGN",
+                "content": payload["content"],
+            }
+            active_tickets.append(ticket)
+            return {"status": "success", "data": ticket}
+
+        graph = build_ticket_process_graph(
+            analyzer_chain=RunnableLambda(lambda _: _status_analysis()),
+            retrieve_knowledge=lambda _: [],
+            query_order=lambda order_no, auth_token: {
+                "status": "success",
+                "query_type": "order_detail",
+                "order_no": order_no,
+                "data": {"orderNo": order_no, "orderStatus": "SIGNED"},
+            },
+            query_customer_orders=lambda customer_id, auth_token: {"status": "success", "data": []},
+            query_order_logistics=lambda order_no, auth_token: {
+                "status": "success",
+                "query_type": "order_logistics",
+                "order_no": order_no,
+                "data": {
+                    "orderNo": order_no,
+                    "logisticsStatus": "SIGNED",
+                    "latestLocation": "上海浦东签收点",
+                    "traces": [{"status": "SIGNED", "description": "快件已签收"}],
+                },
+            },
+            create_ticket=create_ticket,
+            auto_assign_ticket=lambda ticket_no: {"status": "failed"},
+            list_customer_tickets=lambda auth_token: {"status": "success", "data": list(active_tickets)},
+            query_ticket_status=lambda ticket_no, auth_token: {"status": "empty"},
+            urge_ticket=lambda ticket_no, reason, auth_token: {"status": "empty"},
+            prepare_action=prepare_action,
+            compose_answer=lambda state: "物流异常已登记",
+            log_tool_call=lambda tool_name, input_data, output_data: None,
+        )
+
+        result = graph.invoke({
+            "message": "我没收到",
+            "customer_id": 1,
+            "selected_order_no": "EC202606220001",
+            "tool_results": [],
+            "citations": [],
+        })
+        repeated = graph.invoke({
+            "message": "我还是没有收到",
+            "customer_id": 1,
+            "selected_order_no": "EC202606220001",
+            "tool_results": [],
+            "citations": [],
+        })
+
+        self.assertEqual(len(created_payloads), 1)
+        self.assertEqual(created_payloads[0]["ticketType"], "logistics")
+        self.assertIn("异常类型：物流显示签收但客户反馈未收到", created_payloads[0]["content"])
+        self.assertIn("delivery_status_conflict", result["risk_reasons"])
+        self.assertTrue(result["need_human"])
+        answer = CustomerServiceAgent.__new__(CustomerServiceAgent)._build_customer_message(result)
+        self.assertIn("显示包裹已签收", answer)
+        self.assertIn("实际没有收到", answer)
+        self.assertIn("物流签收异常", answer)
+        self.assertNotIn("退货流程已超时", answer)
+        self.assertTrue(repeated["ticket_result"]["deduplicated"])
 
     def test_short_out_of_scope_reply_during_pending_is_contextual_cancel(self):
         """即使短句被模型判成越界，也应优先结合 pending 解释为取消上一轮动作。"""

@@ -63,13 +63,18 @@ class AgentExecutionService:
             pending_action_request=pending_action_request,
             selected_order_no=payload.selected_order_no,
             selected_ticket_no=payload.selected_ticket_no,
+            login_user_context=payload.login_user_context,
         )
         self.chat_messages.save(
             session_no=session_id,
             sender_type="customer",
             sender_id=str(payload.customer_id),
             content=payload.message,
-            extra_data={"route_target": route_target},
+            extra_data={
+                "route_target": route_target,
+                # 仅保存订单号本身，不保存 Token；用于后续同一 session 内的短期订单上下文有效期判断。
+                "selected_order_no": payload.selected_order_no,
+            },
         )
         if route_target == "both":
             self._ensure_handoff_exists(session_id, session, "synced_by_customer")
@@ -79,6 +84,7 @@ class AgentExecutionService:
                 "session_id": session_id,
                 "pending_action_request": pending_action_request,
                 "conversation_context": conversation_context,
+                "login_user_context": conversation_context.get("login_user_context"),
             }
         )
         try:
@@ -149,6 +155,7 @@ class AgentExecutionService:
     def _persist_result(self, session_id: str, payload: AgentReplyRequest, result: dict[str, Any], conversation_context: dict[str, Any]) -> None:
         """持久化客户可见回复和评测 Trace；评测采集失败不影响客户回复。"""
         self.chat_sessions.update_after_agent_reply(session_id, result["analysis"], self._resolve_session_status(result))
+        persisted_context = self._safe_persisted_conversation_context(conversation_context)
         self.chat_messages.save(
             session_no=session_id,
             sender_type="ai",
@@ -161,7 +168,7 @@ class AgentExecutionService:
                 "ticket_result": result.get("ticket_result"), "risk_reasons": result["risk_reasons"],
                 "auto_send": result["auto_send"], "need_human": result["need_human"],
                 "handoff_result": result.get("handoff_result"), "pending_action_request": result.get("pending_action_request"),
-                "conversation_context": conversation_context,
+                "conversation_context": persisted_context,
                 "context_conflict": (conversation_context.get("debug_context") or {}).get("context_conflict"),
             },
         )
@@ -175,6 +182,17 @@ class AgentExecutionService:
         except Exception:
             pass
 
+    @staticmethod
+    def _safe_persisted_conversation_context(conversation_context: dict[str, Any]) -> dict[str, Any]:
+        """保存到客户消息扩展字段前移除内部身份冲突标记，避免前端拿到调试状态。"""
+        safe_context = dict(conversation_context or {})
+        session_memory = dict(safe_context.get("session_memory") or {})
+        session_memory.pop("identity_conflict", None)
+        # pending_action 属于后端流程控制状态，客户侧历史消息接口不得直接展示。
+        session_memory.pop("pending_action", None)
+        safe_context["session_memory"] = session_memory
+        return safe_context
+
     def _get_or_create_session(self, payload: AgentReplyRequest) -> dict[str, Any]:
         """续接已授权会话或创建新会话，防止客户越权追加他人消息。"""
         if payload.session_id:
@@ -186,12 +204,25 @@ class AgentExecutionService:
 
     def _latest_pending_action_request(self, session_id: str) -> dict[str, Any] | None:
         """读取最近未完成动作，保持多轮槽位补全行为不变。"""
+        now = datetime.utcnow()
         for message in reversed(self.chat_messages.list_by_session(session_id)):
             if message.get("sender_type") != "ai":
                 continue
             pending = (message.get("extra_data") or {}).get("pending_action_request")
-            if pending and not pending.get("completed") and pending.get("status") not in {"completed", "cancelled"}:
-                return pending
+            if not pending:
+                continue
+            if pending.get("completed") or pending.get("status") in {"completed", "cancelled"}:
+                # 最新终止状态是该动作的墓碑；禁止继续向前扫描并复活同一会话里的旧 pending。
+                return None
+            expires_at = pending.get("expires_at") or pending.get("expire_at")
+            if expires_at:
+                try:
+                    if datetime.fromisoformat(str(expires_at)) <= now:
+                        # 已过期状态仍交给本轮规则做“重新确认诉求”，但不会作为可执行动作恢复。
+                        return pending
+                except ValueError:
+                    pass
+            return pending
         return None
 
     def _prepare_handoff_response(self, session_id: str) -> dict[str, Any]:

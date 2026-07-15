@@ -17,10 +17,26 @@ class FakeResilientClient:
         return httpx.Response(200, json={"ticketNo": "T1"}, request=httpx.Request(method, url))
 
 
+class PassthroughCache:
+    """避免跨测试 Redis 缓存命中掩盖本轮韧性客户端调用。"""
+
+    @staticmethod
+    def key(prefix, **parts):
+        return f"{prefix}:{parts}"
+
+    @staticmethod
+    def get_or_load(key, ttl_seconds, loader, **kwargs):
+        return loader()
+
+    @staticmethod
+    def delete(*keys):
+        return None
+
+
 def test_order_tool_uses_resilient_client_for_query():
     """订单查询应通过注入的 ResilientClient，而非直接 HTTP 调用。"""
     client = FakeResilientClient()
-    tool = OrderTools(client=client)
+    tool = OrderTools(client=client, cache=PassthroughCache())
 
     assert tool.query_order("EC202607130001", "token")["status"] == "success"
     assert client.calls[0][0] == "GET"
@@ -36,3 +52,18 @@ def test_ticket_create_passes_idempotency_key_to_resilient_client():
     _, _, kwargs = client.calls[0]
     assert kwargs["idempotency_key"] == "create-1"
     assert kwargs["headers"]["Idempotency-Key"] == "create-1"
+
+
+def test_worker_execution_identity_uses_signed_internal_headers():
+    """Worker 调 Java 时只透传短期签名凭证，不得伪装为客户 Authorization。"""
+    identity = "agent-execution:8:request-1:v1.1770000000.signature"
+
+    order_headers = OrderTools._headers(identity)
+    ticket_headers = TicketTools._headers(identity, "ticket-key")
+
+    for headers in (order_headers, ticket_headers):
+        assert "Authorization" not in headers
+        assert headers["X-Agent-Customer-ID"] == "8"
+        assert headers["X-Agent-Execution-Credential"] == "v1.1770000000.signature"
+        assert headers["X-Request-ID"] == "request-1"
+    assert ticket_headers["Idempotency-Key"] == "ticket-key"

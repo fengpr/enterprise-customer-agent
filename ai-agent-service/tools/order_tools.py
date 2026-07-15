@@ -5,7 +5,7 @@ import hashlib
 
 from services.resilient_client import ResilienceError, ResilientClient
 from services.cache_service import CacheService
-from services.observability import current_context
+from services.downstream_identity import build_business_headers, identity_cache_key
 
 
 class OrderTools:
@@ -52,17 +52,13 @@ class OrderTools:
 
     @staticmethod
     def _headers(auth_token: str | None) -> dict[str, str]:
-        """构造客户 Token 请求头。"""
-        context = current_context()
-        headers = {"X-Request-ID": context["request_id"], "X-Trace-ID": context["trace_id"]}
-        if auth_token:
-            headers["Authorization"] = f"Bearer {auth_token}"
-        return headers
+        """构造客户登录身份或 Worker 短期执行身份请求头。"""
+        return build_business_headers(auth_token)
 
     @staticmethod
     def _customer_key(auth_token: str | None) -> str:
         """以不可逆 Token 摘要隔离缓存，避免直接把凭证写入 key。"""
-        return hashlib.sha256((auth_token or "anonymous").encode()).hexdigest()[:16]
+        return hashlib.sha256(identity_cache_key(auth_token).encode()).hexdigest()[:16]
 
     @staticmethod
     def _failure(query_type: str, error: ResilienceError, **fields) -> dict:

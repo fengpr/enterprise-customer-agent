@@ -1,5 +1,7 @@
 package com.example.business.service;
 
+import com.example.business.dto.TicketSupplementRequest;
+import com.example.business.dto.TicketSupplementResult;
 import com.example.business.entity.SupportTicket;
 import com.example.business.entity.TicketStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -16,11 +18,19 @@ import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Set;
 
+import org.springframework.transaction.annotation.Transactional;
+
 /**
  * 工单服务，负责工单创建、持久化、派单元数据和状态流转约束。
  */
 @Service
 public class TicketService {
+    private static final Set<String> DIRECT_FULFILLMENT_UPDATE_STATUSES = Set.of(
+            TicketStatus.PENDING_ASSIGN.name()
+    );
+    private static final Set<String> LOCKED_PICKUP_STATUSES = Set.of(
+            "CONFIRMED", "SCHEDULED", "COURIER_ASSIGNED", "PICKED_UP", "COMPLETED"
+    );
     private final JdbcTemplate jdbcTemplate;
     private final RowMapper<SupportTicket> ticketRowMapper = (rs, rowNum) -> new SupportTicket(
             nullableLong(rs, "id"),
@@ -34,6 +44,9 @@ public class TicketService {
             rs.getString("external_session_no"),
             rs.getString("content"),
             rs.getString("ai_summary"),
+            rs.getString("return_method"),
+            rs.getString("pickup_time_window"),
+            rs.getString("pickup_status"),
             rs.getString("assigned_group"),
             nullableLong(rs, "handler_id"),
             rs.getString("assigned_by"),
@@ -173,6 +186,9 @@ public class TicketService {
                 ticket.externalSessionNo(),
                 ticket.content(),
                 ticket.aiSummary(),
+                ticket.returnMethod(),
+                ticket.pickupTimeWindow(),
+                ticket.pickupStatus(),
                 ticket.assignedGroup(),
                 ticket.handlerId(),
                 ticket.assignedBy(),
@@ -261,6 +277,160 @@ public class TicketService {
             throw new IllegalArgumentException("工单不存在：" + ticketNo);
         }
         return detailForCustomer(ticketNo, customerId);
+    }
+
+    /**
+     * 向客户自己的在途工单追加退货信息，并依据履约阶段决定是否允许直接修改取件偏好。
+     *
+     * <p>退货原因等说明始终以审计记录追加；取件方式和取件时间只有在尚未分派且未锁定
+     * 履约安排时才直接更新。工单一旦分派给工作人员或进入承运阶段，就只登记变更申请，
+     * 避免临近取件时覆盖原安排。</p>
+     *
+     * @param ticketNo 工单编号
+     * @param customerId 登录态客户 ID
+     * @param request 客户补充内容
+     * @param idempotencyKey 本次追加幂等键
+     * @return 追加结果和最新工单
+     */
+    @Transactional
+    public TicketSupplementResult appendSupplementForCustomer(
+            String ticketNo,
+            Long customerId,
+            TicketSupplementRequest request,
+            String idempotencyKey
+    ) {
+        if (idempotencyKey == null || idempotencyKey.isBlank()) {
+            throw new IllegalArgumentException("追加工单信息必须提供 Idempotency-Key");
+        }
+        SupportTicket ticket = detailForCustomer(ticketNo, customerId);
+        if (TicketStatus.CLOSED.name().equals(ticket.status())) {
+            throw new IllegalArgumentException("工单已关闭，不能继续追加信息：" + ticketNo);
+        }
+
+        String content = cleanSupplementValue(request == null ? null : request.content(), 1000);
+        String reason = cleanSupplementValue(request == null ? null : request.afterSaleReason(), 500);
+        String returnMethod = cleanSupplementValue(request == null ? null : request.returnMethod(), 32);
+        String pickupTimeWindow = cleanSupplementValue(request == null ? null : request.pickupTimeWindow(), 128);
+        if (content == null && reason == null && returnMethod == null && pickupTimeWindow == null) {
+            throw new IllegalArgumentException("没有可追加的工单信息");
+        }
+
+        String existingContent = (ticket.content() == null ? "" : ticket.content())
+                + "\n" + (ticket.aiSummary() == null ? "" : ticket.aiSummary());
+        boolean reasonIsNew = reason != null
+                && !existingContent.contains("after_sale_reason: " + reason)
+                && !existingContent.contains("退货原因：" + reason);
+        boolean contentIsNew = content != null && !existingContent.contains(content);
+        boolean returnMethodChanged = returnMethod != null && !returnMethod.equalsIgnoreCase(
+                ticket.returnMethod() == null ? "" : ticket.returnMethod()
+        );
+        boolean pickupTimeChanged = pickupTimeWindow != null && !pickupTimeWindow.equals(
+                ticket.pickupTimeWindow() == null ? "" : ticket.pickupTimeWindow()
+        );
+        boolean fulfillmentChangeRequested = returnMethodChanged || pickupTimeChanged;
+        boolean fulfillmentLocked = ticket.pickupStatus() != null
+                && LOCKED_PICKUP_STATUSES.contains(ticket.pickupStatus().trim().toUpperCase());
+        boolean fulfillmentUpdated = fulfillmentChangeRequested
+                && DIRECT_FULFILLMENT_UPDATE_STATUSES.contains(ticket.status())
+                && !fulfillmentLocked;
+        boolean hasNewInformation = reasonIsNew || contentIsNew || fulfillmentChangeRequested;
+        String updateMode = !hasNewInformation
+                ? "UNCHANGED"
+                : (fulfillmentChangeRequested && !fulfillmentUpdated ? "REVIEW_REQUIRED" : "APPLIED");
+
+        LocalDateTime now = LocalDateTime.now();
+        String normalizedKey = idempotencyKey.trim();
+        int inserted = jdbcTemplate.update(
+                """
+                INSERT INTO ticket_supplement (
+                    ticket_no, customer_id, idempotency_key, content, after_sale_reason,
+                    requested_return_method, requested_pickup_time_window, update_mode, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(ticket_no, idempotency_key) DO NOTHING
+                """,
+                ticketNo,
+                customerId,
+                normalizedKey,
+                content,
+                reason,
+                returnMethod,
+                pickupTimeWindow,
+                updateMode,
+                toTimestamp(now)
+        );
+        if (inserted == 0) {
+            // Worker 重试命中同一幂等键时只返回已有结果，不重复追加正文或重复修改履约字段。
+            String existingMode = jdbcTemplate.queryForObject(
+                    "SELECT update_mode FROM ticket_supplement WHERE ticket_no = ? AND idempotency_key = ?",
+                    String.class,
+                    ticketNo,
+                    normalizedKey
+            );
+            return new TicketSupplementResult(
+                    detailForCustomer(ticketNo, customerId),
+                    existingMode == null ? "APPLIED" : existingMode,
+                    "APPLIED".equals(existingMode) && fulfillmentChangeRequested,
+                    true
+            );
+        }
+
+        if ("UNCHANGED".equals(updateMode)) {
+            // 完全重复的业务信息只留下幂等审计，不改写工单正文和更新时间。
+            return new TicketSupplementResult(ticket, updateMode, false, false);
+        }
+
+        String supplementSummary = buildSupplementSummary(
+                contentIsNew ? content : null,
+                reasonIsNew ? reason : null,
+                returnMethodChanged ? returnMethod : null,
+                pickupTimeChanged ? pickupTimeWindow : null,
+                updateMode
+        );
+        String marker = "\n\n[客户补充 " + now.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")) + "] ";
+        String updatedContent = appendText(ticket.content(), marker + supplementSummary);
+        String updatedAiSummary = appendText(ticket.aiSummary(), marker + supplementSummary);
+
+        String updatedReturnMethod = ticket.returnMethod();
+        String updatedPickupTimeWindow = ticket.pickupTimeWindow();
+        String updatedPickupStatus = ticket.pickupStatus();
+        if (fulfillmentUpdated) {
+            if (returnMethod != null) {
+                updatedReturnMethod = returnMethod;
+            }
+            if ("self_ship".equalsIgnoreCase(updatedReturnMethod)) {
+                // 改为自行寄回后清除旧取件时间，避免坐席继续按已取消的上门偏好处理。
+                updatedPickupTimeWindow = null;
+                updatedPickupStatus = "NOT_REQUIRED";
+            } else {
+                if (pickupTimeWindow != null) {
+                    updatedPickupTimeWindow = pickupTimeWindow;
+                }
+                updatedPickupStatus = "PREFERENCE_RECORDED";
+            }
+        }
+
+        jdbcTemplate.update(
+                """
+                UPDATE support_ticket
+                SET content = ?, ai_summary = ?, return_method = ?, pickup_time_window = ?,
+                    pickup_status = ?, updated_at = ?
+                WHERE ticket_no = ? AND customer_id = ?
+                """,
+                updatedContent,
+                updatedAiSummary,
+                updatedReturnMethod,
+                updatedPickupTimeWindow,
+                updatedPickupStatus,
+                toTimestamp(now),
+                ticketNo,
+                customerId
+        );
+        return new TicketSupplementResult(
+                detailForCustomer(ticketNo, customerId),
+                updateMode,
+                fulfillmentUpdated,
+                false
+        );
     }
 
     /**
@@ -473,6 +643,9 @@ public class TicketService {
                     external_session_no VARCHAR(64),
                     content CLOB,
                     ai_summary CLOB,
+                    return_method VARCHAR(32),
+                    pickup_time_window VARCHAR(128),
+                    pickup_status VARCHAR(32),
                     assigned_group VARCHAR(128),
                     handler_id BIGINT,
                     assigned_by VARCHAR(32),
@@ -503,8 +676,31 @@ public class TicketService {
         );
         jdbcTemplate.execute(
                 """
+                CREATE TABLE IF NOT EXISTS ticket_supplement (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticket_no VARCHAR(64) NOT NULL,
+                    customer_id BIGINT NOT NULL,
+                    idempotency_key VARCHAR(128) NOT NULL,
+                    content CLOB,
+                    after_sale_reason VARCHAR(500),
+                    requested_return_method VARCHAR(32),
+                    requested_pickup_time_window VARCHAR(128),
+                    update_mode VARCHAR(32) NOT NULL,
+                    created_at TIMESTAMP NOT NULL,
+                    UNIQUE(ticket_no, idempotency_key)
+                )
+                """
+        );
+        jdbcTemplate.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_ticket_urge_log_ticket_created
                 ON ticket_urge_log(ticket_no, created_at)
+                """
+        );
+        jdbcTemplate.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_ticket_supplement_ticket_created
+                ON ticket_supplement(ticket_no, created_at)
                 """
         );
         jdbcTemplate.execute(
@@ -532,6 +728,10 @@ public class TicketService {
         ensureColumn("urge_count", "INTEGER DEFAULT 0");
         ensureColumn("last_urged_at", "TIMESTAMP");
         ensureColumn("last_urge_reason", "CLOB");
+        // 旧版 SQLite 数据库启动时补齐退货履约字段，避免要求开发者手工重建数据库。
+        ensureColumn("return_method", "VARCHAR(32)");
+        ensureColumn("pickup_time_window", "VARCHAR(128)");
+        ensureColumn("pickup_status", "VARCHAR(32)");
     }
 
     private void insertDraft(SupportTicket ticket) {
@@ -540,11 +740,12 @@ public class TicketService {
                     """
                     INSERT INTO support_ticket (
                         ticket_no, title, ticket_type, priority, customer_id, order_no,
-                        session_id, external_session_no, content, ai_summary, assigned_group,
+                        session_id, external_session_no, content, ai_summary,
+                        return_method, pickup_time_window, pickup_status, assigned_group,
                         handler_id, assigned_by, assignment_reason, assignment_score, assigned_at,
                         status, sla_deadline, source, urge_count, last_urged_at, last_urge_reason, created_at, updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """
             );
             ps.setString(1, ticket.ticketNo());
@@ -557,20 +758,23 @@ public class TicketService {
             ps.setString(8, ticket.externalSessionNo());
             ps.setString(9, ticket.content());
             ps.setString(10, ticket.aiSummary());
-            ps.setString(11, ticket.assignedGroup());
-            ps.setObject(12, ticket.handlerId());
-            ps.setString(13, ticket.assignedBy());
-            ps.setString(14, ticket.assignmentReason());
-            ps.setObject(15, ticket.assignmentScore());
-            ps.setTimestamp(16, toTimestamp(ticket.assignedAt()));
-            ps.setString(17, ticket.status());
-            ps.setTimestamp(18, toTimestamp(ticket.slaDeadline()));
-            ps.setString(19, ticket.source());
-            ps.setObject(20, ticket.urgeCount());
-            ps.setTimestamp(21, toTimestamp(ticket.lastUrgedAt()));
-            ps.setString(22, ticket.lastUrgeReason());
-            ps.setTimestamp(23, toTimestamp(ticket.createdAt()));
-            ps.setTimestamp(24, toTimestamp(ticket.updatedAt()));
+            ps.setString(11, ticket.returnMethod());
+            ps.setString(12, ticket.pickupTimeWindow());
+            ps.setString(13, ticket.pickupStatus());
+            ps.setString(14, ticket.assignedGroup());
+            ps.setObject(15, ticket.handlerId());
+            ps.setString(16, ticket.assignedBy());
+            ps.setString(17, ticket.assignmentReason());
+            ps.setObject(18, ticket.assignmentScore());
+            ps.setTimestamp(19, toTimestamp(ticket.assignedAt()));
+            ps.setString(20, ticket.status());
+            ps.setTimestamp(21, toTimestamp(ticket.slaDeadline()));
+            ps.setString(22, ticket.source());
+            ps.setObject(23, ticket.urgeCount());
+            ps.setTimestamp(24, toTimestamp(ticket.lastUrgedAt()));
+            ps.setString(25, ticket.lastUrgeReason());
+            ps.setTimestamp(26, toTimestamp(ticket.createdAt()));
+            ps.setTimestamp(27, toTimestamp(ticket.updatedAt()));
             return ps;
         });
     }
@@ -593,6 +797,7 @@ public class TicketService {
                 UPDATE support_ticket
                 SET title = ?, ticket_type = ?, priority = ?, customer_id = ?, order_no = ?,
                     session_id = ?, external_session_no = ?, content = ?, ai_summary = ?,
+                    return_method = ?, pickup_time_window = ?, pickup_status = ?,
                     assigned_group = ?, handler_id = ?, assigned_by = ?, assignment_reason = ?,
                     assignment_score = ?, assigned_at = ?, status = ?, sla_deadline = ?,
                     source = ?, urge_count = ?, last_urged_at = ?, last_urge_reason = ?,
@@ -608,6 +813,9 @@ public class TicketService {
                 updated.externalSessionNo(),
                 updated.content(),
                 updated.aiSummary(),
+                updated.returnMethod(),
+                updated.pickupTimeWindow(),
+                updated.pickupStatus(),
                 updated.assignedGroup(),
                 updated.handlerId(),
                 updated.assignedBy(),
@@ -665,6 +873,9 @@ public class TicketService {
                 ticket.externalSessionNo(),
                 ticket.content(),
                 ticket.aiSummary(),
+                ticket.returnMethod(),
+                ticket.pickupTimeWindow(),
+                ticket.pickupStatus(),
                 assignedGroup == null || assignedGroup.isBlank() ? ticket.assignedGroup() : assignedGroup,
                 handlerId == null ? ticket.handlerId() : handlerId,
                 assignedBy,
@@ -741,6 +952,44 @@ public class TicketService {
 
     private static LocalDateTime toLocalDateTime(Timestamp value) {
         return value == null ? null : value.toLocalDateTime();
+    }
+
+    private static String cleanSupplementValue(String value, int maxLength) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        String cleaned = value.trim();
+        return cleaned.length() <= maxLength ? cleaned : cleaned.substring(0, maxLength);
+    }
+
+    private static String appendText(String original, String addition) {
+        return (original == null ? "" : original) + addition;
+    }
+
+    private static String buildSupplementSummary(
+            String content,
+            String reason,
+            String returnMethod,
+            String pickupTimeWindow,
+            String updateMode
+    ) {
+        StringBuilder summary = new StringBuilder();
+        if (reason != null) {
+            summary.append("退货原因：").append(reason).append("；");
+        }
+        if (content != null) {
+            summary.append("客户说明：").append(content).append("；");
+        }
+        if (returnMethod != null) {
+            summary.append("申请退回方式：").append(returnMethod).append("；");
+        }
+        if (pickupTimeWindow != null) {
+            summary.append("申请取件时间：").append(pickupTimeWindow).append("；");
+        }
+        if ("REVIEW_REQUIRED".equals(updateMode)) {
+            summary.append("履约变更需人工确认，原安排暂不覆盖；");
+        }
+        return summary.toString();
     }
 
     private static Long nullableLong(ResultSet rs, String columnName) throws SQLException {

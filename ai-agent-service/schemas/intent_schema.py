@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -37,6 +38,39 @@ NextAction = Literal[
     "cancel_pending",
     "unsupported",
 ]
+ActionOperation = Literal["start", "update", "confirm", "cancel", "switch", "unknown"]
+SlotSource = Literal["selected_order", "explicit_message", "llm", "pending", "derived"]
+
+
+class ReturnGoodsSlots(BaseModel):
+    """退货动作的标准槽位，统一校验自然语言抽取结果和历史 pending 数据。"""
+
+    order_no: str | None = None
+    after_sale_reason: str | None = None
+    return_method: Literal["pickup", "self_ship"] | None = None
+    pickup_time_window: str | None = None
+    pickup_status: str | None = None
+    product_name: str | None = None
+    description: str | None = None
+
+
+class SlotMetadata(BaseModel):
+    """记录槽位来源和可信度，避免低置信度模型结果直接触发业务动作。"""
+
+    source: SlotSource
+    confidence: float = Field(ge=0, le=1)
+    updated_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
+
+
+class ActionTurnExtraction(BaseModel):
+    """单轮动作抽取结果，由状态归并器统一消费，不直接决定工具执行。"""
+
+    operation: ActionOperation = "unknown"
+    action_type: ActionType | None = None
+    explicit_action: bool = False
+    slots: dict[str, Any] = Field(default_factory=dict)
+    slot_metadata: dict[str, SlotMetadata] = Field(default_factory=dict)
+    ambiguous_fields: list[str] = Field(default_factory=list)
 
 
 class AnalyzeRequest(BaseModel):
@@ -114,6 +148,7 @@ class AgentReplyRequest(BaseModel):
     route_target: Literal["ai", "human", "both"] = "ai"
     pending_action_request: dict[str, Any] | None = None
     conversation_context: dict[str, Any] | None = None
+    login_user_context: dict[str, Any] | None = None
 
 
 class AgentExecutionJob(BaseModel):
@@ -133,16 +168,29 @@ class AgentExecutionJob(BaseModel):
     risk_level: str = "normal"
     trace_id: str | None = None
     execution_credential: str | None = None
+    login_user_context: dict[str, Any] | None = None
 
     def to_request(self) -> AgentReplyRequest:
         """转换为执行服务所需请求；凭证仅代表内部执行身份，不是客户原始 Token。"""
+        # Worker 只在内存中组合短期执行身份；队列本身仍不保存 Authorization 原始 Token。
+        from services.downstream_identity import build_execution_identity
+
+        execution_identity = None
+        if self.execution_credential:
+            execution_identity = build_execution_identity(
+                self.customer_id,
+                self.request_id,
+                self.execution_credential,
+            )
         return AgentReplyRequest(
             message=self.message,
             session_id=self.session_id,
             customer_id=self.customer_id,
+            auth_token=execution_identity,
             selected_order_no=self.selected_order_no,
             selected_ticket_no=self.selected_ticket_no,
             route_target=self.route_target,
+            login_user_context=self.login_user_context,
         )
 
 

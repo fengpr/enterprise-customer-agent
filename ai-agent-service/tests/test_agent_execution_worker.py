@@ -2,6 +2,9 @@
 
 from pathlib import Path
 
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
+
 from rag.agent_execution_worker import run_once
 from services.resilient_client import ResilienceError
 
@@ -63,6 +66,17 @@ class FakeEventService:
         self.events.append((request_id, event_type, payload))
 
 
+class TransientRedisFailureQueue(FakeQueue):
+    """模拟 Redis Stream 在领取任务前发生读超时或短暂断连。"""
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self.error = error
+
+    def recover_pending(self):
+        raise self.error
+
+
 def test_worker_uses_execution_service_and_shared_job_contract() -> None:
     """Worker 应把队列载荷转换为 AgentExecutionJob 后委托执行服务。"""
     queue = FakeQueue()
@@ -90,6 +104,17 @@ def test_worker_stream_timeout_is_requeued_without_terminal_error() -> None:
     assert run_once(queue, TimeoutExecutionService(), events) is True
     assert queue.retries[0][-1] == "ONLINE_LLM_TIMEOUT"
     assert events.events[-1][1] == "queued"
+
+
+def test_worker_survives_transient_redis_timeout_and_disconnect() -> None:
+    """Redis 读超时和短暂断连只能结束本轮轮询，不能终止常驻 Worker。"""
+    service = FakeExecutionService()
+
+    for error in (RedisTimeoutError("read timeout"), RedisConnectionError("connection lost")):
+        queue = TransientRedisFailureQueue(error)
+        assert run_once(queue, service) is False
+        assert queue.completed == []
+        assert queue.retries == []
 
 
 def test_worker_does_not_import_fastapi_app() -> None:

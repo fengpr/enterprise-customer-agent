@@ -27,6 +27,10 @@ class AgentExecutionQueue:
         self.visibility_timeout_ms = int(os.getenv("AGENT_JOB_VISIBILITY_TIMEOUT_MS", "30000"))
         self.ttl_seconds = int(os.getenv("AGENT_JOB_TTL_SECONDS", "600"))
         self.idempotency_ttl = int(os.getenv("AGENT_IDEMPOTENCY_TTL_SECONDS", "600"))
+        self.claim_block_ms = max(100, int(os.getenv("AGENT_QUEUE_BLOCK_MS", "1000")))
+        configured_socket_timeout = float(os.getenv("AGENT_REDIS_SOCKET_TIMEOUT_SECONDS", "5"))
+        # Redis 读超时必须明显大于 XREADGROUP 阻塞周期，否则空队列也会被误判为连接超时。
+        self.redis_socket_timeout_seconds = max(configured_socket_timeout, self.claim_block_ms / 1000 + 1)
         # 心跳 TTL 要略大于空闲轮询周期，同时能尽快识别卡在下游调用中的失联 Worker。
         self.worker_heartbeat_ttl = int(os.getenv("AGENT_WORKER_HEARTBEAT_TTL_SECONDS", "20"))
         if self._redis is None:
@@ -35,7 +39,13 @@ class AgentExecutionQueue:
                 return
             try:
                 import redis
-                self._redis = redis.Redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=1, socket_timeout=2)
+                self._redis = redis.Redis.from_url(
+                    redis_url,
+                    decode_responses=True,
+                    socket_connect_timeout=1,
+                    socket_timeout=self.redis_socket_timeout_seconds,
+                    health_check_interval=15,
+                )
                 self._redis.ping()
             except Exception:
                 self._redis = None
@@ -64,7 +74,7 @@ class AgentExecutionQueue:
         self._refresh_metrics()
         return job.request_id
 
-    def heartbeat(self) -> None:
+    def heartbeat(self, ttl_seconds: int | None = None) -> None:
         """写入消费者心跳，供启动脚本识别真正可工作的 Agent Worker。
 
         心跳不携带客户信息。Worker 卡在模型调用时无法刷新心跳，TTL 到期后再次
@@ -73,7 +83,8 @@ class AgentExecutionQueue:
         if not self.enabled:
             return
         try:
-            self._redis.setex(self._worker_heartbeat_key(self.consumer_name), self.worker_heartbeat_ttl, str(int(time.time())))
+            ttl = int(ttl_seconds or self.worker_heartbeat_ttl)
+            self._redis.setex(self._worker_heartbeat_key(self.consumer_name), ttl, str(int(time.time())))
         except Exception:
             # 心跳仅用于运维发现，Redis 短暂异常不能中断正常的队列执行路径。
             pass
@@ -130,10 +141,17 @@ class AgentExecutionQueue:
                 "error": "redis_queue_unavailable",
             }
 
-    def claim(self, block_ms: int = 1000) -> tuple[str, str, AgentExecutionJob, int] | None:
+    def claim(self, block_ms: int | None = None) -> tuple[str, str, AgentExecutionJob, int] | None:
         """通过 XREADGROUP 领取新消息并将状态切换为 RUNNING。"""
         self._require_enabled()
-        data = self._redis.xreadgroup(self.group_name, self.consumer_name, {self.stream_key: ">"}, count=1, block=block_ms)
+        actual_block_ms = self.claim_block_ms if block_ms is None else max(0, int(block_ms))
+        data = self._redis.xreadgroup(
+            self.group_name,
+            self.consumer_name,
+            {self.stream_key: ">"},
+            count=1,
+            block=actual_block_ms,
+        )
         return self._parse_claim(data)
 
     def recover_pending(self) -> tuple[str, str, AgentExecutionJob, int] | None:

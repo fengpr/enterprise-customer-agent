@@ -48,6 +48,12 @@ const humanMessages = computed(() =>
   })
 )
 const visibleMessages = computed(() => (activeTab.value === 'human' ? humanMessages.value : aiMessages.value))
+const visibleMessageEntries = computed(() =>
+  visibleMessages.value.map((message, index, list) => ({
+    message,
+    timeDivider: shouldShowTimeDivider(message, list[index - 1]) ? formatTimeDivider(message) : ''
+  }))
+)
 const humanStatusText = computed(() => {
   if (!props.session) return ''
   if (props.session.status === 'HUMAN_PENDING') return '待接入'
@@ -131,13 +137,42 @@ function parseMessageDate(value: string | number | Date | null | undefined) {
   return Number.isNaN(parsed.getTime()) ? new Date() : parsed
 }
 
-function formatMessageTime(message?: MessageTimeSource | null) {
+function messageDate(message?: MessageTimeSource | null) {
   const rawTime = message?.created_at ?? message?.createdAt ?? message?.createTime ?? message?.sendTime ?? message?.timestamp
-  return new Intl.DateTimeFormat(undefined, {
+  return parseMessageDate(rawTime)
+}
+
+function isSameCalendarDay(left: Date, right: Date) {
+  return left.getFullYear() === right.getFullYear()
+    && left.getMonth() === right.getMonth()
+    && left.getDate() === right.getDate()
+}
+
+function shouldShowTimeDivider(message: ChatMessage, previous?: ChatMessage) {
+  // 第一条消息必须显示时间；跨天或距离上一条消息达到 10 分钟时显示新的时间分隔条。
+  if (!previous) return true
+  const currentDate = messageDate(message)
+  const previousDate = messageDate(previous)
+  if (!isSameCalendarDay(currentDate, previousDate)) return true
+  return currentDate.getTime() - previousDate.getTime() >= 10 * 60 * 1000
+}
+
+function formatTimeDivider(message: ChatMessage) {
+  const date = messageDate(message)
+  const now = new Date()
+  const yesterday = new Date(now)
+  yesterday.setDate(now.getDate() - 1)
+  const time = new Intl.DateTimeFormat(undefined, {
     hour: '2-digit',
     minute: '2-digit',
     hour12: false
-  }).format(parseMessageDate(rawTime))
+  }).format(date)
+  if (isSameCalendarDay(date, now)) return `今天 ${time}`
+  if (isSameCalendarDay(date, yesterday)) return `昨天 ${time}`
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day} ${time}`
 }
 
 function senderLabel(message: ChatMessage) {
@@ -272,20 +307,24 @@ watch(
 
     <div ref="chatWindowRef" class="chat-window">
       <template v-if="visibleMessages.length">
-        <div
-          v-for="item in visibleMessages"
-          :key="item.id"
-          :class="['chat-message', messageClass(item)]"
+        <template
+          v-for="entry in visibleMessageEntries"
+          :key="entry.message.id"
         >
-          <div class="bubble-avatar">{{ senderAvatar(item) }}</div>
-          <div class="message-stack">
-            <time>{{ senderLabel(item) }} · {{ formatMessageTime(item) }}</time>
-            <div class="chat-bubble">
-              <p v-if="item.sender_type === 'customer'">{{ item.content }}</p>
-              <div v-else class="message-markdown" v-html="renderMessageMarkdown(item.content)" />
+          <time v-if="entry.timeDivider" class="chat-time-divider">{{ entry.timeDivider }}</time>
+          <div
+            :class="['chat-message', messageClass(entry.message)]"
+          >
+            <div class="bubble-avatar">{{ senderAvatar(entry.message) }}</div>
+            <div class="message-stack">
+              <span class="message-sender">{{ senderLabel(entry.message) }}</span>
+              <div class="chat-bubble">
+                <p v-if="entry.message.sender_type === 'customer'">{{ entry.message.content }}</p>
+                <div v-else class="message-markdown" v-html="renderMessageMarkdown(entry.message.content)" />
+              </div>
             </div>
           </div>
-        </div>
+        </template>
       </template>
       <div v-else-if="activeTab === 'ai'" class="chat-message from-agent">
         <div class="bubble-avatar">AI</div>

@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from agents.action_request import ACTION_SLOT_RULES, enrich_action_analysis
 from agents.intent_normalizer import (
+    is_delivery_not_received_message,
     infer_intent as normalize_intent,
     infer_user_goal as normalize_user_goal,
     is_action_request_message as normalize_is_action_request_message,
@@ -20,6 +21,7 @@ from agents.intent_normalizer import (
     is_out_of_scope_message,
 )
 from agents.llm_intent_analyzer import LLMIntentAnalyzer
+from agents.order_context import has_fuzzy_order_reference, resolve_order_context
 from graphs.ticket_process_graph import TicketProcessState, build_ticket_process_graph
 from rag.quality import build_rag_trace, ensure_citation_ids
 from rag.rag_chain import RagChain
@@ -60,6 +62,7 @@ class CustomerServiceAgent:
             prepare_action=self._prepare_action_state,
             compose_answer=self._compose_answer,
             log_tool_call=self._log,
+            append_ticket_information=self.ticket_tools.append_ticket_information,
         )
 
     def analyze(self, message: str) -> IntentResult:
@@ -169,7 +172,8 @@ class CustomerServiceAgent:
         if decision_type == "auto_reply":
             return "自动回复"
         if decision_type == "review_required":
-            return "已提交，待分派"
+            # 没有 Java 成功建单证据时不能展示“已提交”，避免客户误以为工单已经落库。
+            return "待人工核实，尚未建单"
         return "人工客服将跟进"
 
     def _build_customer_message(self, state: TicketProcessState) -> str:
@@ -183,6 +187,90 @@ class CustomerServiceAgent:
 
         if decision_type == "review_required":
             ticket_text = self._format_customer_ticket_text(state.get("ticket_result"))
+            if (
+                is_delivery_not_received_message(state.get("message", ""))
+                and "delivery_status_conflict" in set(state.get("risk_reasons", []))
+            ):
+                # 签收状态与客户反馈冲突时使用确定性异常话术，不能让模型继续重复“已签收”。
+                if ticket_text:
+                    return (
+                        "我已核对到系统物流记录显示包裹已签收，但您反馈实际没有收到，两者存在不一致。"
+                        "我已按物流签收异常为您登记核实，不会仅凭系统签收记录否定您的反馈。"
+                        f"{ticket_text}您也可以先确认门卫、快递柜、代收点或家人是否代收；"
+                        "后续结果以物流工作人员核实为准。"
+                    )
+                return (
+                    "我已核对到系统物流记录显示包裹已签收，但您反馈实际没有收到，两者存在不一致。"
+                    "该情况需要进入物流异常核实；当前工单登记暂未成功，请稍后重试或转人工客服处理。"
+                )
+            if (
+                state["analysis"].user_goal == "action_request"
+                and state.get("ticket_result")
+                and state["ticket_result"].get("status") != "success"
+            ):
+                # Java 建单失败时不得使用“已受理”话术，保留槽位供客户稍后重试或人工接管。
+                return (
+                    "订单和申请信息已经核对，但售后工单暂时未能创建成功。"
+                    "请稍后重试；如持续失败，可转人工客服继续处理。"
+                )
+            if (
+                state["analysis"].user_goal == "action_request"
+                and "order_validation_failed" in set(state.get("risk_reasons", []))
+                and not ticket_text
+            ):
+                # 未通过订单归属校验时必须明确告知“尚未建单”，禁止让模型生成已提交、已登记等假成功话术。
+                return (
+                    "您的申请信息已经记录，但当前暂时无法验证该订单的归属，因此尚未创建售后工单。"
+                    "请稍后重试；如持续失败，可转人工客服进一步核实。"
+                )
+            if state["analysis"].user_goal == "action_request" and state["analysis"].action_type == "return_goods" and ticket_text:
+                # 退货申请已成功落到工单时，客户侧必须明确展示“退货申请已提交”，避免退化成泛化人工核实话术。
+                slots = state["analysis"].action_slots or {}
+                ticket_result = state.get("ticket_result") or {}
+                if ticket_result.get("deduplicated"):
+                    supplement_result = ticket_result.get("supplement_result")
+                    if supplement_result and supplement_result.get("status") != "success":
+                        return (
+                            f"已找到您现有的退货工单。{ticket_text}"
+                            "但本次补充信息暂未成功写入，请稍后重试或联系人工客服核实；原取件安排没有变更。"
+                        )
+                    supplement_data = (supplement_result or {}).get("data") or {}
+                    update_mode = supplement_data.get("updateMode")
+                    if update_mode == "UNCHANGED":
+                        return (
+                            f"已关联您现有的退货工单。{ticket_text}"
+                            "本次信息与原工单一致，因此没有重复追加或新建工单。"
+                        )
+                    reason_text = (
+                        f"已把退货原因“{slots.get('after_sale_reason')}”追加到原工单。"
+                        if slots.get("after_sale_reason")
+                        else "本次说明已追加到原工单。"
+                    )
+                    if update_mode == "REVIEW_REQUIRED":
+                        return (
+                            f"已关联您现有的退货工单。{ticket_text}{reason_text}"
+                            "由于工单或取件已经进入处理阶段，新的取件方式/时间仅登记为变更申请，"
+                            "不会直接覆盖原安排，请以工作人员或承运方后续确认为准。"
+                        )
+                    if supplement_result:
+                        return (
+                            f"已关联您现有的退货工单。{ticket_text}{reason_text}"
+                            "本次提供的退回方式和取件时间偏好已更新到原工单，具体安排仍以后续确认为准。"
+                        )
+                    # 兼容未接入追加接口的旧测试图，仅说明复用工单，不声称新信息已经写入。
+                    return f"已关联您现有的退货工单。{ticket_text}本次没有重复创建新工单。"
+                if slots.get("return_method") == "pickup":
+                    fulfillment_text = (
+                        f"已登记上门取件偏好：{slots.get('pickup_time_window')}。"
+                        "具体取件安排以工作人员或承运方后续确认为准。"
+                    )
+                else:
+                    fulfillment_text = "已登记为自行寄回，后续请按工作人员提供的退回信息寄送。"
+                reason_text = f"已记录退货原因：{slots.get('after_sale_reason')}。" if slots.get("after_sale_reason") else ""
+                return (
+                    f"已为您提交退货申请，售后工单已进入受理流程。{ticket_text}"
+                    f"{reason_text}{fulfillment_text}工作人员会结合订单状态、退货原因和相关凭证继续核实处理。"
+                )
             if state["analysis"].user_goal in {"complaint", "dispute"}:
                 # 投诉、赔付争议属于高风险场景，使用受控模板而不让自由生成补充未被证据支持的处理承诺。
                 citation_marker = self._primary_citation_marker(state.get("citations", []))
@@ -403,6 +491,20 @@ class CustomerServiceAgent:
         citations = state.get("citations", [])
         order_text = self._format_order_tool_text(state.get("tool_results", []))
 
+        if self._is_user_identity_message(state["message"]):
+            return self._compose_user_identity_answer(state)
+
+        if self._is_session_memory_question(state["message"]):
+            return self._compose_session_memory_answer(state)
+
+        order_context_answer = self._compose_order_context_guardrail_answer(state)
+        if order_context_answer:
+            return order_context_answer
+
+        other_identity_order_answer = self._compose_other_identity_order_answer(state)
+        if other_identity_order_answer:
+            return other_identity_order_answer
+
         if analysis.user_goal == "info_query" and self._is_agent_identity_message(state["message"]):
             return self._compose_agent_identity_answer(state)
 
@@ -440,6 +542,22 @@ class CustomerServiceAgent:
 
         if analysis.user_goal == "action_request" and analysis.next_action == "collect_slots":
             # 动作请求缺槽位时进入多轮补齐，不输出政策建议，也不提前建单。
+            deterministic_slots = {
+                "pending_confirmation",
+                "action_confirmation",
+                "order_confirmation",
+                "order_no",
+                "after_sale_reason",
+                "return_method",
+                "pickup_time_window",
+                "fault_description",
+                "invoice_title",
+                "invoice_type",
+                "tax_no",
+            }
+            if deterministic_slots.intersection(analysis.missing_slots or []):
+                # 确认和关键业务槽位必须按真实缺失字段追问，不能让模型泛化成“还有其他信息吗”。
+                return self._format_action_slot_question(state)
             llm_answer = self._compose_llm_customer_answer(
                 state,
                 reply_mode="collect_slots",
@@ -801,6 +919,73 @@ class CustomerServiceAgent:
         )
         return llm_answer or fallback
 
+    def _compose_user_identity_answer(self, state: TicketProcessState) -> str:
+        """回答“我是谁”类问题，登录态身份永远优先于会话自称。"""
+        context = state.get("conversation_context") or {}
+        login_user = context.get("login_user_context") or {}
+        session_memory = context.get("session_memory") or {}
+        display_name = str(login_user.get("display_name") or "").strip()
+        role = str(login_user.get("role") or "customer").strip()
+        role_text = "客户" if role == "customer" else role
+        preferred_name = str(session_memory.get("preferred_name") or session_memory.get("self_claimed_name") or "").strip()
+        if display_name and preferred_name and session_memory.get("identity_conflict"):
+            return (
+                f"当前登录账号显示为{display_name}，身份是{role_text}；"
+                f"本次会话中您提到希望称呼为{preferred_name}。"
+                "涉及订单、工单和身份校验时，以当前登录账号为准。"
+            )
+        if display_name:
+            return f"当前登录账号显示为{display_name}，身份是{role_text}。涉及订单、工单和身份校验时，我会以当前登录账号为准。"
+        if preferred_name:
+            return f"本次会话中您提到希望称呼为{preferred_name}。不过涉及订单、工单和身份校验时，仍以当前登录账号为准。"
+        return "您是当前已登录并正在咨询的客户。为了保护隐私，我不会展示更多账号信息；涉及订单、工单和身份校验时，会以当前登录账号为准。"
+
+    def _compose_session_memory_answer(self, state: TicketProcessState) -> str:
+        """回答“刚才问了什么/刚才聊了什么”类问题，只读取当前会话短期记忆。"""
+        session_memory = ((state.get("conversation_context") or {}).get("session_memory") or {})
+        recent_user_messages = session_memory.get("recent_user_messages") or []
+        recent_ai_messages = session_memory.get("recent_ai_messages") or []
+        last_question = session_memory.get("last_user_question")
+        message = state["message"]
+        if self._contains_any(message, ["问了什么", "上一句", "刚刚问", "刚才问", "前一句"]):
+            if last_question:
+                return f"您刚才问的是：“{last_question}”。"
+            return "当前会话里我还没有看到更早的问题。您可以继续描述，我会从这条消息开始帮您记住上下文。"
+        if not recent_user_messages and not recent_ai_messages:
+            return "当前会话里暂时没有更早的聊天内容。您可以继续提问，我会基于本次会话继续衔接。"
+        parts: list[str] = []
+        for item in recent_user_messages[-3:]:
+            content = item.get("content")
+            if content:
+                parts.append(f"您提到：“{content}”")
+        if recent_ai_messages:
+            answer = recent_ai_messages[-1].get("content")
+            if answer:
+                parts.append(f"我上一轮回复的大意是：“{answer}”")
+        return "刚才我们主要聊了：" + "；".join(parts) + "。"
+
+    def _compose_other_identity_order_answer(self, state: TicketProcessState) -> str:
+        """阻止按会话自称或其他姓名查询订单，订单权限只能来自登录态 customer_id。"""
+        message = state["message"]
+        if not self._is_other_identity_order_request(message, state.get("conversation_context")):
+            return ""
+        return (
+            "为了保护账号和订单隐私，我不能仅凭会话里提到的姓名查询他人订单。"
+            "订单、工单和售后信息会以当前登录账号为准；如果需要查询其他人的订单，请切换到对应账号，或联系人工客服完成身份核验。"
+        )
+
+    def _compose_order_context_guardrail_answer(self, state: TicketProcessState) -> str:
+        """在历史订单需要确认或已过期时，优先给出确定性追问，避免误查单或误建单。"""
+        message = state["message"]
+        if not has_fuzzy_order_reference(message):
+            return ""
+        resolution = resolve_order_context(state.get("conversation_context"), message)
+        if resolution.get("status") == "needs_confirmation" and resolution.get("order_no"):
+            return f"请确认您说的是订单 {resolution['order_no']} 吗？确认后我再继续帮您查询或处理。"
+        if resolution.get("status") in {"none", "expired"}:
+            return "我还不能确定您指的是哪一笔订单。请先在上方选择订单，或直接发送订单号，我再继续帮您查询或处理。"
+        return ""
+
     def _slot_question_context(self, state: TicketProcessState) -> dict[str, Any]:
         """为缺槽位追问提供聚焦上下文，避免模型展开无关政策说明。"""
         analysis = state["analysis"]
@@ -1096,6 +1281,41 @@ class CustomerServiceAgent:
         action_name = self._action_display_name(analysis.action_type)
         order_options = self._format_recent_order_options(state.get("tool_results", []))
 
+        if "pending_confirmation" in missing:
+            pending = state.get("pending_action_request") or {}
+            pending_order_no = (pending.get("action_slots") or {}).get("order_no")
+            order_hint = f"订单 {pending_order_no} 的" if pending_order_no else "之前的"
+            return f"您之前正在办理{order_hint}{action_name}申请，已间隔一段时间。请确认是否继续该申请？"
+        if "action_confirmation" in missing:
+            pending = state.get("pending_action_request") or {}
+            if pending.get("confirmation_reason") == "ambiguous_unwanted_item":
+                order_no = (pending.get("action_slots") or {}).get("order_no")
+                order_hint = f"订单 {order_no}" if order_no else "一笔订单"
+                return f"请确认您是想为{order_hint}发起退货申请吗？确认后我会继续核对尚缺的信息。"
+            return f"之前的{action_name}流程已超时，我不会继续关联原订单。请确认是否重新发起一笔{action_name}申请？"
+        if "order_confirmation" in missing:
+            pending = state.get("pending_action_request") or {}
+            summary = pending.get("candidate_order_summary") or {}
+            candidate_order_no = (pending.get("action_slots") or {}).get("candidate_order_no") or summary.get("order_no")
+            product_name = summary.get("product_name")
+            product_hint = f"（{product_name}）" if product_name else ""
+            return f"请确认您要办理的是订单 {candidate_order_no}{product_hint} 吗？回复“是”后我会继续收集{action_name}所需信息。"
+        if analysis.action_type == "return_goods" and missing.intersection(
+            {"order_no", "after_sale_reason", "return_method", "pickup_time_window"}
+        ):
+            # 退货流程根据当前真实缺口组合问题，允许客户一轮补充多个槽位，不再固定逐项询问。
+            questions: list[str] = []
+            if "order_no" in missing:
+                questions.append("请选择要退货的订单，或直接回复订单号")
+            if "after_sale_reason" in missing:
+                questions.append("说明退货原因")
+            if "return_method" in missing:
+                questions.append("选择上门取件或自行寄回；如需上门取件，也可以同时告诉我方便的时间")
+            elif "pickup_time_window" in missing:
+                questions.append("告诉我方便上门取件的时间段")
+            suffix = f"\n\n您也可以从这些订单中选择：\n{order_options}" if "order_no" in missing and order_options else ""
+            prefix = f"已关联订单 {order_no}，" if order_no and "order_no" not in missing else ""
+            return prefix + "；".join(questions) + "。" + suffix
         if "order_no" in missing and "after_sale_reason" in missing:
             suffix = f"\n\n您也可以从这些订单中选择：\n{order_options}" if order_options else ""
             return f"请问您要处理哪一笔订单？可以选择订单或直接回复订单号，并说明{action_name}原因。{suffix}"
@@ -1105,6 +1325,15 @@ class CustomerServiceAgent:
         if "after_sale_reason" in missing:
             prefix = f"已关联订单 {order_no}，" if order_no else ""
             return f"{prefix}请补充{action_name}原因，例如商品质量问题、拍错、不想要、配件缺失等。"
+        if "return_method" in missing:
+            reason = slots.get("after_sale_reason")
+            reason_hint = f"已记录您的退货原因：{reason}。" if reason else ""
+            return f"{reason_hint}您希望选择上门取件，还是自行寄回商品？"
+        if "pickup_time_window" in missing:
+            return (
+                "好的，已选择上门取件。请告诉我方便取件的时间段，例如明天下午、工作日 18:00 后或周六上午。"
+                "该时间会作为取件偏好登记，最终安排以工作人员或承运方确认为准。"
+            )
         if "fault_description" in missing:
             prefix = f"已关联订单 {order_no}，" if order_no else ""
             return f"{prefix}请描述需要维修的具体故障现象，例如无法联网、无法开机、报错或配件异常。"
@@ -1754,8 +1983,8 @@ class CustomerServiceAgent:
             if order_no not in normalized.order_no:
                 normalized.order_no.append(order_no)
 
-        if self._is_agent_identity_message(message):
-            # “你是谁/你能做什么”是基础信息咨询，不继承订单、工单或售后动作上下文。
+        if self._is_agent_identity_message(message) or self._is_user_identity_message(message) or self._is_session_memory_question(message):
+            # 身份和会话记忆问题是基础信息咨询，不继承订单、工单或售后动作上下文。
             normalized.intent = "consult"
             normalized.user_goal = "info_query"
             normalized.order_related = False
@@ -2107,12 +2336,54 @@ class CustomerServiceAgent:
         conversation_context: dict[str, Any] | None,
     ) -> IntentResult:
         """把结构化上下文补入意图结果，让工具节点和槽位判断链路一致。"""
-        if not conversation_context or not self._has_context_reference(message):
+        if not conversation_context:
             return result
         normalized = result.model_copy(deep=True)
+        order_resolution = resolve_order_context(conversation_context, message)
+        if order_resolution.get("status") == "usable":
+            order_no = str(order_resolution.get("order_no") or "")
+            if order_no and order_no not in normalized.order_no:
+                # 仅 5 分钟内明确确认过的订单上下文可直接补入本轮只读查询或动作槽位。
+                normalized.order_no.append(order_no)
+                normalized.order_related = True
+                normalized.need_order_query = normalized.user_goal not in {"policy_consult", "how_to"}
+        elif has_fuzzy_order_reference(message):
+            # 过期或待确认订单上下文不得触发查单、建单或售后动作。
+            normalized.intent = "consult" if normalized.intent == "other" else normalized.intent
+            normalized.user_goal = "info_query"
+            normalized.order_related = False
+            normalized.order_no = []
+            normalized.need_order_query = False
+            normalized.need_human = False
+            normalized.need_ticket = False
+            normalized.action_type = None
+            normalized.action_slots = {}
+            normalized.missing_slots = []
+            normalized.next_action = None
+            if order_resolution.get("status") == "needs_confirmation" and "order_context_needs_confirmation" not in normalized.risk_reasons:
+                normalized.risk_reasons.append("order_context_needs_confirmation")
+            return normalized
+        if self._is_other_identity_order_request(message, conversation_context):
+            # 用户自称或指定其他姓名不能作为订单查询身份，必须阻断工具查询。
+            normalized.intent = "consult"
+            normalized.user_goal = "info_query"
+            normalized.order_related = False
+            normalized.order_no = []
+            normalized.need_order_query = False
+            normalized.need_human = False
+            normalized.need_ticket = False
+            normalized.action_type = None
+            normalized.action_slots = {}
+            normalized.missing_slots = []
+            normalized.next_action = None
+            normalized.confidence = max(normalized.confidence, 0.9)
+            normalized.risk_reasons = [reason for reason in normalized.risk_reasons if reason not in {"low_confidence"}]
+            return normalized
+        if not self._has_context_reference(message):
+            return normalized
         explicit_order_no = re.findall(r"(?<![A-Za-z])(?:EC)?\d{10,18}", message, flags=re.IGNORECASE)
         if not explicit_order_no:
-            order_no = self._conversation_context_value(conversation_context, "last_order")
+            order_no = str(order_resolution.get("order_no") or "") if order_resolution.get("status") == "usable" else ""
             if order_no and order_no not in normalized.order_no:
                 # 上下文订单只作为候选，后续 query_order 节点仍会调用 Java 校验归属。
                 normalized.order_no.append(order_no)
@@ -2132,7 +2403,7 @@ class CustomerServiceAgent:
         return normalized
 
     def _safe_conversation_context(self, state: TicketProcessState) -> dict[str, Any] | None:
-        """只把安全摘要和结构化实体交给回复模型，不传历史原文或调试依据。"""
+        """只把安全摘要、短期记忆和结构化实体交给回复模型，不传调试依据。"""
         context = state.get("conversation_context") or {}
         if not context:
             return None
@@ -2141,12 +2412,74 @@ class CustomerServiceAgent:
             "last_product": context.get("last_product"),
             "last_ticket": context.get("last_ticket"),
             "last_action": context.get("last_action"),
+            "order_context": context.get("order_context"),
             "safe_context_summary": context.get("safe_context_summary"),
+            "login_user_context": context.get("login_user_context"),
+            "session_memory": self._safe_session_memory_for_llm(context.get("session_memory") or {}),
+            "identity_policy": (
+                "登录态身份是权威身份；preferred_name 只能用于称呼；"
+                "self_claimed_name 不能用于权限、订单或工单判断；不得暴露内部冲突标记、customer_id、Authorization 或风控原因。"
+            ),
+        }
+
+    @staticmethod
+    def _safe_session_memory_for_llm(session_memory: dict[str, Any]) -> dict[str, Any]:
+        """过滤会话记忆中的内部冲突标记，只保留客户可见短期上下文。"""
+        return {
+            "recent_user_messages": session_memory.get("recent_user_messages") or [],
+            "recent_ai_messages": session_memory.get("recent_ai_messages") or [],
+            "last_user_question": session_memory.get("last_user_question"),
+            "last_ai_answer": session_memory.get("last_ai_answer"),
+            "preferred_name": session_memory.get("preferred_name"),
+            "self_claimed_name": session_memory.get("self_claimed_name"),
         }
 
     def _has_context_reference(self, message: str) -> bool:
         """识别需要依赖历史上下文解析的指代表达。"""
-        return self._contains_any(message, ["刚才", "上面", "之前", "那个", "这个", "这单", "那单", "还是", "继续", "它", "那就"])
+        return self._contains_any(message, ["刚才", "刚刚", "上面", "之前", "上一句", "前面", "那个", "这个", "这单", "那单", "还是", "继续", "它", "那就"])
+
+    def _is_user_identity_message(self, message: str) -> bool:
+        """识别客户询问自身登录身份的问题，必须用登录态确定性回答。"""
+        text = message.strip()
+        return bool(re.search(r"(我是谁|你知道我是谁吗|知道我是谁吗|我叫什么|我的身份|当前账号是谁)", text))
+
+    def _is_session_memory_question(self, message: str) -> bool:
+        """识别客户询问当前会话历史的问题，避免模型谎称无法看到上下文。"""
+        text = message.strip()
+        return bool(
+            self._contains_any(text, ["我刚刚问", "我刚才问", "上一句我说", "前一句我说", "我问了什么", "刚才聊", "之前聊", "前面聊", "我们刚才"])
+            and self._contains_any(text, ["什么", "内容", "问题", "说"])
+        )
+
+    def _is_other_identity_order_request(self, message: str, conversation_context: dict[str, Any] | None) -> bool:
+        """识别按姓名查询订单的请求；姓名不是授权凭据，不能触发订单工具。"""
+        if "订单" not in message or not self._contains_any(message, ["查", "查询", "看", "看看", "帮我"]):
+            return False
+        login_user = (conversation_context or {}).get("login_user_context") or {}
+        session_memory = (conversation_context or {}).get("session_memory") or {}
+        display_name = self._normalize_identity_name(login_user.get("display_name"))
+        explicit_names = [self._normalize_identity_name(name) for name in re.findall(r"([\u4e00-\u9fa5A-Za-z][\u4e00-\u9fa5A-Za-z·]{1,11})的订单", message)]
+        current_claim = self._extract_self_claimed_name_from_message(message)
+        if current_claim:
+            explicit_names.append(self._normalize_identity_name(current_claim))
+        return any(name and name != display_name for name in explicit_names)
+
+    @staticmethod
+    def _normalize_identity_name(value: Any) -> str:
+        """归一化姓名用于安全比较。"""
+        return re.sub(r"\s+", "", str(value or "").strip()).lower()
+
+    @staticmethod
+    def _extract_self_claimed_name_from_message(message: str) -> str | None:
+        """从本轮消息提取自称姓名，避免本轮自称直接触发查单。"""
+        for pattern in [
+            r"(?:我叫|我是|本人叫|我的名字叫)\s*([\u4e00-\u9fa5A-Za-z][\u4e00-\u9fa5A-Za-z·]{1,11})",
+            r"(?:以后|之后)?(?:请)?(?:叫我|称呼我为|喊我)\s*([\u4e00-\u9fa5A-Za-z][\u4e00-\u9fa5A-Za-z·]{1,11})",
+        ]:
+            match = re.search(pattern, message)
+            if match:
+                return match.group(1).strip(" ，,。！？!；;：:")
+        return None
 
     def _is_context_ticket_message(self, message: str, conversation_context: dict[str, Any]) -> bool:
         """识别省略工单号的工单查询或催办。"""

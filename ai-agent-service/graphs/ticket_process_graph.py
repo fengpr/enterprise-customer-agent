@@ -7,6 +7,8 @@ from langchain_core.runnables import Runnable
 from langgraph.graph import END, StateGraph
 
 from agents.action_request import ACTION_SLOT_RULES
+from agents.intent_normalizer import is_delivery_not_received_message
+from agents.order_context import has_fuzzy_order_reference, resolve_order_context
 from rag.knowledge_taxonomy import infer_business_scope
 from schemas.intent_schema import Citation, IntentResult
 
@@ -47,6 +49,7 @@ def build_ticket_process_graph(
     prepare_action: Callable[[TicketProcessState], TicketProcessState],
     compose_answer: Callable[[TicketProcessState], str],
     log_tool_call: Callable[[str, dict[str, Any], dict[str, Any]], None],
+    append_ticket_information: Callable[[str, dict[str, Any], str | None], dict[str, Any]] | None = None,
 ):
     """构建客服处理 LangGraph，将 PRD 主流程显式编排为可追踪节点。"""
     graph = StateGraph(TicketProcessState)
@@ -68,12 +71,17 @@ def build_ticket_process_graph(
     def query_order_node(state: TicketProcessState) -> TicketProcessState:
         """根据订单号或客户 ID 调用业务系统，查询结果进入后续回复依据。"""
         analysis = state["analysis"]
-        selected_order_no = state.get("selected_order_no") or _context_value(state, "last_order")
+        selected_order_no = state.get("selected_order_no")
+        context_resolution = resolve_order_context(state.get("conversation_context"), state["message"])
+        if not selected_order_no and context_resolution.get("status") == "usable":
+            # 只有 5 分钟内明确确认过的模糊订单上下文才可直接用于查单。
+            selected_order_no = context_resolution.get("order_no")
         should_use_selected_order = bool(selected_order_no and analysis.order_related and analysis.user_goal in {"status_query", "action_request"})
         ticket_result = _query_or_urge_ticket_if_needed(state, list_customer_tickets, query_ticket_status, urge_ticket, log_tool_call)
         if ticket_result is not None:
             return {"tool_results": ticket_result}
         should_list_orders_for_slots = analysis.user_goal == "action_request" and analysis.next_action == "collect_slots" and "order_no" in analysis.missing_slots
+        unresolved_fuzzy_order = has_fuzzy_order_reference(state["message"]) and not selected_order_no and context_resolution.get("status") != "usable"
         if not analysis.need_order_query and not should_use_selected_order:
             if should_list_orders_for_slots and state.get("customer_id") is not None:
                 # 动作申请缺订单时查询客户订单列表，追问时给出可选订单，减少客户重复输入成本。
@@ -101,7 +109,7 @@ def build_ticket_process_graph(
                 tool_results.append(logistics_result)
                 log_tool_call("query_order_logistics", {"order_no": order_no}, logistics_result)
 
-        if not order_nos and state.get("customer_id") is not None:
+        if not order_nos and state.get("customer_id") is not None and not unresolved_fuzzy_order:
             # 没有订单号但有客户上下文时，走客户订单列表接口支持“查询我的订单”。
             customer_id = state.get("customer_id")
             result = query_customer_orders(customer_id, state.get("auth_token"))
@@ -175,6 +183,34 @@ def build_ticket_process_graph(
                 # 信息未补齐时允许自动追问，但禁止创建工单。
                 analysis.need_human = False
                 analysis.need_ticket = False
+                candidate_order = _single_customer_order(state)
+                if "order_no" in analysis.missing_slots and candidate_order:
+                    # 订单列表只有一笔时也不能靠自然语言暗示后直接使用，必须把候选订单写回 pending 等待“是/否”。
+                    candidate_order_no = str(candidate_order.get("orderNo") or "").strip()
+                    analysis.action_slots = {
+                        **(analysis.action_slots or {}),
+                        "candidate_order_no": candidate_order_no,
+                    }
+                    analysis.missing_slots = ["order_confirmation"]
+                    pending = dict(state.get("pending_action_request") or {})
+                    pending_slots = dict(pending.get("action_slots") or {})
+                    pending_slots["candidate_order_no"] = candidate_order_no
+                    pending["action_slots"] = pending_slots
+                    pending["collected_slots"] = dict(pending_slots)
+                    pending["missing_slots"] = ["order_confirmation"]
+                    pending["status"] = "waiting_for_user_input"
+                    pending["next_action"] = "collect_slots"
+                    pending["candidate_order_summary"] = {
+                        "order_no": candidate_order_no,
+                        "product_name": candidate_order.get("productName"),
+                    }
+                    return {
+                        "analysis": analysis,
+                        "need_human": False,
+                        "auto_send": True,
+                        "risk_reasons": risk_reasons,
+                        "pending_action_request": pending,
+                    }
                 return {
                     "analysis": analysis,
                     "need_human": False,
@@ -183,16 +219,23 @@ def build_ticket_process_graph(
                 }
             if _action_requires_order(analysis) and not _has_success_order_detail(state):
                 # 订单归属或订单号未通过 Java 校验时不能建单，避免把他人订单写进工单。
-                analysis.need_human = False
+                # 订单号已经存在但 Java 校验失败时，不能谎报为“缺少订单号”并反复追问。
+                # 保留已收集槽位、暂停动作并转人工核实；只有确实没有订单号时才继续收集。
+                known_order_no = (
+                    (analysis.action_slots or {}).get("order_no")
+                    or (analysis.order_no[0] if analysis.order_no else None)
+                    or state.get("selected_order_no")
+                )
+                analysis.need_human = bool(known_order_no)
                 analysis.need_ticket = False
-                analysis.next_action = "collect_slots"
-                analysis.missing_slots = ["order_no"]
+                analysis.next_action = "transfer_human" if known_order_no else "collect_slots"
+                analysis.missing_slots = [] if known_order_no else ["order_no"]
                 pending = state.get("pending_action_request") or {}
                 if pending:
                     pending = dict(pending)
-                    pending["status"] = "collecting"
-                    pending["next_action"] = "collect_slots"
-                    pending["missing_slots"] = ["order_no"]
+                    pending["status"] = "blocked" if known_order_no else "waiting_for_user_input"
+                    pending["next_action"] = analysis.next_action
+                    pending["missing_slots"] = list(analysis.missing_slots)
                 if "order_validation_failed" not in risk_reasons:
                     risk_reasons.append("order_validation_failed")
                 return {
@@ -202,6 +245,17 @@ def build_ticket_process_graph(
                     "risk_reasons": risk_reasons,
                     "pending_action_request": pending or state.get("pending_action_request"),
                 }
+
+        if is_delivery_not_received_message(state["message"]) and _has_signed_logistics_evidence(state):
+            # 系统签收事实与客户“未收到”反馈冲突时必须进入异常核实，不能继续把签收结果当作正常答复重复播报。
+            analysis.intent = "logistics"
+            analysis.user_goal = "dispute"
+            analysis.need_human = True
+            analysis.need_ticket = True
+            analysis.priority = "high"
+            analysis.order_related = True
+            if "delivery_status_conflict" not in risk_reasons:
+                risk_reasons.append("delivery_status_conflict")
 
         has_tool_evidence = _has_order_tool_evidence(state)
         return_goods_policy_consult = analysis.user_goal == "policy_consult" and analysis.action_type == "return_goods"
@@ -258,15 +312,41 @@ def build_ticket_process_graph(
 
         duplicate = _find_duplicate_ticket(state, list_customer_tickets)
         if duplicate:
-            # 同一客户、同一动作、同一订单已有未完成工单时直接复用，避免重复建单。
+            # 同一动作已有在途工单时复用工单；本轮新信息必须审计追加，不能只复用工单号后谎称已登记。
             tool_results = list(state.get("tool_results", []))
-            duplicate_result = {"status": "success", "data": duplicate, "deduplicated": True}
+            supplement_result: dict[str, Any] | None = None
+            current_ticket = duplicate
+            if append_ticket_information is not None and analysis.user_goal == "action_request":
+                supplement_payload = _build_ticket_supplement_payload(state)
+                supplement_result = append_ticket_information(
+                    str(duplicate.get("ticketNo") or ""),
+                    supplement_payload,
+                    state.get("auth_token"),
+                )
+                log_tool_call(
+                    "append_ticket_information",
+                    {**supplement_payload, "ticket_no": duplicate.get("ticketNo")},
+                    supplement_result,
+                )
+                tool_results.append({"tool_name": "append_ticket_information", **supplement_result})
+                supplement_data = supplement_result.get("data") if supplement_result.get("status") == "success" else None
+                if isinstance(supplement_data, dict) and isinstance(supplement_data.get("ticket"), dict):
+                    current_ticket = supplement_data["ticket"]
+            duplicate_result = {
+                "status": "success",
+                "data": current_ticket,
+                "deduplicated": True,
+                "supplement_result": supplement_result,
+            }
             tool_results.append({"tool_name": "find_duplicate_ticket", **duplicate_result})
             pending = state.get("pending_action_request") or {}
             if pending:
                 pending = dict(pending)
-                pending["status"] = "completed"
-                pending["completed"] = True
+                supplement_failed = supplement_result is not None and supplement_result.get("status") != "success"
+                pending["status"] = "blocked" if supplement_failed else "completed"
+                pending["flow_state"] = "BLOCKED" if supplement_failed else "COMPLETED"
+                pending["completed"] = not supplement_failed
+                pending["ticket_no"] = duplicate.get("ticketNo")
             return {"ticket_result": duplicate_result, "tool_results": tool_results, "pending_action_request": pending}
 
         payload = _build_ticket_payload(state)
@@ -294,6 +374,7 @@ def build_ticket_process_graph(
             if pending:
                 pending = dict(pending)
                 pending["status"] = "completed"
+                pending["flow_state"] = "COMPLETED"
                 pending["completed"] = True
                 pending["ticket_no"] = ticket_no
                 return {"ticket_result": result, "tool_results": tool_results, "pending_action_request": pending}
@@ -334,7 +415,7 @@ def _build_ticket_payload(state: TicketProcessState) -> dict[str, Any]:
     ticket_type = _resolve_ticket_type(analysis)
     content = _build_ticket_content(state)
 
-    return {
+    payload = {
         "title": title[:128],
         "ticketType": ticket_type,
         "priority": analysis.priority,
@@ -349,6 +430,39 @@ def _build_ticket_payload(state: TicketProcessState) -> dict[str, Any]:
         "handlerId": None,
         "source": "AI_AGENT",
     }
+    if analysis.action_type == "return_goods":
+        # 退货履约信息作为结构化工单字段保存；上门时间只是客户偏好，不能表述为已经预约成功。
+        payload["returnMethod"] = action_slots.get("return_method")
+        payload["pickupTimeWindow"] = action_slots.get("pickup_time_window")
+        payload["pickupStatus"] = action_slots.get("pickup_status") or (
+            "PREFERENCE_RECORDED" if action_slots.get("return_method") == "pickup" else "NOT_REQUIRED"
+        )
+    pending_id = str((state.get("pending_action_request") or {}).get("pending_id") or "").strip()
+    if pending_id:
+        # 同一 pending 动作在 Worker 重试或客户端重连时复用幂等键，避免重复创建售后工单。
+        payload["idempotency_key"] = f"agent-ticket:{pending_id}"
+    return payload
+
+
+def _build_ticket_supplement_payload(state: TicketProcessState) -> dict[str, Any]:
+    """组装既有工单的补充信息，并使用 pending ID 保证 Worker 重试不会重复追加。"""
+    analysis = state["analysis"]
+    slots = analysis.action_slots or {}
+    pending_id = str((state.get("pending_action_request") or {}).get("pending_id") or "").strip()
+    message = str(state.get("message") or "").strip()
+    # “是/确认”等确认词只负责推进状态，不是对工单有价值的客户补充说明。
+    supplement_content = None if message in {"是", "是的", "确认", "好的", "可以", "没错"} else message
+    payload = {
+        "content": supplement_content,
+        "afterSaleReason": slots.get("after_sale_reason"),
+        "returnMethod": slots.get("return_method"),
+        "pickupTimeWindow": slots.get("pickup_time_window"),
+        "idempotency_key": f"agent-ticket-supplement:{pending_id}",
+    }
+    if not pending_id:
+        # 动作状态正常都会带 pending ID；缺失时拒绝可重试写入，避免生成不稳定幂等键。
+        payload["idempotency_key"] = ""
+    return payload
 
 
 def _has_order_tool_evidence(state: TicketProcessState) -> bool:
@@ -374,6 +488,7 @@ def _query_or_urge_ticket_if_needed(
     selected_ticket_action = has_selected_ticket and not _is_logistics_query(message, "") and not _is_how_to_query(message) and any(
         word in message for word in ["催", "加急", "进度", "处理", "状态", "太慢", "怎么还没"]
     )
+
     if not (_is_ticket_status_query(message) or _is_ticket_urge_query(message) or selected_ticket_action):
         return None
 
@@ -404,6 +519,17 @@ def _query_or_urge_ticket_if_needed(
     log_tool_call("query_ticket_status", {"ticket_no": ticket_no}, result)
     tool_results.append({"tool_name": "query_ticket_status", **result})
     return tool_results
+
+
+def _single_customer_order(state: TicketProcessState) -> dict[str, Any] | None:
+    """仅在 Java 返回唯一客户订单时生成候选项，多订单场景仍要求客户主动选择。"""
+    for item in state.get("tool_results", []):
+        if item.get("query_type") != "customer_orders" or item.get("status") != "success":
+            continue
+        orders = item.get("data") or []
+        if len(orders) == 1 and isinstance(orders[0], dict) and orders[0].get("orderNo"):
+            return orders[0]
+    return None
 
 
 def _extract_ticket_no(message: str) -> str | None:
@@ -478,6 +604,9 @@ def _build_ticket_content(state: TicketProcessState) -> str:
         lines.append("已收集信息：")
         for key, value in slots.items():
             lines.append(f"- {key}: {value}")
+    if "delivery_status_conflict" in set(state.get("risk_reasons", [])):
+        # 明确记录系统状态与客户反馈的冲突，供物流坐席按异常签收流程核实。
+        lines.append("异常类型：物流显示签收但客户反馈未收到")
     order = _first_success_order(state)
     if order:
         lines.append(
@@ -502,10 +631,12 @@ def _find_duplicate_ticket(
 ) -> dict[str, Any] | None:
     """建单前查找同客户、同动作、同订单的未完成工单，避免重复提交。"""
     analysis = state["analysis"]
-    if analysis.user_goal != "action_request":
+    delivery_exception = "delivery_status_conflict" in set(state.get("risk_reasons", []))
+    if analysis.user_goal != "action_request" and not delivery_exception:
         return None
     slots = analysis.action_slots or {}
-    order_no = slots.get("order_no")
+    order = _first_success_order(state) or {}
+    order_no = slots.get("order_no") or (analysis.order_no[0] if analysis.order_no else None) or order.get("orderNo")
     if not order_no:
         return None
     result = list_customer_tickets(state.get("auth_token"))
@@ -517,7 +648,11 @@ def _find_duplicate_ticket(
             ticket.get("ticketType") == ticket_type
             and str(ticket.get("orderNo") or "").lower() == str(order_no).lower()
             and ticket.get("status") in active_statuses
-            and _ticket_has_same_action(ticket, str(analysis.action_type or ""))
+            and (
+                _ticket_has_same_action(ticket, str(analysis.action_type or ""))
+                if not delivery_exception
+                else "异常类型：物流显示签收但客户反馈未收到" in str(ticket.get("content") or "")
+            )
         ):
             return ticket
     return None
@@ -529,6 +664,20 @@ def _ticket_has_same_action(ticket: dict[str, Any], action_type: str) -> bool:
         return False
     content = f"{ticket.get('content') or ''}\n{ticket.get('aiSummary') or ''}"
     return f"业务动作：{action_type}" in content
+
+
+def _has_signed_logistics_evidence(state: TicketProcessState) -> bool:
+    """确认 Java 物流接口确实返回已签收状态，避免仅凭客户短句推断配送冲突。"""
+    signed_statuses = {"SIGNED", "DELIVERED", "RECEIVED"}
+    for item in state.get("tool_results", []):
+        if item.get("query_type") != "order_logistics" or item.get("status") != "success":
+            continue
+        logistics = item.get("data") or {}
+        if str(logistics.get("logisticsStatus") or "").upper() in signed_statuses:
+            return True
+        if any(str(trace.get("status") or "").upper() in signed_statuses for trace in logistics.get("traces") or []):
+            return True
+    return False
 
 
 def should_auto_assign_ticket(state: TicketProcessState) -> bool:

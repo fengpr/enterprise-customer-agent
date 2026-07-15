@@ -3,6 +3,7 @@ package com.example.business.controller;
 import com.example.business.dto.LogisticsView;
 import com.example.business.dto.OrderView;
 import com.example.business.service.AuthService;
+import com.example.business.service.AgentExecutionCredentialService;
 import com.example.business.service.LogisticsService;
 import com.example.business.service.OrderService;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -24,11 +25,14 @@ public class OrderController {
     private final OrderService orderService;
     private final LogisticsService logisticsService;
     private final AuthService authService;
+    private final AgentExecutionCredentialService executionCredentialService;
 
-    public OrderController(OrderService orderService, LogisticsService logisticsService, AuthService authService) {
+    public OrderController(OrderService orderService, LogisticsService logisticsService, AuthService authService,
+                           AgentExecutionCredentialService executionCredentialService) {
         this.orderService = orderService;
         this.logisticsService = logisticsService;
         this.authService = authService;
+        this.executionCredentialService = executionCredentialService;
     }
 
     /**
@@ -41,10 +45,13 @@ public class OrderController {
     @GetMapping
     public List<OrderView> listByCustomer(
             @RequestParam(value = "customerId", required = false) Long customerId,
-            @RequestHeader("Authorization") String authorization
+            @RequestHeader(value = "Authorization", required = false) String authorization,
+            @RequestHeader(value = "X-Agent-Execution-Credential", required = false) String executionCredential,
+            @RequestHeader(value = "X-Agent-Customer-ID", required = false) Long agentCustomerId,
+            @RequestHeader(value = "X-Request-ID", required = false) String requestId
     ) {
         // 客户订单属于敏感业务数据，必须以登录 Token 中的客户 ID 为准。
-        Long currentCustomerId = authService.currentCustomerId(authorization);
+        Long currentCustomerId = resolveCustomerId(authorization, executionCredential, agentCustomerId, requestId);
         return orderService.findViewsByCustomerId(currentCustomerId);
     }
 
@@ -58,9 +65,12 @@ public class OrderController {
     @GetMapping("/{orderNo}")
     public Optional<OrderView> detail(
             @PathVariable("orderNo") String orderNo,
-            @RequestHeader("Authorization") String authorization
+            @RequestHeader(value = "Authorization", required = false) String authorization,
+            @RequestHeader(value = "X-Agent-Execution-Credential", required = false) String executionCredential,
+            @RequestHeader(value = "X-Agent-Customer-ID", required = false) Long agentCustomerId,
+            @RequestHeader(value = "X-Request-ID", required = false) String requestId
     ) {
-        Long currentCustomerId = authService.currentCustomerId(authorization);
+        Long currentCustomerId = resolveCustomerId(authorization, executionCredential, agentCustomerId, requestId);
         return orderService.findViewByOrderNo(orderNo)
                 .filter(order -> order.customerId().equals(currentCustomerId));
     }
@@ -75,12 +85,24 @@ public class OrderController {
     @GetMapping("/{orderNo}/logistics")
     public Optional<LogisticsView> logistics(
             @PathVariable("orderNo") String orderNo,
-            @RequestHeader("Authorization") String authorization
+            @RequestHeader(value = "Authorization", required = false) String authorization,
+            @RequestHeader(value = "X-Agent-Execution-Credential", required = false) String executionCredential,
+            @RequestHeader(value = "X-Agent-Customer-ID", required = false) Long agentCustomerId,
+            @RequestHeader(value = "X-Request-ID", required = false) String requestId
     ) {
-        Long currentCustomerId = authService.currentCustomerId(authorization);
+        Long currentCustomerId = resolveCustomerId(authorization, executionCredential, agentCustomerId, requestId);
         // 物流查询必须先校验订单归属，避免通过运单接口越权查看他人路线。
         return orderService.findViewByOrderNo(orderNo)
                 .filter(order -> order.customerId().equals(currentCustomerId))
                 .flatMap(order -> logisticsService.findByOrderNo(order.orderNo()));
+    }
+
+    /** 登录 Token 与 Worker 短期凭证二选一完成身份校验。 */
+    private Long resolveCustomerId(String authorization, String executionCredential,
+                                   Long agentCustomerId, String requestId) {
+        if (authorization != null && !authorization.isBlank()) {
+            return authService.currentCustomerId(authorization);
+        }
+        return executionCredentialService.requireCustomerId(executionCredential, agentCustomerId, requestId);
     }
 }

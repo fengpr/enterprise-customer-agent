@@ -187,6 +187,18 @@ def is_logistics_message(message: str) -> bool:
     )
 
 
+def is_delivery_not_received_message(message: str) -> bool:
+    """识别实体包裹未收到反馈，排除退款到账和电子发票等非物流语境。"""
+    if contains_any(message, ["退款", "款项", "到账", "银行卡", "余额"]):
+        return False
+    if "发票" in message and not contains_any(message, ["纸质", "邮寄", "快递"]):
+        return False
+    return contains_any(
+        message,
+        ["没收到", "没有收到", "未收到", "还没收到", "还没有收到", "包裹没到", "快递没到", "货没到"],
+    )
+
+
 def is_order_query_message(message: str) -> bool:
     """识别泛订单查询表达。"""
     return contains_any(message, ["查询我的订单", "查我的订单", "我的订单", "查询订单", "查订单", "订单列表", "订单记录", "买过什么", "购买记录"])

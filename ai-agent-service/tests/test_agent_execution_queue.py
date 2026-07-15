@@ -12,6 +12,7 @@ class FakeRedis:
     def __init__(self):
         self.values, self.streams, self.pending, self.acks = {}, {}, {}, []
         self.counter = 0
+        self.last_block = None
 
     def ping(self): return True
     def xgroup_create(self, *args, **kwargs): return True
@@ -27,6 +28,7 @@ class FakeRedis:
         self.counter += 1; stream_id = f"{self.counter}-0"
         self.streams.setdefault(stream, []).append((stream_id, fields)); return stream_id
     def xreadgroup(self, group, consumer, streams, count=1, block=0):
+        self.last_block = block
         stream = next(iter(streams)); messages = self.streams.get(stream, [])[:count]
         if not messages: return []
         self.streams[stream] = self.streams[stream][count:]
@@ -49,6 +51,14 @@ def _queue():
 def _job(key="key-1"):
     """构造不含客户 Token 的安全任务。"""
     return AgentExecutionJob(request_id="request-1", customer_id=8, message="查询订单", idempotency_key=key, execution_credential="v1.short.signature")
+
+
+def test_job_restores_short_lived_execution_identity_without_customer_token():
+    """Worker 还原任务时应使用短期内部身份，不能依赖或恢复客户原始 Token。"""
+    request = _job().to_request()
+
+    assert request.auth_token == "agent-execution:8:request-1:v1.short.signature"
+    assert "Bearer " not in request.auth_token
 
 
 def test_enqueue_claim_and_ack_success(monkeypatch):
@@ -90,13 +100,17 @@ def test_max_attempt_goes_to_safe_dead_letter(monkeypatch):
 def test_idempotency_does_not_enqueue_twice_or_store_authorization(monkeypatch):
     """相同客户幂等键复用 request_id，Stream 载荷不含 Authorization。"""
     monkeypatch.setenv("AGENT_EXECUTION_QUEUE_ENABLED", "true")
-    queue = _queue(); first = queue.enqueue(_job("same"), "owner")
+    safe_job = _job("same").model_copy(update={"login_user_context": {"display_name": "张三", "role": "customer", "verified": True, "source": "java_auth"}})
+    queue = _queue(); first = queue.enqueue(safe_job, "owner")
     second = queue.enqueue(AgentExecutionJob(request_id="request-2", customer_id=8, message="重复", idempotency_key="same"), "owner")
     _, fields = queue._redis.streams[queue.stream_key][0]
+    job_payload = json.loads(fields["job"])
     assert first == second == "request-1"
     assert len(queue._redis.streams[queue.stream_key]) == 1
     assert "Authorization" not in json.dumps(fields)
     assert "auth_token" not in fields["job"]
+    assert job_payload["login_user_context"]["display_name"] == "张三"
+    assert "customer_id" not in job_payload["login_user_context"]
 
 
 def test_worker_heartbeat_replaces_unreliable_process_detection(monkeypatch):
@@ -107,3 +121,28 @@ def test_worker_heartbeat_replaces_unreliable_process_detection(monkeypatch):
     assert queue.has_active_worker() is False
     queue.heartbeat()
     assert queue.has_active_worker() is True
+
+
+def test_queue_socket_timeout_exceeds_stream_block(monkeypatch):
+    """Redis 读超时必须大于 Stream 阻塞周期，避免空队列等待导致 Worker 退出。"""
+    import redis
+
+    captured = {}
+    fake = FakeRedis()
+
+    def from_url(url, **kwargs):
+        captured.update(kwargs)
+        return fake
+
+    monkeypatch.setenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+    monkeypatch.setenv("AGENT_EXECUTION_QUEUE_ENABLED", "true")
+    monkeypatch.setenv("AGENT_QUEUE_BLOCK_MS", "3000")
+    monkeypatch.setenv("AGENT_REDIS_SOCKET_TIMEOUT_SECONDS", "1")
+    monkeypatch.setattr(redis.Redis, "from_url", from_url)
+
+    queue = AgentExecutionQueue(consumer_name="timeout-test-worker")
+
+    assert queue.redis_socket_timeout_seconds >= 4
+    assert captured["socket_timeout"] == queue.redis_socket_timeout_seconds
+    queue.claim()
+    assert fake.last_block == 3000
