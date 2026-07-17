@@ -2,7 +2,7 @@
 
 CREATE TABLE IF NOT EXISTS chat_session (
     id BIGSERIAL PRIMARY KEY, session_no VARCHAR(64) NOT NULL UNIQUE, customer_id BIGINT,
-    status VARCHAR(32) NOT NULL, title VARCHAR(128), intent VARCHAR(64), emotion VARCHAR(32), priority VARCHAR(32), ai_summary TEXT,
+    status VARCHAR(32) NOT NULL, handoff_status VARCHAR(16) NOT NULL DEFAULT 'NONE', title VARCHAR(128), intent VARCHAR(64), emotion VARCHAR(32), priority VARCHAR(32), ai_summary TEXT,
     human_requested_at TIMESTAMPTZ, human_assigned_staff_id VARCHAR(64), human_assigned_staff_name VARCHAR(128),
     human_accepted_at TIMESTAMPTZ, human_closed_at TIMESTAMPTZ, handoff_reason TEXT,
     created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL, deleted_at TIMESTAMPTZ
@@ -16,6 +16,12 @@ CREATE TABLE IF NOT EXISTS chat_message (
     created_at TIMESTAMPTZ NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_chat_message_session_created ON chat_message(session_id, created_at, id);
+
+CREATE TABLE IF NOT EXISTS handoff_ticket_link (
+    session_no VARCHAR(64) PRIMARY KEY,
+    ticket_no VARCHAR(64) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS agent_call_log (
     id BIGSERIAL PRIMARY KEY, tool_name VARCHAR(128) NOT NULL, input_data JSONB NOT NULL, output_data JSONB NOT NULL,

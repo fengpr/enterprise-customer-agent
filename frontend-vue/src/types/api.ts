@@ -32,6 +32,7 @@ export interface ChatSession {
   session_id: string
   customer_id: number
   status: string
+  handoff_status: 'NONE' | 'PENDING' | 'ACTIVE' | 'CLOSED' | string
   title: string | null
   intent: string | null
   emotion: string | null
@@ -104,6 +105,7 @@ export interface ChatMessage {
 export interface ChatSessionDetail {
   session: ChatSession | null
   messages: ChatMessage[]
+  latest_message_id: number
 }
 
 export interface AgentReply {
@@ -254,7 +256,9 @@ export interface SystemMonitorSnapshot {
 export interface StaffHandoffSession {
   session_id: string
   customer_id: number
-  status: 'HUMAN_PENDING' | 'HUMAN_ACTIVE' | 'HUMAN_CLOSED' | 'AI_ONLY' | string
+  status: string
+  session_status: string
+  handoff_status: 'PENDING' | 'ACTIVE' | 'CLOSED' | string
   title?: string | null
   intent?: string | null
   emotion?: string | null
@@ -265,12 +269,17 @@ export interface StaffHandoffSession {
   human_assigned_staff_id?: string | null
   human_assigned_staff_name?: string | null
   human_accepted_at?: string | null
+  human_closed_at?: string | null
+  waiting_seconds?: number
+  linked_ticket_no?: string | null
+  latest_message_id?: number
   updated_at?: string | null
 }
 
 export interface StaffHandoffDetail {
   session: StaffHandoffSession
   messages: ChatMessage[]
+  latest_message_id: number
 }
 
 export interface StaffMemberStatus {

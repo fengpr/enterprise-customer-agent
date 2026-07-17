@@ -87,8 +87,8 @@ export const staffHandoffApi = {
   list(limit = 50) {
     return agentHttp.get<StaffHandoffSession[]>('/staff/handoff/sessions', { params: { limit } })
   },
-  detail(sessionId: string) {
-    return agentHttp.get<StaffHandoffDetail>(`/staff/handoff/sessions/${sessionId}`)
+  detail(sessionId: string, afterMessageId = 0) {
+    return agentHttp.get<StaffHandoffDetail>(`/staff/handoff/sessions/${sessionId}`, { params: { after_message_id: afterMessageId } })
   },
   accept(sessionId: string) {
     return agentHttp.post<{ status: string; session: StaffHandoffSession }>(`/staff/handoff/sessions/${sessionId}/accept`)
@@ -96,10 +96,18 @@ export const staffHandoffApi = {
   reply(sessionId: string, message: string) {
     return agentHttp.post<{ status: string; session_id: string }>(`/staff/handoff/sessions/${sessionId}/reply`, { message })
   },
-  close(sessionId: string, message: string, status: 'HUMAN_CLOSED' | 'AI_ONLY' = 'HUMAN_CLOSED') {
+  close(sessionId: string, message: string) {
     return agentHttp.post<{ status: string; session: StaffHandoffSession }>(`/staff/handoff/sessions/${sessionId}/close`, {
-      message,
-      status
+      message
     })
+  },
+  heartbeat() {
+    return agentHttp.post<{ online: boolean; ttl_seconds: number }>('/staff/presence/heartbeat')
+  },
+  leave() {
+    return agentHttp.delete<{ status: string }>('/staff/presence')
+  },
+  createTicket(sessionId: string) {
+    return agentHttp.post<{ status: string; ticket: Ticket }>(`/staff/handoff/sessions/${sessionId}/ticket`)
   }
 }

@@ -13,7 +13,7 @@ const customerViewKey = computed(() => `${auth.user?.customer_id ?? 'guest'}:${r
 
 <template>
   <router-view v-slot="{ Component }">
-    <KeepAlive :include="['CustomerHome', 'CustomerDashboard', 'CustomerOrders', 'CustomerTickets']">
+    <KeepAlive :include="['CustomerHome', 'CustomerDashboard', 'CustomerOrders', 'CustomerTickets', 'CustomerHelp']">
       <component :is="Component" :key="customerViewKey" />
     </KeepAlive>
   </router-view>

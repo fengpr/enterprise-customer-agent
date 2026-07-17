@@ -3,20 +3,23 @@ defineOptions({ name: 'CustomerTickets' })
 
 import { ChatDotRound, CircleCheckFilled, Clock, Document, EditPen, Headset, Refresh, Search, Tickets, Van } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { storeToRefs } from 'pinia'
 import { computed, onActivated, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import { customerApi } from '@/api/customer'
 import CustomerSidebar from '@/components/customer/CustomerSidebar.vue'
-import type { ChatSession, Ticket } from '@/types/api'
+import { useCustomerSessionStore } from '@/stores/customerSessions'
+import type { Ticket } from '@/types/api'
 
 type StatusGroup = 'ALL' | 'PROCESSING' | 'SUPPLEMENT' | 'ASSIGN' | 'COMPLETED' | 'CLOSED'
 type TicketTone = 'processing' | 'supplement' | 'assign' | 'completed' | 'closed'
 
 const router = useRouter()
 const route = useRoute()
+const sessionStore = useCustomerSessionStore()
+const { sessions } = storeToRefs(sessionStore)
 const tickets = ref<Ticket[]>([])
-const sessions = ref<ChatSession[]>([])
 const selectedTicketNo = ref<string | null>(null)
 const selectedDetail = ref<Ticket | null>(null)
 const loading = ref(false)
@@ -151,16 +154,15 @@ async function selectTicket(ticketNo: string, force = false) {
 }
 
 async function loadSessions() {
-  try { sessions.value = (await customerApi.sessions(50)).data } catch { /* 侧栏保留上次成功数据。 */ }
+  try { await sessionStore.refresh(true) } catch { /* 侧栏保留上次成功数据。 */ }
 }
 
 async function loadPage(showFeedback = false) {
   if (loading.value) return
   loading.value = true
   try {
-    const [ticketResult, sessionResult] = await Promise.all([customerApi.tickets(), customerApi.sessions(50)])
+    const [ticketResult] = await Promise.all([customerApi.tickets(), sessionStore.refresh(true)])
     tickets.value = ticketResult.data
-    sessions.value = sessionResult.data
     // 首页携带工单号时仅在当前客户的工单集合中定位，避免信任外部 URL 参数。
     const targetTicketNo = typeof route.query.ticketNo === 'string' ? route.query.ticketNo : selectedTicketNo.value
     const target = tickets.value.find((item) => item.ticketNo === targetTicketNo) || tickets.value[0]
@@ -206,9 +208,9 @@ onActivated(() => { if (!tickets.value.length) void loadPage() })
     <CustomerSidebar :sessions="sessions" :selected-session-id="null" @contact-service="openService()" @unavailable="() => ElMessage.info('该功能页面暂未开放')" @select-session="openSession" @sessions-changed="loadSessions" />
 
     <main class="customer-tickets-main">
-      <header class="tickets-header">
+      <header class="tickets-header customer-page-header">
         <div><h1>我的工单</h1><p>查看工单状态、处理进度、沟通记录与服务详情</p></div>
-        <div class="tickets-header-actions"><el-button :icon="Refresh" :loading="loading" @click="loadPage(true)">刷新工单</el-button><el-button :icon="EditPen" @click="createTicket">创建工单</el-button><el-button type="primary" :icon="ChatDotRound" @click="openService()">新建咨询</el-button></div>
+        <div class="tickets-header-actions customer-page-header-actions"><el-button :icon="Refresh" :loading="loading" @click="loadPage(true)">刷新工单</el-button><el-button :icon="EditPen" @click="createTicket">创建工单</el-button><el-button type="primary" :icon="ChatDotRound" @click="openService()">新建咨询</el-button></div>
       </header>
 
       <section class="ticket-metric-grid">

@@ -5,6 +5,7 @@ import CustomerHome from '@/views/customer/CustomerHome.vue'
 import CustomerDashboard from '@/views/customer/CustomerDashboard.vue'
 import CustomerOrders from '@/views/customer/CustomerOrders.vue'
 import CustomerTickets from '@/views/customer/CustomerTickets.vue'
+import CustomerHelp from '@/views/customer/CustomerHelp.vue'
 import CustomerLogin from '@/views/customer/CustomerLogin.vue'
 import DispatcherHome from '@/views/dispatcher/DispatcherHome.vue'
 import DispatcherLogin from '@/views/dispatcher/DispatcherLogin.vue'
@@ -23,6 +24,7 @@ const router = createRouter({
     { path: '/customer', component: CustomerDashboard, meta: { role: 'customer' } },
     { path: '/customer/orders', component: CustomerOrders, meta: { role: 'customer' } },
     { path: '/customer/tickets', component: CustomerTickets, meta: { role: 'customer' } },
+    { path: '/customer/help', component: CustomerHelp, meta: { role: 'customer' } },
     // 在线客服保留原有工作台，首页仅负责提供客户自助入口和信息概览。
     { path: '/customer/service', component: CustomerHome, meta: { role: 'customer' } },
     { path: '/staff/login', component: StaffLogin, meta: { guest: true } },

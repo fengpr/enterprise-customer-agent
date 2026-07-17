@@ -3,18 +3,21 @@ defineOptions({ name: 'CustomerDashboard' })
 
 import { Bell, ChatDotRound, Document, Headset, HelpFilled, House, Refresh, Tickets, Van } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
+import { storeToRefs } from 'pinia'
 import { computed, onActivated, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
 import CustomerSidebar from '@/components/customer/CustomerSidebar.vue'
 import { customerApi } from '@/api/customer'
 import { useAuthStore } from '@/stores/auth'
-import type { ChatSession, CustomerOrder, Ticket } from '@/types/api'
+import { useCustomerSessionStore } from '@/stores/customerSessions'
+import type { CustomerOrder, Ticket } from '@/types/api'
 
 const router = useRouter()
 const auth = useAuthStore()
+const sessionStore = useCustomerSessionStore()
+const { sessions } = storeToRefs(sessionStore)
 const refreshing = ref(false)
-const sessions = ref<ChatSession[]>([])
 const orders = ref<CustomerOrder[]>([])
 const tickets = ref<Ticket[]>([])
 const loaded = ref(false)
@@ -97,6 +100,7 @@ function handleEntry(key: string) {
   ElMessage.info('该功能页面暂未开放')
 }
 function contactService() { void router.push('/customer/service?new=1') }
+function openSession(sessionId: string) { void router.push({ path: '/customer/service', query: { sessionId } }) }
 function createTicket() { void router.push({ path: '/customer/service', query: { new: '1', message: '我想创建一个新的服务工单，请引导我补充必要信息。' } }) }
 function openOrder(order?: CustomerOrder) { void router.push({ path: '/customer/orders', query: order ? { orderNo: order.orderNo } : {} }) }
 function openTicket(ticket?: Ticket) { void router.push({ path: '/customer/tickets', query: ticket ? { ticketNo: ticket.ticketNo } : {} }) }
@@ -105,12 +109,12 @@ async function loadHomeData(showFeedback = false) {
   if (refreshing.value) return
   refreshing.value = true
   try {
-    const [orderResult, ticketResult, sessionResult] = await Promise.allSettled([customerApi.orders(), customerApi.tickets(), customerApi.sessions(50)])
+    const [orderResult, ticketResult, sessionResult] = await Promise.allSettled([customerApi.orders(), customerApi.tickets(), sessionStore.refresh(true)])
     let hasSuccess = false
     // 三类数据独立保留，单个接口短暂失败不应让首页其它真实信息消失。
     if (orderResult.status === 'fulfilled') { orders.value = orderResult.value.data; hasSuccess = true }
     if (ticketResult.status === 'fulfilled') { tickets.value = ticketResult.value.data; hasSuccess = true }
-    if (sessionResult.status === 'fulfilled') { sessions.value = sessionResult.value.data; hasSuccess = true }
+    if (sessionResult.status === 'fulfilled') hasSuccess = true
     if (hasSuccess) {
       loaded.value = true
       if (showFeedback) ElMessage.success('首页数据已刷新')
@@ -137,11 +141,11 @@ onActivated(() => { if (!loaded.value) void loadHomeData() })
 
 <template>
   <div class="prototype-home">
-    <CustomerSidebar :prototype-user="user" :sessions="sessions" @contact-service="contactService" @unavailable="unavailable" @sessions-changed="() => loadHomeData()" />
+    <CustomerSidebar :prototype-user="user" :sessions="sessions" @contact-service="contactService" @unavailable="unavailable" @select-session="openSession" @sessions-changed="() => sessionStore.refresh(true)" />
     <main class="prototype-main">
-      <header class="prototype-header">
+      <header class="prototype-header customer-page-header">
         <div><h1>客户自助服务首页</h1><p>欢迎回来，您可以在这里快速查看订单、工单、服务进度与常用入口</p></div>
-        <div class="prototype-header-actions"><el-button :icon="Refresh" :loading="refreshing" @click="refresh">刷新数据</el-button><el-button :icon="Document" @click="createTicket">新建工单</el-button><el-button type="primary" :icon="ChatDotRound" @click="contactService">新建咨询</el-button></div>
+        <div class="prototype-header-actions customer-page-header-actions"><el-button :icon="Refresh" :loading="refreshing" @click="refresh">刷新数据</el-button><el-button :icon="Document" @click="createTicket">新建工单</el-button><el-button type="primary" :icon="ChatDotRound" @click="contactService">新建咨询</el-button></div>
       </header>
       <div class="prototype-grid">
         <section class="prototype-center">

@@ -3,7 +3,7 @@ import { Connection, DocumentCopy, Headset, Link, Message, Position, Refresh, Se
 import { ElMessage } from 'element-plus'
 import DOMPurify from 'dompurify'
 import MarkdownIt from 'markdown-it'
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onActivated, ref, watch } from 'vue'
 import type { AgentReply, ChatMessage, ChatSession, CustomerOrder, RouteTarget, Ticket } from '@/types/api'
 
 const props = defineProps<{
@@ -21,6 +21,7 @@ const emit = defineEmits<{
   'update:modelValue': [value: string]
   'update:routeTarget': [value: RouteTarget]
   'continue-ai': []
+  'cancel-handoff': []
   submit: []
   quick: [action: string]
   regenerate: [message: string]
@@ -34,7 +35,9 @@ const inputPlaceholder = computed(() =>
     ? '请输入要补充给人工客服的信息...'
     : '请输入您的问题...'
 )
-const hasHumanSession = computed(() => ['HUMAN_PENDING', 'HUMAN_ACTIVE', 'HUMAN_CLOSED'].includes(String(props.session?.status || '')))
+const hasHumanSession = computed(() => ['PENDING', 'ACTIVE', 'CLOSED'].includes(String(props.session?.handoff_status || '')))
+const handoffStatusText = computed(() => ({ PENDING: '待接入', ACTIVE: '已接入', CLOSED: '已结束' }[String(props.session?.handoff_status)] || ''))
+const handoffStatusType = computed(() => props.session?.handoff_status === 'ACTIVE' ? 'success' : props.session?.handoff_status === 'CLOSED' ? 'info' : 'warning')
 const aiMessages = computed(() =>
   props.messages.filter((message) => {
     if (message.sender_type === 'ai') return true
@@ -45,6 +48,7 @@ const aiMessages = computed(() =>
 const humanMessages = computed(() =>
   props.messages.filter((message) => {
     if (message.sender_type === 'staff') return true
+    if (message.sender_type === 'system') return String(message.extra_data?.message_source || '').startsWith('handoff_')
     if (message.sender_type === 'customer') return message.extra_data?.route_target === 'human' || message.extra_data?.route_target === 'both'
     return false
   })
@@ -56,18 +60,6 @@ const visibleMessageEntries = computed(() =>
     timeDivider: shouldShowTimeDivider(message, list[index - 1]) ? formatTimeDivider(message) : ''
   }))
 )
-const humanStatusText = computed(() => {
-  if (!props.session) return ''
-  if (props.session.status === 'HUMAN_PENDING') return '待接入'
-  if (props.session.status === 'HUMAN_ACTIVE') return '已接入'
-  if (props.session.status === 'HUMAN_CLOSED') return '已结束'
-  return ''
-})
-const humanStatusType = computed(() => {
-  if (props.session?.status === 'HUMAN_ACTIVE') return 'success'
-  if (props.session?.status === 'HUMAN_CLOSED') return 'info'
-  return 'warning'
-})
 
 const markdown = new MarkdownIt({
   breaks: true,
@@ -249,10 +241,13 @@ async function scrollToBottom() {
   await nextTick()
   const target = chatWindowRef.value
   if (target) {
-    // 新消息到达时自动定位到最新回复，同时保留窗口本身的滚动能力供客户回看历史。
-    target.scrollTop = target.scrollHeight
+    // 首次进入、切换会话和历史消息回填必须直接定位，避免整段会话从顶部缓慢滑到底部。
+    target.scrollTo({ top: target.scrollHeight, behavior: 'auto' })
   }
 }
+
+// KeepAlive 页面恢复时在浏览器绘制前校准位置，不播放历史内容滚动过程。
+onActivated(() => { void scrollToBottom() })
 
 watch(
   () => [visibleMessages.value.length, props.lastReply?.answer, activeTab.value],
@@ -271,8 +266,12 @@ watch(
 )
 
 watch(
-  () => props.session?.status,
+  () => props.session?.handoff_status,
   (status, previousStatus) => {
+    if (status === 'CLOSED' && status !== previousStatus) {
+      activeTab.value = 'ai'
+      return
+    }
     if (status && status !== previousStatus && hasHumanSession.value && previousStatus !== undefined) {
       activeTab.value = 'human'
     }
@@ -311,13 +310,16 @@ watch(
       <span v-if="!selectedOrder && !selectedTicket">当前为无订单咨询，可直接提问规则、发票、会员或人工服务问题</span>
     </div>
 
-    <div v-if="activeTab === 'human' && humanStatusText" class="human-status-card">
+    <div v-if="activeTab === 'human' && handoffStatusText" class="human-status-card">
       <div class="human-status-main">
         <div>
           <span>当前状态</span>
-          <strong>{{ humanStatusText }}</strong>
+          <strong>{{ handoffStatusText }}</strong>
         </div>
-        <el-tag :type="humanStatusType">{{ session?.status }}</el-tag>
+        <div class="human-status-actions">
+          <el-button v-if="session?.handoff_status === 'PENDING'" size="small" @click="emit('cancel-handoff')">取消排队</el-button>
+          <el-tag :type="handoffStatusType">{{ session?.handoff_status }}</el-tag>
+        </div>
       </div>
       <dl>
         <div>
@@ -334,7 +336,7 @@ watch(
         </div>
         <div>
           <dt>预计等待</dt>
-          <dd>{{ session?.status === 'HUMAN_PENDING' ? '排队中' : '-' }}</dd>
+          <dd>{{ session?.handoff_status === 'PENDING' ? '排队中' : '-' }}</dd>
         </div>
       </dl>
       <div class="handoff-summary-card">

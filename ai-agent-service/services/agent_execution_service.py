@@ -11,6 +11,7 @@ from repositories.evaluation_repository import EvaluationRepository
 from schemas.intent_schema import AgentReplyRequest
 from services.resilient_client import ResilienceError
 from services.resilient_client import ResilientClient
+from services.staff_presence_service import StaffPresenceService
 
 
 class AgentExecutionAccessDenied(Exception):
@@ -28,6 +29,7 @@ class AgentExecutionService:
         chat_messages: ChatMessageRepository | None = None,
         evaluation_repository: EvaluationRepository | None = None,
         staff_availability_loader: Callable[[], list[dict[str, Any]]] | None = None,
+        staff_presence_checker: Callable[[str], bool] | None = None,
     ) -> None:
         """注入执行依赖，方便 API 与 Worker 复用同一服务并进行单元测试。"""
         self.agent = agent or CustomerServiceAgent()
@@ -39,6 +41,7 @@ class AgentExecutionService:
         self.human_service_start = os.getenv("HUMAN_SERVICE_START", "09:00")
         self.human_service_end = os.getenv("HUMAN_SERVICE_END", "18:00")
         self.staff_availability_loader = staff_availability_loader or self._load_staff_members_internal
+        self.staff_presence_checker = staff_presence_checker or StaffPresenceService().is_online
         self.staff_client = ResilientClient(downstream="java_staff")
 
     def execute(self, payload: AgentReplyRequest, event_publisher: Callable[[str, dict[str, Any]], None] | None = None) -> dict[str, Any]:
@@ -227,6 +230,11 @@ class AgentExecutionService:
 
     def _prepare_handoff_response(self, session_id: str) -> dict[str, Any]:
         """创建人工接管请求，并按服务时间和坐席容量生成客户可见话术。"""
+        current = self.chat_sessions.get_by_session_no(session_id) or {}
+        if current.get("handoff_status") == "ACTIVE":
+            return {"status": "active", "reason": "already_active", "service_status": "人工客服处理中", "message": "人工客服已接入当前会话，无需重复排队。您可以切换到人工客服继续补充信息。", "availability": {}}
+        if current.get("handoff_status") == "PENDING":
+            return {"status": "queued", "reason": "already_pending", "service_status": "人工客服排队中", "message": "当前会话已在人工客服队列中，无需重复提交。客服接入后会继续跟进。", "availability": {}}
         availability = self._load_human_availability()
         if not availability["in_service_time"]:
             self.chat_sessions.request_handoff(session_id, "off_hours")
@@ -238,7 +246,7 @@ class AgentExecutionService:
 
     def _save_manual_handoff_message(self, session_id: str, payload: AgentReplyRequest, session: dict[str, Any]) -> dict[str, Any]:
         """保存客户发送给人工客服的补充内容，不触发 AI 生成。"""
-        active = session.get("status") == "HUMAN_ACTIVE"
+        active = session.get("handoff_status") == "ACTIVE"
         self._ensure_handoff_exists(session_id, session, "manual_message")
         self.chat_messages.save(session_no=session_id, sender_type="customer", sender_id=str(payload.customer_id), content=payload.message, extra_data={"route_target": "human", "message_source": "manual_handoff_customer_message"})
         message = "您的补充内容已发送给当前人工客服。" if active else "您的补充内容已记录到人工服务请求中，客服接入后会一并查看。"
@@ -246,12 +254,12 @@ class AgentExecutionService:
 
     def _ensure_handoff_exists(self, session_id: str, session: dict[str, Any], reason: str) -> None:
         """保证人工请求幂等，已有挂起或接入状态时不重复创建。"""
-        if session.get("status") not in {"HUMAN_PENDING", "HUMAN_ACTIVE"}:
+        if session.get("handoff_status") not in {"PENDING", "ACTIVE"}:
             self.chat_sessions.request_handoff(session_id, reason)
 
     def _manual_session_ack(self, session_id: str, session: dict[str, Any], message: str) -> dict[str, Any]:
         """构造人工通道的兼容 AgentReply 响应。"""
-        active = session.get("status") == "HUMAN_ACTIVE"
+        active = session.get("handoff_status") == "ACTIVE"
         reasons = ["manual_handoff_active" if active else "manual_handoff_pending"]
         return {"session_id": session_id, "answer": message, "customer_message": message, "internal_suggestion": None, "decision_type": "human_takeover", "service_status": "人工客服处理中" if active else "人工请求已挂起", "auto_send": False, "need_human": True, "analysis": {"intent": "consult", "user_goal": "human_request", "emotion": "normal", "order_related": False, "order_no": [], "product_name": None, "need_order_query": False, "need_ticket": False, "need_human": True, "priority": "medium", "confidence": 1.0, "summary": "人工会话补充消息", "risk_reasons": reasons, "action_type": None, "action_slots": {}, "missing_slots": [], "next_action": "transfer_human"}, "citations": [], "tool_results": [], "ticket_result": None, "risk_reasons": reasons, "pending_action_request": None}
 
@@ -259,7 +267,16 @@ class AgentExecutionService:
         """汇总人工服务时间和坐席负载，只输出安全摘要。"""
         in_service_time = self._is_human_service_time()
         staff_members = self.staff_availability_loader() if in_service_time else []
-        available = [staff for staff in staff_members if staff.get("online") and staff.get("acceptingTickets") and int(staff.get("activeTickets") or 0) + self.chat_sessions.count_active_handoff_by_staff(str(staff.get("userId"))) < int(staff.get("maxActiveTickets") or 0)]
+        available = [
+            staff
+            for staff in staff_members
+            if staff.get("online")
+            and staff.get("acceptingTickets")
+            and self.staff_presence_checker(str(staff.get("userId")))
+            and int(staff.get("activeTickets") or 0)
+            + self.chat_sessions.count_active_handoff_by_staff(str(staff.get("userId")))
+            < int(staff.get("maxActiveTickets") or 0)
+        ]
         return {"in_service_time": in_service_time, "service_start": self.human_service_start, "service_end": self.human_service_end, "staff_count": len(staff_members), "available_staff_count": len(available)}
 
     def _load_staff_members_internal(self) -> list[dict[str, Any]]:
@@ -289,14 +306,14 @@ class AgentExecutionService:
     def _resolve_session_status(agent_result: dict[str, Any]) -> str:
         """将 Agent 决策映射为会话状态，保持原有状态流转。"""
         if agent_result.get("handoff_result"):
-            return "HUMAN_PENDING"
+            return "AI_REPLIED"
         ticket_result = agent_result.get("ticket_result") or {}
         if ticket_result.get("status") == "success":
             return "CREATED_TICKET"
         if agent_result.get("decision_type") == "human_takeover":
-            return "HUMAN_PENDING"
+            return "AI_REPLIED"
         if agent_result.get("decision_type") == "review_required":
             return "AI_REVIEW"
         if agent_result.get("decision_type") == "auto_reply":
             return "AI_REPLIED"
-        return "HUMAN_PENDING" if agent_result.get("need_human") else "AI_ONLY"
+        return "AI_REPLIED" if agent_result.get("need_human") else "AI_ONLY"

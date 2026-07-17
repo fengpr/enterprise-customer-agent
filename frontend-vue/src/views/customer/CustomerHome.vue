@@ -3,8 +3,9 @@ defineOptions({ name: 'CustomerHome' })
 
 import { Plus, Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
-import { computed, onActivated, onMounted, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { storeToRefs } from 'pinia'
+import { computed, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 
 import { customerApi } from '@/api/customer'
 import ChatAssistantPanel from '@/components/customer/ChatAssistantPanel.vue'
@@ -13,6 +14,7 @@ import OrderCardList from '@/components/customer/OrderCardList.vue'
 import TicketList from '@/components/customer/TicketList.vue'
 import TicketProgressPanel from '@/components/customer/TicketProgressPanel.vue'
 import { useAuthStore } from '@/stores/auth'
+import { useCustomerSessionStore } from '@/stores/customerSessions'
 import type { AgentReply, AgentStatus, ChatMessage, ChatSession, CustomerOrder, RouteTarget, Ticket } from '@/types/api'
 
 interface CustomerWorkspaceCache {
@@ -28,8 +30,10 @@ let workspaceCache: CustomerWorkspaceCache | null = null
 
 const auth = useAuthStore()
 const route = useRoute()
+const router = useRouter()
+const sessionStore = useCustomerSessionStore()
+const { sessions } = storeToRefs(sessionStore)
 const agentStatus = ref<AgentStatus | null>(null)
-const sessions = ref<ChatSession[]>([])
 const messages = ref<ChatMessage[]>([])
 const orders = ref<CustomerOrder[]>([])
 const tickets = ref<Ticket[]>([])
@@ -49,6 +53,10 @@ const activatedOnce = ref(false)
 const handledRouteContext = ref('')
 const lowerGridRef = ref<HTMLElement | null>(null)
 const contentGridRef = ref<HTMLElement | null>(null)
+const latestMessageId = ref(0)
+let messagePollTimer: number | null = null
+let messagePollRunning = false
+let messagePollFailures = 0
 
 const layoutStorageKey = 'customer-service-layout-v1'
 const layoutState = ref({
@@ -85,7 +93,7 @@ function restoreCustomerWorkspace() {
   agentStatus.value = workspaceCache.agentStatus
   orders.value = workspaceCache.orders
   tickets.value = workspaceCache.tickets
-  sessions.value = workspaceCache.sessions
+  if (!sessionStore.loaded) sessionStore.replace(workspaceCache.sessions)
   selectedSessionId.value = sessions.value[0]?.session_id ?? null
   selectedTicketNo.value = tickets.value[0]?.ticketNo ?? null
   return true
@@ -205,8 +213,7 @@ function mergeReplyTicket(reply: AgentReply) {
 async function loadSessions(keepSelection = true) {
   loadingSessions.value = true
   try {
-    const { data } = await customerApi.sessions()
-    sessions.value = data
+    const data = await sessionStore.refresh(true)
     cacheCustomerWorkspace()
     if (!keepSelection || !selectedSessionId.value) {
       selectedSessionId.value = data[0]?.session_id ?? null
@@ -226,6 +233,8 @@ async function loadMessages(sessionId: string) {
   try {
     const { data } = await customerApi.sessionDetail(sessionId)
     messages.value = data.messages
+    latestMessageId.value = data.latest_message_id || Math.max(0, ...data.messages.map((item) => item.id))
+    if (data.session) sessionStore.prepend(data.session)
   } finally {
     loadingMessages.value = false
   }
@@ -241,15 +250,18 @@ async function selectSession(sessionId: string) {
 }
 
 async function createNewSession() {
+  // 顶部按钮双击、路由监听与 KeepAlive 激活可能同时触发，创建期间只允许一个请求进入。
+  if (creatingSession.value) return null
   creatingSession.value = true
   try {
     const { data } = await customerApi.createSession()
     selectedSessionId.value = data.session_id
-    sessions.value = [data, ...sessions.value]
+    sessionStore.prepend(data)
     messages.value = []
     lastReply.value = null
     messageText.value = ''
     ElMessage.success('已新建咨询')
+    return data
   } finally {
     creatingSession.value = false
   }
@@ -276,6 +288,55 @@ function showReplySubmitFeedback(reply: AgentReply) {
     return
   }
   // 普通知识咨询或基础能力介绍已经在聊天气泡中展示，不再弹“问题已提交”误导用户。
+}
+
+function stopMessagePolling() {
+  if (messagePollTimer !== null) window.clearTimeout(messagePollTimer)
+  messagePollTimer = null
+}
+
+function scheduleMessagePolling(delay = 2000) {
+  stopMessagePolling()
+  if (document.hidden || route.path !== '/customer/service') return
+  messagePollTimer = window.setTimeout(() => void pollCurrentSession(), delay)
+}
+
+async function pollCurrentSession() {
+  const sessionId = selectedSessionId.value
+  if (!sessionId || messagePollRunning || submitting.value || document.hidden) {
+    scheduleMessagePolling()
+    return
+  }
+  messagePollRunning = true
+  try {
+    const { data } = await customerApi.sessionDetail(sessionId, latestMessageId.value)
+    if (selectedSessionId.value !== sessionId) return
+    const known = new Set(messages.value.map((item) => item.id))
+    const additions = data.messages.filter((item) => !known.has(item.id))
+    if (additions.length) messages.value = [...messages.value, ...additions]
+    latestMessageId.value = Math.max(latestMessageId.value, data.latest_message_id || 0)
+    if (data.session) sessionStore.prepend(data.session)
+    messagePollFailures = 0
+  } catch {
+    messagePollFailures += 1
+  } finally {
+    messagePollRunning = false
+    scheduleMessagePolling(Math.min(15000, 2000 * 2 ** messagePollFailures))
+  }
+}
+
+function handleVisibilityChange() {
+  if (document.hidden) stopMessagePolling()
+  else scheduleMessagePolling(0)
+}
+
+async function cancelHandoff() {
+  if (!selectedSessionId.value) return
+  const { data } = await customerApi.cancelHandoff(selectedSessionId.value)
+  sessionStore.prepend(data.session)
+  routeTarget.value = 'ai'
+  await pollCurrentSession()
+  ElMessage.success('已取消人工客服排队')
 }
 
 /** 侧栏删除当前会话后主动回退到最新可用会话，避免继续请求已软删除的数据。 */
@@ -528,20 +589,35 @@ function regenerateAnswer(message: string) {
 /** 应用外部入口携带的会话、订单和工单上下文，避免进入智能客服后丢失用户选择。 */
 async function applyRouteContext() {
   if (route.path !== '/customer/service' || handledRouteContext.value === route.fullPath) return
+  // 在任何异步请求之前占用当前路由上下文，防止 mounted、activated 和 watch 重复创建会话。
+  const contextPath = route.fullPath
+  handledRouteContext.value = contextPath
   const sessionId = typeof route.query.sessionId === 'string' ? route.query.sessionId : ''
   const orderNo = typeof route.query.orderNo === 'string' ? route.query.orderNo : ''
   const ticketNo = typeof route.query.ticketNo === 'string' ? route.query.ticketNo : ''
 
-  if (sessionId && sessions.value.some((item) => item.session_id === sessionId)) {
-    await selectSession(sessionId)
-  } else if (route.query.new === '1' || route.query.message) {
-    await createNewSession()
+  try {
+    if (sessionId && sessions.value.some((item) => item.session_id === sessionId)) {
+      await selectSession(sessionId)
+    } else if (route.query.new === '1') {
+      const createdSession = await createNewSession()
+      // 创建成功后将一次性 new 标记替换为真实会话号，刷新和重复激活都不会再次创建。
+      if (createdSession) {
+        const nextQuery = { ...route.query }
+        delete nextQuery.new
+        nextQuery.sessionId = createdSession.session_id
+        await router.replace({ path: route.path, query: nextQuery })
+      }
+    }
+    // 关联标识必须先经过当前客户已加载列表校验，不能直接信任 URL 参数。
+    if (orderNo && orders.value.some((item) => item.orderNo === orderNo)) selectedOrderNo.value = orderNo
+    if (ticketNo && tickets.value.some((item) => item.ticketNo === ticketNo)) selectedTicketNo.value = ticketNo
+    if (typeof route.query.message === 'string') messageText.value = route.query.message
+  } catch (error) {
+    // 处理失败时释放占用，允许用户再次进入或刷新后重试。
+    if (handledRouteContext.value === contextPath) handledRouteContext.value = ''
+    throw error
   }
-  // 关联标识必须先经过当前客户已加载列表校验，不能直接信任 URL 参数。
-  if (orderNo && orders.value.some((item) => item.orderNo === orderNo)) selectedOrderNo.value = orderNo
-  if (ticketNo && tickets.value.some((item) => item.ticketNo === ticketNo)) selectedTicketNo.value = ticketNo
-  if (typeof route.query.message === 'string') messageText.value = route.query.message
-  handledRouteContext.value = route.fullPath
 }
 
 onMounted(async () => {
@@ -554,11 +630,13 @@ onMounted(async () => {
   } else {
     await refreshWorkspace
   }
-  await refreshWorkspace
   await applyRouteContext()
+  document.addEventListener('visibilitychange', handleVisibilityChange)
+  scheduleMessagePolling()
 })
 
 onActivated(() => {
+  scheduleMessagePolling(0)
   if (!activatedOnce.value) {
     activatedOnce.value = true
     return
@@ -567,6 +645,12 @@ onActivated(() => {
   // KeepAlive 恢复页面后静默校准最新业务数据，避免缓存内容出现骨架屏闪烁。
   void Promise.all([loadAgentStatus(), loadOrders(false), loadTickets(false), loadSessions(true)]).catch(() => undefined)
   void applyRouteContext()
+})
+
+onDeactivated(stopMessagePolling)
+onBeforeUnmount(() => {
+  stopMessagePolling()
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
 })
 
 watch(() => route.fullPath, () => {
@@ -592,7 +676,7 @@ watch(() => route.fullPath, () => {
     />
 
     <main class="customer-main">
-      <header class="customer-hero">
+      <header class="customer-hero customer-page-header">
         <div>
           <h1>客户自助服务</h1>
           <p>
@@ -600,7 +684,7 @@ watch(() => route.fullPath, () => {
             <span v-if="agentStatus?.llm?.enabled"> · LLM {{ agentStatus.llm.provider }}</span>
           </p>
         </div>
-        <div class="hero-actions">
+        <div class="hero-actions customer-page-header-actions">
           <el-button :icon="Refresh" :loading="loadingOrders" @click="loadOrders">刷新订单</el-button>
           <el-button :icon="Refresh" :loading="loadingTickets" @click="refreshTickets">刷新工单</el-button>
           <el-button :icon="Plus" :loading="creatingSession" type="primary" @click="createNewSession">新建咨询</el-button>
@@ -655,6 +739,7 @@ watch(() => route.fullPath, () => {
               :selected-ticket="selectedTicket"
               :submitting="submitting || loadingMessages"
               @continue-ai="routeTarget = 'ai'"
+              @cancel-handoff="cancelHandoff"
               @quick="fillAndMaybeSend"
               @regenerate="regenerateAnswer"
               @update:route-target="routeTarget = $event"

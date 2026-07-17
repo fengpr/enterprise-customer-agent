@@ -1,11 +1,14 @@
 package com.example.business.controller;
 
+import com.example.business.dto.HandoffTicketRequest;
 import com.example.business.entity.SupportTicket;
 import com.example.business.service.TicketAssignmentService;
+import com.example.business.service.TicketService;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
@@ -18,13 +21,16 @@ import org.springframework.web.server.ResponseStatusException;
 @RequestMapping("/api/internal/tickets")
 public class InternalTicketController {
     private final TicketAssignmentService ticketAssignmentService;
+    private final TicketService ticketService;
     private final String agentInternalSecret;
 
     public InternalTicketController(
             TicketAssignmentService ticketAssignmentService,
+            TicketService ticketService,
             @Value("${agent.internal-secret:enterprise-customer-agent-demo-internal-secret}") String agentInternalSecret
     ) {
         this.ticketAssignmentService = ticketAssignmentService;
+        this.ticketService = ticketService;
         this.agentInternalSecret = agentInternalSecret;
     }
 
@@ -44,5 +50,25 @@ public class InternalTicketController {
             throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Agent 内部密钥无效");
         }
         return ticketAssignmentService.autoAssign(ticketNo);
+    }
+
+    /**
+     * 由已鉴权 Agent 为人工会话创建幂等跟进工单，客户与会话身份均由服务端读取。
+     *
+     * @param request Agent 组装的安全业务字段
+     * @param secret Agent 内部共享密钥
+     * @return 已存在或新创建的真实工单
+     */
+    @PostMapping("/handoff")
+    public SupportTicket createHandoffTicket(
+            @RequestBody HandoffTicketRequest request,
+            @RequestHeader("X-Agent-Internal-Secret") String secret
+    ) {
+        if (!agentInternalSecret.equals(secret)) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Agent 内部密钥无效");
+        }
+        return ticketService.createHandoffFollowUp(
+                request.customerId(), request.externalSessionNo(), request.title(), request.content(), request.priority()
+        );
     }
 }

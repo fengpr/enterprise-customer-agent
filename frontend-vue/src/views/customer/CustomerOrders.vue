@@ -3,17 +3,20 @@ defineOptions({ name: 'CustomerOrders' })
 
 import { ChatDotRound, CircleCheckFilled, Document, Filter, Headset, Refresh, Search, Van } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
+import { storeToRefs } from 'pinia'
 import { computed, onActivated, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import { customerApi } from '@/api/customer'
 import CustomerSidebar from '@/components/customer/CustomerSidebar.vue'
-import type { ChatSession, CustomerOrder, CustomerOrderDetail, CustomerOrderLogistics } from '@/types/api'
+import { useCustomerSessionStore } from '@/stores/customerSessions'
+import type { CustomerOrder, CustomerOrderDetail, CustomerOrderLogistics } from '@/types/api'
 
 const router = useRouter()
 const route = useRoute()
+const sessionStore = useCustomerSessionStore()
+const { sessions } = storeToRefs(sessionStore)
 const orders = ref<CustomerOrder[]>([])
-const sessions = ref<ChatSession[]>([])
 const selectedOrderNo = ref<string | null>(null)
 const selectedDetail = ref<CustomerOrderDetail | null>(null)
 const selectedLogistics = ref<CustomerOrderLogistics | null>(null)
@@ -65,6 +68,7 @@ function openService(order?: CustomerOrder) {
   const query = order ? { new: '1', orderNo: order.orderNo } : { new: '1' }
   void router.push({ path: '/customer/service', query })
 }
+function openSession(sessionId: string) { void router.push({ path: '/customer/service', query: { sessionId } }) }
 function unavailable() { ElMessage.info('该功能正在建设中') }
 function selectStatus(value: string) { activeStatus.value = value; page.value = 1 }
 function resetFilters() { keyword.value = ''; activeStatus.value = 'ALL'; dateRange.value = null; page.value = 1 }
@@ -91,9 +95,8 @@ async function loadPage(showFeedback = false) {
   if (loading.value) return
   loading.value = true
   try {
-    const [orderResult, sessionResult] = await Promise.all([customerApi.orders(), customerApi.sessions(50)])
+    const [orderResult] = await Promise.all([customerApi.orders(), sessionStore.refresh(true)])
     orders.value = orderResult.data
-    sessions.value = sessionResult.data
     // 首页携带订单号时只在当前客户订单集合中定位，避免信任外部 URL 参数。
     const targetOrderNo = typeof route.query.orderNo === 'string' ? route.query.orderNo : selectedOrderNo.value
     const target = orders.value.find((item) => item.orderNo === targetOrderNo) || orders.value[0]
@@ -116,11 +119,11 @@ onActivated(() => { if (!orders.value.length) void loadPage() })
 
 <template>
   <div class="customer-orders-page">
-    <CustomerSidebar :sessions="sessions" @contact-service="openService()" @unavailable="unavailable" @select-session="openService()" @sessions-changed="() => loadPage()" />
+    <CustomerSidebar :sessions="sessions" @contact-service="openService()" @unavailable="unavailable" @select-session="openSession" @sessions-changed="() => sessionStore.refresh(true)" />
     <main class="customer-orders-main">
-      <header class="orders-header">
+      <header class="orders-header customer-page-header">
         <div><h1>我的订单</h1><p>查看订单状态、物流进度、售后入口与订单详情</p></div>
-        <div class="orders-header-actions"><el-button :icon="Refresh" :loading="loading" @click="loadPage(true)">刷新订单</el-button><el-button :icon="Filter" @click="unavailable">筛选订单</el-button><el-button type="primary" :icon="ChatDotRound" @click="openService()">新建咨询</el-button></div>
+        <div class="orders-header-actions customer-page-header-actions"><el-button :icon="Refresh" :loading="loading" @click="loadPage(true)">刷新订单</el-button><el-button :icon="Filter" @click="unavailable">筛选订单</el-button><el-button type="primary" :icon="ChatDotRound" @click="openService()">新建咨询</el-button></div>
       </header>
 
       <section class="order-metric-grid">

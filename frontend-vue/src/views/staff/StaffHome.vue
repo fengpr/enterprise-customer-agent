@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { Check, Close, Refresh, SwitchButton, UserFilled } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 
 import { staffHandoffApi, staffReplyApi, staffTicketApi } from '@/api/staff'
@@ -24,12 +24,22 @@ const draftMessage = ref('')
 const handoffReply = ref('')
 const handoffCloseMessage = ref('人工服务已结束，后续可继续由智能助手协助。')
 const workMode = ref<'tickets' | 'handoff'>('tickets')
+const handoffScope = ref<'pending' | 'mine'>('pending')
+const latestHandoffMessageId = ref(0)
+const seenHandoffMessageIds = ref<Record<string, number>>({})
+let queuePollTimer: number | null = null
+let detailPollTimer: number | null = null
+let heartbeatTimer: number | null = null
+let handoffPolling = false
+let queuePollFailures = 0
+let detailPollFailures = 0
 const queueScope = ref<'mine' | 'claimable'>('mine')
 const selectedStatuses = ref(['PENDING_ASSIGN', 'PENDING_PROCESS', 'PROCESSING', 'REOPENED'])
 
 const statusOptions = ['PENDING_ASSIGN', 'PENDING_PROCESS', 'PROCESSING', 'REOPENED', 'CLOSED']
 const selectedTicket = computed(() => tickets.value.find((item) => item.ticketNo === selectedTicketNo.value) ?? null)
 const selectedHandoff = computed(() => handoffSessions.value.find((item) => item.session_id === selectedHandoffSessionId.value) ?? null)
+const visibleHandoffs = computed(() => handoffSessions.value.filter((item) => handoffScope.value === 'pending' ? item.handoff_status === 'PENDING' : item.handoff_status === 'ACTIVE'))
 const visibleTickets = computed(() => {
   if (queueScope.value === 'claimable') {
     return tickets.value.filter((ticket) => !ticket.handlerId || ticket.status === 'PENDING_ASSIGN')
@@ -41,7 +51,7 @@ const canClaim = computed(() => {
 })
 const canOperate = computed(() => selectedTicket.value?.handlerId === auth.user?.user_id)
 const canOperateHandoff = computed(() => {
-  return selectedHandoff.value?.status === 'HUMAN_ACTIVE' && selectedHandoff.value.human_assigned_staff_id === String(auth.user?.user_id)
+  return selectedHandoff.value?.handoff_status === 'ACTIVE' && selectedHandoff.value.human_assigned_staff_id === String(auth.user?.user_id)
 })
 
 async function loadTickets() {
@@ -60,12 +70,13 @@ async function loadTickets() {
 async function loadHandoffSessions(keepSelection = true) {
   handoffLoading.value = true
   try {
+    const previousSelection = selectedHandoffSessionId.value
     const { data } = await staffHandoffApi.list()
     handoffSessions.value = data
     if (!keepSelection || !selectedHandoffSessionId.value || !data.some((item) => item.session_id === selectedHandoffSessionId.value)) {
       selectedHandoffSessionId.value = data[0]?.session_id ?? null
     }
-    if (selectedHandoffSessionId.value) {
+    if (selectedHandoffSessionId.value && (previousSelection !== selectedHandoffSessionId.value || !handoffMessages.value.length)) {
       await loadHandoffDetail(selectedHandoffSessionId.value)
     } else {
       handoffMessages.value = []
@@ -75,9 +86,84 @@ async function loadHandoffSessions(keepSelection = true) {
   }
 }
 
+watch(handoffScope, () => {
+  const first = visibleHandoffs.value[0]
+  if (first && !visibleHandoffs.value.some((item) => item.session_id === selectedHandoffSessionId.value)) {
+    void selectHandoff(first)
+  }
+})
+
 async function loadHandoffDetail(sessionId: string) {
   const { data } = await staffHandoffApi.detail(sessionId)
   handoffMessages.value = data.messages
+  latestHandoffMessageId.value = data.latest_message_id || Math.max(0, ...data.messages.map((item) => item.id))
+  seenHandoffMessageIds.value[sessionId] = latestHandoffMessageId.value
+}
+
+async function pollHandoffDetail() {
+  const sessionId = selectedHandoffSessionId.value
+  if (!sessionId || document.hidden) return
+  try {
+    const { data } = await staffHandoffApi.detail(sessionId, latestHandoffMessageId.value)
+    if (selectedHandoffSessionId.value !== sessionId) return
+    const known = new Set(handoffMessages.value.map((item) => item.id))
+    handoffMessages.value = [...handoffMessages.value, ...data.messages.filter((item) => !known.has(item.id))]
+    latestHandoffMessageId.value = Math.max(latestHandoffMessageId.value, data.latest_message_id || 0)
+    seenHandoffMessageIds.value[sessionId] = latestHandoffMessageId.value
+    detailPollFailures = 0
+  } catch {
+    detailPollFailures += 1
+  }
+}
+
+function scheduleQueuePoll(delay = 3000) {
+  if (queuePollTimer !== null) window.clearTimeout(queuePollTimer)
+  queuePollTimer = window.setTimeout(async () => {
+    if (!document.hidden && !handoffPolling) {
+      handoffPolling = true
+      try {
+        await loadHandoffSessions(true)
+        queuePollFailures = 0
+      } catch {
+        queuePollFailures += 1
+      } finally {
+        handoffPolling = false
+      }
+    }
+    scheduleQueuePoll(Math.min(15000, 3000 * 2 ** queuePollFailures))
+  }, delay)
+}
+
+function scheduleDetailPoll(delay = 2000) {
+  if (detailPollTimer !== null) window.clearTimeout(detailPollTimer)
+  detailPollTimer = window.setTimeout(async () => {
+    await pollHandoffDetail()
+    scheduleDetailPoll(Math.min(15000, 2000 * 2 ** detailPollFailures))
+  }, delay)
+}
+
+function startStaffPolling() {
+  if (queuePollTimer !== null) return
+  scheduleQueuePoll()
+  scheduleDetailPoll()
+  heartbeatTimer = window.setInterval(() => {
+    if (!document.hidden) void staffHandoffApi.heartbeat().catch(() => undefined)
+  }, 10000)
+}
+
+function stopStaffPolling() {
+  if (queuePollTimer !== null) window.clearInterval(queuePollTimer)
+  if (detailPollTimer !== null) window.clearInterval(detailPollTimer)
+  if (heartbeatTimer !== null) window.clearInterval(heartbeatTimer)
+  queuePollTimer = detailPollTimer = heartbeatTimer = null
+}
+
+function handleStaffVisibility() {
+  if (!document.hidden) {
+    void staffHandoffApi.heartbeat().catch(() => undefined)
+    scheduleQueuePoll(0)
+    scheduleDetailPoll(0)
+  }
 }
 
 function selectTicket(ticket: Ticket) {
@@ -177,7 +263,7 @@ async function closeHandoff() {
   if (!selectedHandoff.value) return
   acting.value = true
   try {
-    await staffHandoffApi.close(selectedHandoff.value.session_id, handoffCloseMessage.value, 'HUMAN_CLOSED')
+    await staffHandoffApi.close(selectedHandoff.value.session_id, handoffCloseMessage.value)
     ElMessage.success('已结束人工接管，后续回到智能助手协助')
     await loadHandoffSessions(false)
   } finally {
@@ -185,13 +271,34 @@ async function closeHandoff() {
   }
 }
 
+async function createHandoffTicket() {
+  if (!selectedHandoff.value) return
+  acting.value = true
+  try {
+    const { data } = await staffHandoffApi.createTicket(selectedHandoff.value.session_id)
+    ElMessage.success(`跟进工单已就绪：${data.ticket.ticketNo}`)
+  } finally {
+    acting.value = false
+  }
+}
+
 async function logout() {
+  stopStaffPolling()
+  await staffHandoffApi.leave().catch(() => undefined)
   auth.logout()
   await router.push('/staff/login')
 }
 
 onMounted(async () => {
+  await staffHandoffApi.heartbeat().catch(() => undefined)
   await Promise.all([loadTickets(), loadHandoffSessions()])
+  document.addEventListener('visibilitychange', handleStaffVisibility)
+  startStaffPolling()
+})
+onBeforeUnmount(() => {
+  stopStaffPolling()
+  document.removeEventListener('visibilitychange', handleStaffVisibility)
+  void staffHandoffApi.leave().catch(() => undefined)
 })
 </script>
 
@@ -232,6 +339,11 @@ onMounted(async () => {
         <el-button :icon="Refresh" :loading="loading" class="full-button" @click="loadTickets">刷新工单</el-button>
       </template>
       <template v-else>
+        <el-segmented
+          v-model="handoffScope"
+          :options="[{ label: '待接入', value: 'pending' }, { label: '我的会话', value: 'mine' }]"
+          class="full-button"
+        />
         <el-button :icon="Refresh" :loading="handoffLoading" class="full-button" @click="loadHandoffSessions(false)">
           刷新人工会话
         </el-button>
@@ -257,7 +369,7 @@ onMounted(async () => {
       </div>
       <div v-else class="ticket-list">
         <button
-          v-for="session in handoffSessions"
+          v-for="session in visibleHandoffs"
           :key="session.session_id"
           :class="['ticket-item', { active: session.session_id === selectedHandoffSessionId }]"
           @click="selectHandoff(session)"
@@ -265,12 +377,14 @@ onMounted(async () => {
           <strong>{{ session.title || session.session_id }}</strong>
           <span>客户：{{ session.customer_id }}</span>
           <div>
-            <el-tag :type="session.status === 'HUMAN_ACTIVE' ? 'success' : 'warning'" size="small">
-              {{ session.status === 'HUMAN_ACTIVE' ? '已接入' : '待接入' }}
+            <el-tag :type="session.handoff_status === 'ACTIVE' ? 'success' : 'warning'" size="small">
+              {{ session.handoff_status === 'ACTIVE' ? '已接入' : '待接入' }}
             </el-tag>
             <el-tag v-if="session.handoff_reason" size="small" type="info">{{ session.handoff_reason }}</el-tag>
+            <el-tag v-if="(session.latest_message_id || 0) > (seenHandoffMessageIds[session.session_id] || 0)" size="small" type="danger">新消息</el-tag>
           </div>
           <small>接入人：{{ session.human_assigned_staff_name || '未接入' }}</small>
+          <small v-if="session.linked_ticket_no">跟进工单：{{ session.linked_ticket_no }}</small>
           <small>更新时间：{{ session.updated_at || '-' }}</small>
         </button>
         <el-empty v-if="!handoffSessions.length && !handoffLoading" description="当前没有待接入人工会话" />
@@ -292,8 +406,8 @@ onMounted(async () => {
             <template #header>
               <div class="card-header">
                 <span>人工会话</span>
-                <el-tag :type="selectedHandoff.status === 'HUMAN_ACTIVE' ? 'success' : 'warning'">
-                  {{ selectedHandoff.status === 'HUMAN_ACTIVE' ? '人工接管中' : '等待接入' }}
+                <el-tag :type="selectedHandoff.handoff_status === 'ACTIVE' ? 'success' : 'warning'">
+                  {{ selectedHandoff.handoff_status === 'ACTIVE' ? '人工接管中' : '等待接入' }}
                 </el-tag>
               </div>
             </template>
@@ -321,7 +435,7 @@ onMounted(async () => {
           <el-card shadow="never">
             <template #header>人工接管操作</template>
             <el-alert
-              v-if="selectedHandoff.status === 'HUMAN_PENDING'"
+              v-if="selectedHandoff.handoff_status === 'PENDING'"
               title="该客户正在等待人工接入，接入后智能助手会暂停自动回复。"
               :closable="false"
               type="warning"
@@ -336,7 +450,7 @@ onMounted(async () => {
             />
             <div class="action-row section-gap">
               <el-button
-                v-if="selectedHandoff.status === 'HUMAN_PENDING'"
+                v-if="selectedHandoff.handoff_status === 'PENDING'"
                 :loading="acting"
                 type="primary"
                 @click="acceptHandoff"
@@ -356,6 +470,9 @@ onMounted(async () => {
               </el-form-item>
               <el-button :disabled="!canOperateHandoff" :loading="acting" type="primary" @click="sendHandoffReply">
                 发送给客户
+              </el-button>
+              <el-button :disabled="!canOperateHandoff" :loading="acting" @click="createHandoffTicket">
+                创建跟进工单
               </el-button>
 
               <el-divider />

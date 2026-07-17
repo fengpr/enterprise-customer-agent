@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 
 import { authApi } from '@/api/auth'
+import { useCustomerSessionStore } from '@/stores/customerSessions'
 import type { CurrentUser } from '@/types/api'
 
 const TOKEN_KEY = 'eca_token'
@@ -26,6 +27,7 @@ export const useAuthStore = defineStore('auth', {
   actions: {
     async login(username: string, password: string) {
       const { data } = await authApi.login(username, password)
+      useCustomerSessionStore().clear()
       this.token = data.token
       this.user = data.user
       localStorage.setItem(TOKEN_KEY, data.token)
@@ -33,6 +35,7 @@ export const useAuthStore = defineStore('auth', {
       return data.user
     },
     logout() {
+      useCustomerSessionStore().clear()
       this.token = null
       this.user = null
       localStorage.removeItem(TOKEN_KEY)

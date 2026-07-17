@@ -51,8 +51,8 @@ export const customerApi = {
   sessions(limit = 50) {
     return agentHttp.get<ChatSession[]>('/chat/session/list', { params: { limit } })
   },
-  sessionDetail(sessionId: string) {
-    return agentHttp.get<ChatSessionDetail>(`/chat/session/${sessionId}`)
+  sessionDetail(sessionId: string, afterMessageId = 0) {
+    return agentHttp.get<ChatSessionDetail>(`/chat/session/${sessionId}`, { params: { after_message_id: afterMessageId } })
   },
   createSession(title = '新会话') {
     return agentHttp.post<ChatSession>('/chat/session', { title })
@@ -62,6 +62,9 @@ export const customerApi = {
   },
   setSessionPinned(sessionId: string, pinned: boolean) {
     return agentHttp.patch<ChatSession>(`/chat/session/${sessionId}/pin`, { pinned })
+  },
+  cancelHandoff(sessionId: string) {
+    return agentHttp.post<{ status: string; session: ChatSession }>(`/chat/session/${sessionId}/handoff/cancel`)
   },
   orders() {
     return agentHttp.get<CustomerOrder[]>('/customer/orders')

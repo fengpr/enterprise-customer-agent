@@ -487,8 +487,10 @@ def _query_or_urge_ticket_if_needed(
     selected_ticket_no = state.get("selected_ticket_no")
     # “订单状态”是显式的订单语义，不能被历史工单上下文抢占。
     explicit_order_query = _is_order_status_query(message)
-    # 前端当前选中的工单可用于“查进度/催办”；历史工单仅能响应明确的工单指代。
-    context_ticket_reference = bool(context_ticket_no and _has_context_ticket_reference(message))
+    # “帮我催一下”本身就是明确的催办动作；存在最近工单上下文时可直接复用，普通状态查询仍要求明确指代。
+    context_ticket_reference = bool(
+        context_ticket_no and (_has_context_ticket_reference(message) or _has_urge_words(message))
+    )
     selected_ticket_action = bool(selected_ticket_no) and not explicit_order_query and not _is_logistics_query(message, "") and not _is_how_to_query(message) and any(
         word in message for word in ["催", "加急", "进度", "处理", "状态", "太慢", "怎么还没"]
     )

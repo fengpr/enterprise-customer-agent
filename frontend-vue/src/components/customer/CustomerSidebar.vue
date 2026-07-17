@@ -10,14 +10,14 @@ const props = defineProps<{ prototypeUser?: { name: string; level: string; point
 const emit = defineEmits<{ contactService: []; unavailable: []; selectSession: [sessionId: string]; sessionsChanged: [payload: { sessionId: string; deleted: boolean }] }>()
 const router = useRouter()
 const showAllSessions = ref(false)
-const user = computed(() => props.prototypeUser || { name: props.user?.display_name || 'Demo Customer', level: '普通客户', points: '2,680' })
+const user = computed(() => props.prototypeUser || { name: props.user?.display_name || 'Demo Customer', level: '普通客户', points: '—' })
 type SidebarSession = { title: string; desc: string; time: string; sessionId: string; pinned: boolean }
 const sessions = computed<SidebarSession[]>(() => {
   const history = props.sessions?.map((session) => ({ title: session.title || '智能助手', desc: session.ai_summary || session.intent || '暂无最新消息', time: session.updated_at.slice(5, 16), sessionId: session.session_id, pinned: Boolean(session.pinned_at) })) || []
   // 展开与收起始终复用真实会话数据，避免首页和智能客服页出现不同历史记录。
   // 默认展示四条真实会话，兼顾侧栏信息密度与底部联系按钮的稳定位置。
   if (history.length) return showAllSessions.value ? history : history.slice(0, 4)
-  return [{ title: '用户咨询订单EC...', desc: '用户反馈未收到...', time: '07-15 13:56', sessionId: '', pinned: false }, { title: '查询我的订单', desc: '用户查询订单EC...', time: '06-24 08:42', sessionId: '', pinned: false }]
+  return []
 })
 const contextMenu = ref<{ x: number; y: number; session: SidebarSession } | null>(null)
 const menuItems = [
@@ -25,7 +25,7 @@ const menuItems = [
   { label: '我的订单', icon: Notebook, path: '/customer/orders' },
   { label: '我的工单', icon: Tickets, path: '/customer/tickets' },
   { label: '智能客服', icon: ChatLineRound, path: '/customer/service' },
-  { label: '帮助中心', icon: QuestionFilled }
+  { label: '帮助中心', icon: QuestionFilled, path: '/customer/help' }
 ]
 /** 侧栏同时服务首页与智能客服页，高亮必须由当前路由决定。 */
 function isActive(path?: string) { return Boolean(path && router.currentRoute.value.path === path) }
@@ -74,7 +74,7 @@ onBeforeUnmount(() => window.removeEventListener('click', closeContextMenu))
     <div class="prototype-brand"><span>🤖</span><strong>智能客服中心</strong></div>
     <section class="prototype-user-card"><div class="prototype-avatar">{{ user.name.slice(0, 1) }}</div><div><h2>{{ user.name }}</h2><p>{{ user.level }}</p></div><div class="prototype-points">积分 <b>{{ user.points }}</b></div></section>
     <nav class="prototype-nav"><button v-for="item in menuItems" :key="item.label" :class="{ active: isActive(item.path) }" @click="handleMenu(item)"><el-icon><component :is="item.icon" /></el-icon>{{ item.label }}</button></nav>
-    <section class="prototype-sessions"><div><h2>最近会话</h2><button @click="toggleAllSessions">{{ showAllSessions ? '收起' : '查看全部' }}</button></div><div :class="['prototype-session-list', { expanded: showAllSessions }]"><div v-for="session in sessions" :key="session.sessionId || session.time" class="prototype-session" :class="{ pinned: session.pinned }" @contextmenu.prevent="openContextMenu($event, session)"><button class="prototype-session-main" @click="openSession(session.sessionId)"><i>🤖</i><span><b>{{ session.pinned ? '📌 ' : '' }}{{ session.title }}</b><small>{{ session.desc }}</small></span><time>{{ session.time }}</time></button><button v-if="session.sessionId" class="prototype-session-more" :aria-label="`${session.title}更多操作`" @click.stop="openContextMenu($event, session)"><el-icon><MoreFilled /></el-icon></button></div></div></section>
+    <section class="prototype-sessions"><div><h2>最近会话</h2><button @click="toggleAllSessions">{{ showAllSessions ? '收起' : '查看全部' }}</button></div><div :class="['prototype-session-list', { expanded: showAllSessions }]"><div v-for="session in sessions" :key="session.sessionId || session.time" class="prototype-session" :class="{ pinned: session.pinned }" @contextmenu.prevent="openContextMenu($event, session)"><button class="prototype-session-main" @click="openSession(session.sessionId)"><i>🤖</i><span><b><svg v-if="session.pinned" class="prototype-session-pin" viewBox="0 0 16 16" role="img" aria-label="已置顶"><path d="M5.2 2.5h5.6l-1 3v1.6l1.7 1.7h-7l1.7-1.7V5.5l-1-3Z"/><path d="M8 8.8v4.7"/></svg><span>{{ session.title }}</span></b><small>{{ session.desc }}</small></span><time>{{ session.time }}</time></button><button v-if="session.sessionId" class="prototype-session-more" :aria-label="`${session.title}更多操作`" @click.stop="openContextMenu($event, session)"><el-icon><MoreFilled /></el-icon></button></div></div></section>
     <button class="prototype-contact" @click="emit('contactService')"><el-icon><Headset /></el-icon>联系客服</button>
     <div v-if="contextMenu" class="prototype-session-menu" :style="{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }" role="menu" @click.stop><button role="menuitem" @click="togglePinned(contextMenu.session)">{{ contextMenu.session.pinned ? '取消置顶' : '置顶会话' }}</button><button class="danger" role="menuitem" @click="deleteSession(contextMenu.session)">删除会话</button></div>
   </aside>

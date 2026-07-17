@@ -210,6 +210,57 @@ public class TicketService {
     }
 
     /**
+     * 为人工会话按需创建异步跟进工单。同一会话存在未关闭工单时直接返回原工单，避免重复建单。
+     *
+     * @param customerId 由 Agent 会话归属读取的客户 ID
+     * @param externalSessionNo Agent 会话编号，作为幂等业务键
+     * @param title 工单标题
+     * @param content 客户问题摘要
+     * @param priority 工单优先级
+     * @return 已存在或新创建的真实业务工单
+     */
+    @Transactional
+    public synchronized SupportTicket createHandoffFollowUp(
+            Long customerId,
+            String externalSessionNo,
+            String title,
+            String content,
+            String priority
+    ) {
+        if (customerId == null || externalSessionNo == null || externalSessionNo.isBlank()) {
+            throw new IllegalArgumentException("人工会话客户和会话编号不能为空");
+        }
+        List<SupportTicket> existing = jdbcTemplate.query(
+                """
+                SELECT * FROM support_ticket
+                WHERE external_session_no = ?
+                  AND status NOT IN ('CLOSED', 'CANCELLED', 'REJECTED')
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                ticketRowMapper,
+                externalSessionNo.trim()
+        );
+        if (!existing.isEmpty()) {
+            SupportTicket ticket = existing.get(0);
+            if (!customerId.equals(ticket.customerId())) {
+                throw new IllegalArgumentException("人工会话工单归属不一致");
+            }
+            return ticket;
+        }
+        SupportTicket draft = new SupportTicket(
+                null, null,
+                title == null || title.isBlank() ? "人工客服异步跟进" : title.trim(),
+                "人工跟进", priority == null || priority.isBlank() ? "medium" : priority.trim(),
+                customerId, null, null, externalSessionNo.trim(),
+                content == null || content.isBlank() ? "客户请求人工客服异步跟进" : content.trim(),
+                null, null, null, null, "customer-service", null, null,
+                null, null, null, null, null, "HUMAN_HANDOFF", 0, null, null, null, null
+        );
+        return createForCustomer(draft, customerId);
+    }
+
+    /**
      * 按工单号查询工单详情。
      *
      * @param ticketNo 工单编号

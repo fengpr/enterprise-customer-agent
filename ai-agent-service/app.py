@@ -1,3 +1,4 @@
+import asyncio
 import os
 import time
 import uuid
@@ -23,6 +24,7 @@ from services.runtime_protection import admission_controller, metrics
 from services.observability import HTTP_LATENCY, HTTP_REQUESTS, set_request_context
 from services.observability import current_context, tracer
 from services.stream_event_service import StreamEventService
+from services.staff_presence_service import StaffPresenceService
 from tools.order_tools import OrderTools
 from tools.ticket_tools import TicketTools
 
@@ -33,11 +35,13 @@ ticket_tools = TicketTools()
 chat_sessions = ChatSessionRepository()
 chat_messages = ChatMessageRepository(chat_sessions)
 evaluation_repository = EvaluationRepository()
+staff_presence = StaffPresenceService()
 agent_execution_service = AgentExecutionService(
     agent=agent,
     chat_sessions=chat_sessions,
     chat_messages=chat_messages,
     evaluation_repository=evaluation_repository,
+    staff_presence_checker=staff_presence.is_online,
 )
 agent_execution_queue = AgentExecutionQueue()
 stream_event_service = StreamEventService()
@@ -45,14 +49,31 @@ business_client = ResilientClient(downstream="java_business")
 identity_cache = AuthIdentityCache()
 BUSINESS_SERVICE_URL = os.getenv("BUSINESS_SERVICE_URL", "http://localhost:8081")
 AGENT_INTERNAL_SECRET = os.getenv("AGENT_INTERNAL_SECRET", "enterprise-customer-agent-demo-internal-secret")
-HUMAN_SERVICE_START = os.getenv("HUMAN_SERVICE_START", "09:00")
-HUMAN_SERVICE_END = os.getenv("HUMAN_SERVICE_END", "18:00")
+handoff_recovery_task: asyncio.Task | None = None
 
 
 @app.on_event("startup")
 def startup_checks() -> None:
     """服务启动时只检查外部依赖状态，禁止在线 API 进程承载评测 Worker。"""
     agent.rag.check_startup()
+
+
+@app.on_event("startup")
+async def start_handoff_recovery() -> None:
+    """启动失联坐席会话回收任务，避免活跃人工会话永久卡死。"""
+    global handoff_recovery_task
+    handoff_recovery_task = asyncio.create_task(_recover_stale_handoffs())
+
+
+@app.on_event("shutdown")
+async def stop_handoff_recovery() -> None:
+    """服务停止时取消后台回收任务，避免测试或热重载残留协程。"""
+    if handoff_recovery_task:
+        handoff_recovery_task.cancel()
+        try:
+            await handoff_recovery_task
+        except asyncio.CancelledError:
+            pass
 
 
 @app.middleware("http")
@@ -454,7 +475,7 @@ def online_evaluation_queue(authorization: str | None = Header(default=None)) ->
 def list_chat_sessions(limit: int = 50, authorization: str | None = Header(default=None)) -> list[dict]:
     """查询最近客服会话列表，供前端左侧会话队列展示。"""
     current_user_data = _current_login_user(authorization)
-    return chat_sessions.list_recent_for_customer(current_user_data["customer_id"], limit)
+    return [_customer_session_payload(session) for session in chat_sessions.list_recent_for_customer(current_user_data["customer_id"], limit)]
 
 
 @app.post("/api/chat/session")
@@ -462,19 +483,29 @@ def create_chat_session(payload: dict[str, Any] | None = None, authorization: st
     """显式创建一个新的客户会话，便于客户从空白上下文开始咨询。"""
     current_user_data = _current_login_user(authorization)
     title = str((payload or {}).get("title") or "新会话").strip() or "新会话"
-    return chat_sessions.create(current_user_data["customer_id"], title)
+    return _customer_session_payload(chat_sessions.create(current_user_data["customer_id"], title))
 
 
 @app.get("/api/chat/session/{session_id}")
-def get_chat_session(session_id: str, authorization: str | None = Header(default=None)) -> dict:
+def get_chat_session(
+    session_id: str,
+    after_message_id: int = 0,
+    authorization: str | None = Header(default=None),
+) -> dict:
     """查询会话详情和消息历史，供客服工作台展示完整上下文。"""
     current_user_data = _current_login_user(authorization)
     session = chat_sessions.get_by_session_no_for_customer(session_id, current_user_data["customer_id"])
     if not session:
         raise HTTPException(status_code=403, detail="无权访问该会话")
+    messages = chat_messages.list_by_session_for_customer(
+        session_id,
+        current_user_data["customer_id"],
+        after_message_id=max(0, after_message_id),
+    )
     return {
-        "session": session,
-        "messages": chat_messages.list_by_session_for_customer(session_id, current_user_data["customer_id"]),
+        "session": _customer_session_payload(session),
+        "messages": messages,
+        "latest_message_id": max((int(message["id"]) for message in messages), default=after_message_id),
     }
 
 
@@ -482,10 +513,30 @@ def get_chat_session(session_id: str, authorization: str | None = Header(default
 def delete_chat_session(session_id: str, authorization: str | None = Header(default=None)) -> dict:
     """软删除当前客户自己的会话，客户侧列表隐藏但保留工单审计上下文。"""
     current_user_data = _current_login_user(authorization)
+    session = chat_sessions.get_by_session_no_for_customer(session_id, current_user_data["customer_id"])
+    if session and session.get("handoff_status") in {"PENDING", "ACTIVE"}:
+        raise HTTPException(status_code=409, detail="请先取消待接入请求；已接入会话需由坐席结束后才能删除")
     deleted = chat_sessions.soft_delete_for_customer(session_id, current_user_data["customer_id"])
     if not deleted:
         raise HTTPException(status_code=404, detail="会话不存在或已删除")
     return {"status": "success", "session_id": session_id}
+
+
+@app.post("/api/chat/session/{session_id}/handoff/cancel")
+def cancel_customer_handoff(session_id: str, authorization: str | None = Header(default=None)) -> dict:
+    """允许客户取消尚未接入的人工排队请求，已接入会话只能由当前坐席结束。"""
+    current_user_data = _current_login_user(authorization)
+    session = chat_sessions.cancel_pending_handoff(session_id, current_user_data["customer_id"])
+    if not session:
+        raise HTTPException(status_code=409, detail="当前会话不在待接入状态，无法取消")
+    chat_messages.save(
+        session_no=session_id,
+        sender_type="system",
+        sender_id="handoff",
+        content="您已取消人工客服排队，可继续使用智能助手。",
+        extra_data={"message_source": "handoff_cancelled", "customer_visible": True},
+    )
+    return {"status": "success", "session": _customer_session_payload(session)}
 
 
 @app.patch("/api/chat/session/{session_id}/pin")
@@ -497,7 +548,7 @@ def pin_chat_session(session_id: str, payload: dict[str, Any] | None = None,
     session = chat_sessions.set_pinned_for_customer(session_id, current_user_data["customer_id"], pinned)
     if not session:
         raise HTTPException(status_code=404, detail="会话不存在或已删除")
-    return session
+    return _customer_session_payload(session)
 
 
 @app.get("/api/customer/tickets/{ticket_no}")
@@ -625,6 +676,22 @@ def send_staff_ticket_reply(
     return {"status": "success", "session_id": session_id, "message": saved_message}
 
 
+@app.post("/api/staff/presence/heartbeat")
+def heartbeat_staff_presence(authorization: str | None = Header(default=None)) -> dict:
+    """接收坐席工作台心跳，真实在线状态仅由短 TTL 保存。"""
+    staff_user = _require_staff_user(authorization)
+    online = staff_presence.heartbeat(str(staff_user.get("user_id")))
+    return {"online": online, "ttl_seconds": staff_presence.ttl_seconds}
+
+
+@app.delete("/api/staff/presence")
+def remove_staff_presence(authorization: str | None = Header(default=None)) -> dict:
+    """坐席主动离开工作台时立即清理在线标记。"""
+    staff_user = _require_staff_user(authorization)
+    staff_presence.remove(str(staff_user.get("user_id")))
+    return {"status": "success"}
+
+
 @app.get("/api/staff/handoff/sessions")
 def list_staff_handoff_sessions(
     limit: int = 50,
@@ -637,13 +704,19 @@ def list_staff_handoff_sessions(
 
 
 @app.get("/api/staff/handoff/sessions/{session_id}")
-def get_staff_handoff_session(session_id: str, authorization: str | None = Header(default=None)) -> dict:
+def get_staff_handoff_session(
+    session_id: str,
+    after_message_id: int = 0,
+    authorization: str | None = Header(default=None),
+) -> dict:
     """坐席查看人工会话详情和完整消息历史。"""
     staff_user = _require_staff_user(authorization)
     session = _get_staff_visible_handoff_session(session_id, staff_user)
+    messages = chat_messages.list_by_session(session_id, after_message_id=max(0, after_message_id))
     return {
         "session": _handoff_session_payload(session),
-        "messages": chat_messages.list_by_session(session_id),
+        "messages": messages,
+        "latest_message_id": max((int(message["id"]) for message in messages), default=after_message_id),
     }
 
 
@@ -651,6 +724,8 @@ def get_staff_handoff_session(session_id: str, authorization: str | None = Heade
 def accept_staff_handoff_session(session_id: str, authorization: str | None = Header(default=None)) -> dict:
     """坐席接入待处理人工会话，接入后客户消息不再由 Agent 自动回复。"""
     staff_user = _require_staff_user(authorization)
+    if not staff_presence.is_online(str(staff_user.get("user_id"))):
+        raise HTTPException(status_code=409, detail="坐席工作台心跳已失效，请刷新页面后重试")
     accepted = chat_sessions.accept_handoff(
         session_id,
         str(staff_user.get("user_id")),
@@ -694,7 +769,6 @@ def send_staff_handoff_reply(
             },
         },
     )
-    chat_sessions.update_status(session_id, "HUMAN_ACTIVE")
     return {"status": "success", "session_id": session_id, "message": saved_message}
 
 
@@ -706,10 +780,7 @@ def close_staff_handoff_session(
 ) -> dict:
     """坐席结束人工接管，可选择回到 AI 协助或直接关闭会话。"""
     staff_user = _require_staff_user(authorization)
-    target_status = str((payload or {}).get("status") or "HUMAN_CLOSED").strip() or "HUMAN_CLOSED"
-    if target_status not in {"HUMAN_CLOSED", "AI_ONLY"}:
-        raise HTTPException(status_code=400, detail="结束状态只能是 HUMAN_CLOSED 或 AI_ONLY")
-    closed = chat_sessions.close_handoff(session_id, str(staff_user.get("user_id")), target_status)
+    closed = chat_sessions.close_handoff(session_id, str(staff_user.get("user_id")), "CLOSED")
     if not closed:
         raise HTTPException(status_code=403, detail="只能结束自己已接入的人工会话")
     reason = str((payload or {}).get("message") or "").strip()
@@ -719,166 +790,81 @@ def close_staff_handoff_session(
         sender_type="system",
         sender_id="handoff",
         content=content,
-        extra_data={"message_source": "handoff_closed", "customer_visible": True, "target_status": target_status},
+        extra_data={"message_source": "handoff_closed", "customer_visible": True, "target_status": "AI_ONLY"},
     )
     return {"status": "success", "session": _handoff_session_payload(closed)}
 
 
-def _prepare_handoff_response(session_id: str) -> dict[str, Any]:
-    """创建人工接管请求，并根据工作时间和坐席容量生成客户可见话术。"""
-    availability = _load_human_availability()
-    if not availability["in_service_time"]:
-        chat_sessions.request_handoff(session_id, "off_hours")
-        return {
-            "status": "queued",
-            "reason": "off_hours",
-            "service_status": "已记录人工请求，等待工作时间处理",
-            "message": (
-                f"当前人工客服不在服务时间内，已为您记录人工服务请求。"
-                f"人工服务时间为 {HUMAN_SERVICE_START}-{HUMAN_SERVICE_END}，工作人员上线后会优先处理。"
-                "等待期间仍可继续使用智能助手咨询其他问题，也可以选择“人工客服”补充资料。"
-            ),
-            "availability": availability,
-        }
-
-    chat_sessions.request_handoff(session_id, "human_requested")
-    if availability["available_staff_count"] <= 0:
-        return {
-            "status": "queued",
-            "reason": "busy",
-            "service_status": "人工客服繁忙，已进入排队",
-            "message": (
-                "当前人工客服较忙，已为您进入人工排队。请您稍等，工作人员空闲后会接入处理。"
-                "等待期间仍可继续使用智能助手咨询其他问题，也可以选择“人工客服”补充资料。"
-            ),
-            "availability": availability,
-        }
-
-    return {
-        "status": "waiting",
-        "reason": "available",
-        "service_status": "等待人工客服接入",
-        "message": "已为您提交人工请求，请稍候，工作人员会继续跟进本次会话。等待期间仍可继续使用智能助手咨询其他问题。",
-        "availability": availability,
-    }
-
-
-def _save_manual_handoff_message(session_id: str, payload: AgentReplyRequest, session: dict[str, Any]) -> dict[str, Any]:
-    """保存客户发给人工的补充消息，避免人工通道劫持整个 AI 会话。"""
-    active = session.get("status") == "HUMAN_ACTIVE"
-    _ensure_handoff_exists(session_id, session, "manual_message")
-    chat_messages.save(
-        session_no=session_id,
-        sender_type="customer",
-        sender_id=str(payload.customer_id) if payload.customer_id else None,
-        content=payload.message,
-        extra_data={"route_target": "human", "message_source": "manual_handoff_customer_message"},
-    )
-    message = "您的补充内容已发送给当前人工客服。" if active else "您的补充内容已记录到人工服务请求中，客服接入后会一并查看。"
-    return _manual_session_ack(session_id, session, message)
-
-
-def _ensure_handoff_exists(session_id: str, session: dict[str, Any], reason: str) -> None:
-    """确保存在人工请求；已有挂起或接入中的人工服务时不重复创建。"""
-    if session.get("status") in {"HUMAN_PENDING", "HUMAN_ACTIVE"}:
-        return
-    chat_sessions.request_handoff(session_id, reason)
-
-
-def _load_human_availability() -> dict[str, Any]:
-    """聚合人工服务时间和坐席负载，只返回 Agent 决策所需的安全摘要。"""
-    in_service_time = _is_human_service_time()
-    staff_members = _load_staff_members_internal() if in_service_time else []
-    available_staff = []
-    for staff in staff_members:
-        staff_id = str(staff.get("userId"))
-        active_tickets = int(staff.get("activeTickets") or 0)
-        active_handoffs = chat_sessions.count_active_handoff_by_staff(staff_id)
-        max_active = int(staff.get("maxActiveTickets") or 0)
-        if staff.get("online") and staff.get("acceptingTickets") and active_tickets + active_handoffs < max_active:
-            available_staff.append(staff)
-    return {
-        "in_service_time": in_service_time,
-        "service_start": HUMAN_SERVICE_START,
-        "service_end": HUMAN_SERVICE_END,
-        "staff_count": len(staff_members),
-        "available_staff_count": len(available_staff),
-    }
-
-
-def _load_staff_members_internal() -> list[dict[str, Any]]:
-    """通过 Java 内部接口读取坐席聚合状态，避免客户 Token 越权访问坐席数据。"""
+@app.post("/api/staff/handoff/sessions/{session_id}/ticket")
+def create_staff_handoff_ticket(session_id: str, authorization: str | None = Header(default=None)) -> dict:
+    """由当前接入坐席按需创建异步跟进工单，客户身份与会话号只从后端会话读取。"""
+    staff_user = _require_staff_user(authorization)
+    session = _get_staff_owned_handoff_session(session_id, staff_user)
+    customer_messages = [
+        message["content"]
+        for message in chat_messages.list_by_session(session_id)
+        if message.get("sender_type") == "customer" and message.get("content")
+    ]
+    content = "\n".join(customer_messages[-5:])[-2000:] or "客户请求人工客服异步跟进"
     try:
         response = business_client.request_sync(
-            "GET",
-            f"{BUSINESS_SERVICE_URL}/api/internal/staff/availability",
+            "POST",
+            f"{BUSINESS_SERVICE_URL}/api/internal/tickets/handoff",
             headers={"X-Agent-Internal-Secret": AGENT_INTERNAL_SECRET},
+            json={
+                "customerId": session["customer_id"],
+                "externalSessionNo": session_id,
+                "title": session.get("title") or "人工客服异步跟进",
+                "content": content,
+                "priority": session.get("priority") or "medium",
+            },
         )
-        data = response.json()
-        members = data.get("members") if isinstance(data, dict) else data
-        return members if isinstance(members, list) else []
-    except (ResilienceError, ValueError):
-        # 坐席状态服务不可用时按繁忙排队处理，避免误导客户已经有人接入。
-        return []
+        ticket = response.json()
+        if ticket.get("ticketNo"):
+            chat_sessions.set_handoff_ticket(session_id, str(ticket["ticketNo"]))
+    except (ResilienceError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="业务工单服务暂时不可用，请稍后重试") from exc
+    return {"status": "success", "ticket": ticket}
 
 
-def _is_human_service_time() -> bool:
-    """判断当前是否处于人工服务时间，支持跨午夜时间段。"""
-    now_minutes = _time_to_minutes(datetime.now().strftime("%H:%M"))
-    start_minutes = _time_to_minutes(HUMAN_SERVICE_START)
-    end_minutes = _time_to_minutes(HUMAN_SERVICE_END)
-    if start_minutes <= end_minutes:
-        return start_minutes <= now_minutes < end_minutes
-    return now_minutes >= start_minutes or now_minutes < end_minutes
+async def _recover_stale_handoffs() -> None:
+    """每十五秒回收失联超过宽限期的坐席会话，并写入客户可见提示。"""
+    while True:
+        await asyncio.sleep(15)
+        for staff_id in chat_sessions.list_active_handoff_staff_ids():
+            if staff_presence.is_within_grace(staff_id):
+                continue
+            for session in chat_sessions.requeue_handoffs_for_staff(staff_id):
+                chat_messages.save(
+                    session_no=session["session_id"],
+                    sender_type="system",
+                    sender_id="handoff",
+                    content="当前人工客服已离线，您的会话已重新进入排队，我们会尽快安排其他客服接入。",
+                    extra_data={"message_source": "handoff_requeued", "customer_visible": True},
+                )
 
 
-def _time_to_minutes(value: str) -> int:
-    """把 HH:mm 配置转换为分钟，非法配置降级为 0 点。"""
-    try:
-        hour, minute = value.split(":", 1)
-        return int(hour) * 60 + int(minute)
-    except (ValueError, AttributeError):
-        return 0
-
-
-def _manual_session_ack(session_id: str, session: dict[str, Any], message: str | None = None) -> dict[str, Any]:
-    """人工队列中的客户补充消息只返回轻量确认，不再触发 AI 自动答复。"""
-    active = session.get("status") == "HUMAN_ACTIVE"
-    message = message or ("您的补充内容已发送给当前人工客服。" if active else "您的补充内容已记录到人工排队会话中，客服接入后会一并查看。")
-    return {
-        "session_id": session_id,
-        "answer": message,
-        "customer_message": message,
-        "internal_suggestion": None,
-        "decision_type": "human_takeover",
-        "service_status": "人工客服处理中" if active else "人工请求已挂起",
-        "auto_send": False,
-        "need_human": True,
-        "analysis": {
-            "intent": "consult",
-            "user_goal": "human_request",
-            "emotion": "normal",
-            "order_related": False,
-            "order_no": [],
-            "product_name": None,
-            "need_order_query": False,
-            "need_ticket": False,
-            "need_human": True,
-            "priority": "medium",
-            "confidence": 1.0,
-            "summary": "人工会话补充消息",
-            "risk_reasons": ["manual_handoff_active" if active else "manual_handoff_pending"],
-            "action_type": None,
-            "action_slots": {},
-            "missing_slots": [],
-            "next_action": "transfer_human",
-        },
-        "citations": [],
-        "tool_results": [],
-        "ticket_result": None,
-        "risk_reasons": ["manual_handoff_active" if active else "manual_handoff_pending"],
-        "pending_action_request": None,
+def _customer_session_payload(session: dict[str, Any]) -> dict[str, Any]:
+    """仅返回客户页面需要的会话字段，剔除 AI 摘要与内部判断信息。"""
+    allowed = {
+        "id", "session_id", "customer_id", "status", "handoff_status", "title",
+        "human_requested_at", "human_assigned_staff_name", "human_accepted_at",
+        "human_closed_at", "created_at", "updated_at", "pinned_at",
     }
+    return {key: value for key, value in session.items() if key in allowed}
+
+
+def _handoff_waiting_seconds(session: dict[str, Any]) -> int:
+    """计算人工排队等待秒数；时间格式异常时安全返回零。"""
+    value = session.get("human_requested_at")
+    if not value:
+        return 0
+    try:
+        requested_at = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        now = datetime.now(requested_at.tzinfo) if requested_at.tzinfo else datetime.utcnow()
+        return max(0, int((now - requested_at).total_seconds()))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _handoff_session_payload(session: dict[str, Any]) -> dict[str, Any]:
@@ -887,6 +873,8 @@ def _handoff_session_payload(session: dict[str, Any]) -> dict[str, Any]:
         "session_id": session["session_id"],
         "customer_id": session["customer_id"],
         "status": session["status"],
+        "session_status": session["status"],
+        "handoff_status": session.get("handoff_status") or "NONE",
         "title": session.get("title"),
         "intent": session.get("intent"),
         "emotion": session.get("emotion"),
@@ -897,7 +885,11 @@ def _handoff_session_payload(session: dict[str, Any]) -> dict[str, Any]:
         "human_assigned_staff_id": session.get("human_assigned_staff_id"),
         "human_assigned_staff_name": session.get("human_assigned_staff_name"),
         "human_accepted_at": session.get("human_accepted_at"),
+        "human_closed_at": session.get("human_closed_at"),
         "updated_at": session.get("updated_at"),
+        "waiting_seconds": _handoff_waiting_seconds(session),
+        "linked_ticket_no": chat_sessions.get_handoff_ticket(session["session_id"]),
+        "latest_message_id": chat_messages.latest_message_id(session["session_id"]),
     }
 
 
@@ -907,9 +899,9 @@ def _get_staff_visible_handoff_session(session_id: str, staff_user: dict[str, An
     staff_id = str(staff_user.get("user_id"))
     if not session or session.get("deleted_at"):
         raise HTTPException(status_code=404, detail="人工会话不存在")
-    if session.get("status") == "HUMAN_PENDING":
+    if session.get("handoff_status") == "PENDING":
         return session
-    if session.get("status") == "HUMAN_ACTIVE" and session.get("human_assigned_staff_id") == staff_id:
+    if session.get("handoff_status") == "ACTIVE" and session.get("human_assigned_staff_id") == staff_id:
         return session
     raise HTTPException(status_code=403, detail="无权访问该人工会话")
 
@@ -920,7 +912,7 @@ def _get_staff_owned_handoff_session(session_id: str, staff_user: dict[str, Any]
     staff_id = str(staff_user.get("user_id"))
     if (
         not session
-        or session.get("status") != "HUMAN_ACTIVE"
+        or session.get("handoff_status") != "ACTIVE"
         or session.get("human_assigned_staff_id") != staff_id
         or session.get("deleted_at")
     ):
@@ -1165,48 +1157,3 @@ def _cache_metric(cache_name: str) -> dict[str, Any]:
         "error": error,
         "hit_rate": round(hit / denominator, 4) if denominator else None,
     }
-
-
-def _get_or_create_session(payload: AgentReplyRequest) -> dict:
-    """按请求中的会话编号续接会话；没有会话编号时自动创建新会话。"""
-    if payload.session_id:
-        # 续接历史会话必须校验归属，避免用户伪造 session_id 向他人会话追加消息。
-        existing = chat_sessions.get_by_session_no_for_customer(payload.session_id, payload.customer_id)
-        if existing:
-            return existing
-        raise HTTPException(status_code=403, detail="无权访问该会话")
-    return chat_sessions.create(payload.customer_id, payload.message)
-
-
-def _latest_pending_action_request(session_id: str) -> dict[str, Any] | None:
-    """读取同一会话最近未完成的业务动作 pending，供下一轮用户补槽位。"""
-    messages = chat_messages.list_by_session(session_id)
-    for message in reversed(messages):
-        if message.get("sender_type") != "ai":
-            continue
-        pending = (message.get("extra_data") or {}).get("pending_action_request")
-        if not pending or pending.get("completed") or pending.get("status") in {"completed", "cancelled"}:
-            continue
-        return pending
-    return None
-
-
-def _resolve_session_status(agent_result: dict) -> str:
-    """根据 Agent 回复结果映射会话状态，保持前端列表状态可读。"""
-    if agent_result.get("handoff_result"):
-        return "HUMAN_PENDING"
-    ticket_result = agent_result.get("ticket_result") or {}
-    if ticket_result.get("status") == "success":
-        return "CREATED_TICKET"
-    decision_type = agent_result.get("decision_type")
-    if decision_type == "human_takeover":
-        return "HUMAN_PENDING"
-    if decision_type == "review_required":
-        return "AI_REVIEW"
-    if decision_type == "auto_reply":
-        return "AI_REPLIED"
-    if agent_result.get("need_human"):
-        return "HUMAN_PENDING"
-    if agent_result.get("auto_send"):
-        return "AI_ONLY"
-    return "AI_ONLY"
