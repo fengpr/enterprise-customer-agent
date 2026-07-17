@@ -484,15 +484,20 @@ def _query_or_urge_ticket_if_needed(
     """识别客户查工单进度或催办表达，优先走工单 Tool 而不是创建新工单。"""
     message = state["message"]
     context_ticket_no = _context_value(state, "last_ticket")
-    has_selected_ticket = bool(state.get("selected_ticket_no") or context_ticket_no)
-    selected_ticket_action = has_selected_ticket and not _is_logistics_query(message, "") and not _is_how_to_query(message) and any(
+    selected_ticket_no = state.get("selected_ticket_no")
+    # “订单状态”是显式的订单语义，不能被历史工单上下文抢占。
+    explicit_order_query = _is_order_status_query(message)
+    # 前端当前选中的工单可用于“查进度/催办”；历史工单仅能响应明确的工单指代。
+    context_ticket_reference = bool(context_ticket_no and _has_context_ticket_reference(message))
+    selected_ticket_action = bool(selected_ticket_no) and not explicit_order_query and not _is_logistics_query(message, "") and not _is_how_to_query(message) and any(
         word in message for word in ["催", "加急", "进度", "处理", "状态", "太慢", "怎么还没"]
     )
 
-    if not (_is_ticket_status_query(message) or _is_ticket_urge_query(message) or selected_ticket_action):
+    if not (_is_ticket_status_query(message) or _is_ticket_urge_query(message) or selected_ticket_action or context_ticket_reference):
         return None
 
-    ticket_no = _extract_ticket_no(message) or state.get("selected_ticket_no") or context_ticket_no
+    # 只有用户明确提到工单、前端当前选中工单或出现“这张工单”等指代时，才允许读取历史工单。
+    ticket_no = _extract_ticket_no(message) or selected_ticket_no or (context_ticket_no if context_ticket_reference else None)
     tool_results: list[dict[str, Any]] = []
     if not ticket_no:
         list_result = list_customer_tickets(state.get("auth_token"))
@@ -557,6 +562,21 @@ def _is_ticket_status_query(message: str) -> bool:
     """识别客户查询工单处理进度的表达。"""
     return (_extract_ticket_no(message) is not None or "工单" in message) and any(
         word in message for word in ["工单", "进度", "处理", "状态", "到哪"]
+    )
+
+
+def _is_order_status_query(message: str) -> bool:
+    """识别明确的订单状态表达，优先级高于任何历史工单上下文。"""
+    return any(word in message for word in ["订单", "订单号", "查订单"])
+
+
+def _has_context_ticket_reference(message: str) -> bool:
+    """仅在用户明确指代上一张工单时复用会话工单，避免普通“状态”误查旧工单。"""
+    if _is_order_status_query(message):
+        return False
+    ticket_references = ["这个工单", "这张工单", "该工单", "刚才的工单", "刚才那个工单"]
+    return any(reference in message for reference in ticket_references) and any(
+        word in message for word in ["进度", "处理", "状态", "到哪", "催", "加急"]
     )
 
 

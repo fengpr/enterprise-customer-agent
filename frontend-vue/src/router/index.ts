@@ -2,6 +2,9 @@ import { createRouter, createWebHistory } from 'vue-router'
 
 import { useAuthStore } from '@/stores/auth'
 import CustomerHome from '@/views/customer/CustomerHome.vue'
+import CustomerDashboard from '@/views/customer/CustomerDashboard.vue'
+import CustomerOrders from '@/views/customer/CustomerOrders.vue'
+import CustomerTickets from '@/views/customer/CustomerTickets.vue'
 import CustomerLogin from '@/views/customer/CustomerLogin.vue'
 import DispatcherHome from '@/views/dispatcher/DispatcherHome.vue'
 import DispatcherLogin from '@/views/dispatcher/DispatcherLogin.vue'
@@ -17,7 +20,11 @@ const router = createRouter({
   routes: [
     { path: '/', redirect: '/customer' },
     { path: '/customer/login', component: CustomerLogin, meta: { guest: true } },
-    { path: '/customer', component: CustomerHome, meta: { role: 'customer' } },
+    { path: '/customer', component: CustomerDashboard, meta: { role: 'customer' } },
+    { path: '/customer/orders', component: CustomerOrders, meta: { role: 'customer' } },
+    { path: '/customer/tickets', component: CustomerTickets, meta: { role: 'customer' } },
+    // 在线客服保留原有工作台，首页仅负责提供客户自助入口和信息概览。
+    { path: '/customer/service', component: CustomerHome, meta: { role: 'customer' } },
     { path: '/staff/login', component: StaffLogin, meta: { guest: true } },
     { path: '/staff', component: StaffHome, meta: { role: 'staff' } },
     { path: '/staff/rag-evaluation', component: RagEvaluation, meta: { role: 'staff' } },

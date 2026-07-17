@@ -11,11 +11,18 @@ public record OrderInfo(
         String orderNo,
         Long customerId,
         Long productId,
+        Integer quantity,
         String orderStatus,
         LocalDateTime payTime,
         LocalDateTime shipTime,
         LocalDateTime signTime,
         BigDecimal amount,
-        String afterSaleStatus
+        String afterSaleStatus,
+        String receiverName,
+        String receiverPhoneMasked,
+        String shippingAddress,
+        String paymentMethod,
+        String deliveryMethod,
+        BigDecimal freightAmount
 ) {
 }

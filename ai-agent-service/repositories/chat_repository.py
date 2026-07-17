@@ -44,7 +44,7 @@ class ChatSessionRepository:
                 SELECT id, session_no, customer_id, status, title, intent, emotion,
                        priority, ai_summary, human_requested_at, human_assigned_staff_id,
                        human_assigned_staff_name, human_accepted_at, human_closed_at,
-                       handoff_reason, created_at, updated_at, deleted_at
+                       handoff_reason, created_at, updated_at, deleted_at, pinned_at
                 FROM chat_session
                 WHERE session_no = ?
                 """,
@@ -67,7 +67,7 @@ class ChatSessionRepository:
                 SELECT id, session_no, customer_id, status, title, intent, emotion,
                        priority, ai_summary, human_requested_at, human_assigned_staff_id,
                        human_assigned_staff_name, human_accepted_at, human_closed_at,
-                       handoff_reason, created_at, updated_at, deleted_at
+                       handoff_reason, created_at, updated_at, deleted_at, pinned_at
                 FROM chat_session
                 WHERE id = ?
                 """,
@@ -85,10 +85,10 @@ class ChatSessionRepository:
                 SELECT id, session_no, customer_id, status, title, intent, emotion,
                        priority, ai_summary, human_requested_at, human_assigned_staff_id,
                        human_assigned_staff_name, human_accepted_at, human_closed_at,
-                       handoff_reason, created_at, updated_at, deleted_at
+                       handoff_reason, created_at, updated_at, deleted_at, pinned_at
                 FROM chat_session
                 WHERE deleted_at IS NULL
-                ORDER BY updated_at DESC, id DESC
+                ORDER BY pinned_at DESC NULLS LAST, updated_at DESC, id DESC
                 LIMIT ?
                 """,
                 (limit,),
@@ -103,10 +103,10 @@ class ChatSessionRepository:
                 SELECT id, session_no, customer_id, status, title, intent, emotion,
                        priority, ai_summary, human_requested_at, human_assigned_staff_id,
                        human_assigned_staff_name, human_accepted_at, human_closed_at,
-                       handoff_reason, created_at, updated_at, deleted_at
+                       handoff_reason, created_at, updated_at, deleted_at, pinned_at
                 FROM chat_session
                 WHERE customer_id = ? AND deleted_at IS NULL
-                ORDER BY updated_at DESC, id DESC
+                ORDER BY pinned_at DESC NULLS LAST, updated_at DESC, id DESC
                 LIMIT ?
                 """,
                 (customer_id, limit),
@@ -232,7 +232,7 @@ class ChatSessionRepository:
                 SELECT id, session_no, customer_id, status, title, intent, emotion,
                        priority, ai_summary, human_requested_at, human_assigned_staff_id,
                        human_assigned_staff_name, human_accepted_at, human_closed_at,
-                       handoff_reason, created_at, updated_at, deleted_at
+                       handoff_reason, created_at, updated_at, deleted_at, pinned_at
                 FROM chat_session
                 WHERE {condition} AND deleted_at IS NULL
                 ORDER BY
@@ -274,6 +274,20 @@ class ChatSessionRepository:
             )
         return cursor.rowcount > 0
 
+    def set_pinned_for_customer(self, session_no: str, customer_id: int, pinned: bool) -> dict[str, Any] | None:
+        """按客户归属更新会话置顶状态，置顶时间用于稳定排序且不会修改会话业务更新时间。"""
+        now = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE chat_session
+                SET pinned_at = ?
+                WHERE session_no = ? AND customer_id = ? AND deleted_at IS NULL
+                """,
+                (now if pinned else None, session_no, customer_id),
+            )
+        return self.get_by_session_no_for_customer(session_no, customer_id) if cursor.rowcount else None
+
     def _init_tables(self) -> None:
         """创建会话与消息表，确保服务首次启动即可持久化客服记录。"""
         with self._connect() as conn:
@@ -291,7 +305,8 @@ class ChatSessionRepository:
                     ai_summary TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    deleted_at TEXT
+                    deleted_at TEXT,
+                    pinned_at TEXT
                 )
                 """
             )
@@ -302,6 +317,7 @@ class ChatSessionRepository:
             self._ensure_column(conn, "chat_session", "human_accepted_at", "TEXT")
             self._ensure_column(conn, "chat_session", "human_closed_at", "TEXT")
             self._ensure_column(conn, "chat_session", "handoff_reason", "TEXT")
+            self._ensure_column(conn, "chat_session", "pinned_at", "TEXT")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS chat_message (
@@ -362,6 +378,7 @@ class ChatSessionRepository:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "deleted_at": row["deleted_at"],
+            "pinned_at": row["pinned_at"],
         }
 
 

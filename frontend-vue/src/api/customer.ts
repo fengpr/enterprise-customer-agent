@@ -1,5 +1,5 @@
 import { agentHttp } from './http'
-import type { AgentReply, AgentStatus, ChatSession, ChatSessionDetail, CustomerOrder, RouteTarget, Ticket } from '@/types/api'
+import type { AgentReply, AgentStatus, ChatSession, ChatSessionDetail, CustomerOrder, CustomerOrderDetail, CustomerOrderLogistics, RouteTarget, Ticket } from '@/types/api'
 
 export const customerApi = {
   async streamReply(
@@ -60,8 +60,17 @@ export const customerApi = {
   deleteSession(sessionId: string) {
     return agentHttp.delete<{ status: string; session_id: string }>(`/chat/session/${sessionId}`)
   },
+  setSessionPinned(sessionId: string, pinned: boolean) {
+    return agentHttp.patch<ChatSession>(`/chat/session/${sessionId}/pin`, { pinned })
+  },
   orders() {
     return agentHttp.get<CustomerOrder[]>('/customer/orders')
+  },
+  orderDetail(orderNo: string) {
+    return agentHttp.get<CustomerOrderDetail>(`/customer/orders/${encodeURIComponent(orderNo)}`)
+  },
+  orderLogistics(orderNo: string) {
+    return agentHttp.get<CustomerOrderLogistics>(`/customer/orders/${encodeURIComponent(orderNo)}/logistics`)
   },
   tickets() {
     return agentHttp.get<Ticket[]>('/customer/tickets')

@@ -12,6 +12,9 @@ def infer_user_goal(message: str, current_goal: str = "other") -> UserGoalValue:
         return "info_query"
     if is_human_request_message(message):
         return "human_request"
+    if is_order_statistics_message(message):
+        # 购买汇总属于真实数据查询，优先级高于“怎么查看”等泛操作指引判断。
+        return "info_query"
     if contains_any(message, ["投诉", "举报", "维权", "赔付", "赔偿", "差评"]):
         return "complaint"
     if contains_any(message, ["不给", "拒绝", "不处理", "太慢", "一直没", "扯皮"]):
@@ -201,7 +204,20 @@ def is_delivery_not_received_message(message: str) -> bool:
 
 def is_order_query_message(message: str) -> bool:
     """识别泛订单查询表达。"""
-    return contains_any(message, ["查询我的订单", "查我的订单", "我的订单", "查询订单", "查订单", "订单列表", "订单记录", "买过什么", "购买记录"])
+    return is_order_statistics_message(message) or contains_any(
+        message,
+        ["查询我的订单", "查我的订单", "我的订单", "查询订单", "查订单", "订单列表", "订单记录", "买过什么", "买了什么", "买了哪些", "购买记录"],
+    )
+
+
+def is_order_statistics_message(message: str) -> bool:
+    """识别需要查询真实订单并汇总件数、金额或商品清单的表达。"""
+    purchase_scope = contains_any(message, ["买了", "买过", "购买", "订单", "消费", "花费", "实付"])
+    aggregate_goal = contains_any(
+        message,
+        ["统计", "算一下", "哪些东西", "哪些商品", "买了什么", "买过什么", "买了哪些", "一共几件", "总共几件", "多少件", "一共多少", "总共多少", "总计", "合计", "花了多少", "花费多少", "消费多少"],
+    )
+    return purchase_scope and aggregate_goal
 
 
 def _has_business_keyword(message: str) -> bool:
@@ -211,6 +227,7 @@ def _has_business_keyword(message: str) -> bool:
         for checker in [
             is_logistics_message,
             is_order_query_message,
+            is_order_statistics_message,
             is_policy_consult_message,
             is_status_query_message,
             is_how_to_message,

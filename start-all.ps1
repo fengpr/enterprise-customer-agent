@@ -11,6 +11,10 @@ $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RedisUrl = "redis://127.0.0.1:6379/0"
 $agentDir = Join-Path $Root "ai-agent-service"
 $python = Join-Path $agentDir ".venv\Scripts\python.exe"
+$runtimeDir = Join-Path $Root ".runtime"
+$javaPidFile = Join-Path $runtimeDir "business-service.json"
+$javaLogFile = Join-Path $runtimeDir "business-service.log"
+$javaErrorLogFile = Join-Path $runtimeDir "business-service-error.log"
 
 function Test-PortOpen {
     param([int]$Port)
@@ -97,6 +101,103 @@ function Start-ServiceWindow {
     param([string]$Title, [string]$WorkingDirectory, [string]$Command)
     $script = "`$Host.UI.RawUI.WindowTitle = '$Title'; Set-Location '$WorkingDirectory'; $Command"
     Start-Process powershell.exe -ArgumentList "-NoExit", "-ExecutionPolicy", "Bypass", "-Command", $script -WorkingDirectory $WorkingDirectory -WindowStyle Normal
+}
+
+function Test-JavaHealthy {
+    # 通过 Actuator 健康接口确认业务服务真实可用，避免仅凭端口监听误判。
+    try {
+        $response = Invoke-WebRequest -Uri "http://127.0.0.1:8081/actuator/health" -UseBasicParsing -TimeoutSec 3
+        return $response.StatusCode -eq 200
+    } catch {
+        return $false
+    }
+}
+
+function Get-ManagedJavaProcess {
+    # 读取脚本创建的 Java 服务 PID；启动时间不一致时拒绝接管，避免 PID 复用误杀其他进程。
+    if (-not (Test-Path $javaPidFile)) {
+        return $null
+    }
+    try {
+        $metadata = Get-Content -Raw -Path $javaPidFile | ConvertFrom-Json
+        $process = Get-Process -Id ([int]$metadata.pid) -ErrorAction Stop
+        $recordedStartedAt = ([datetime]$metadata.started_at).ToUniversalTime()
+        $actualStartedAt = $process.StartTime.ToUniversalTime()
+        if ([math]::Abs(($actualStartedAt - $recordedStartedAt).TotalSeconds) -gt 1) {
+            Write-Warning "business-service PID 文件与当前进程启动时间不一致，已拒绝接管该进程。"
+            return $null
+        }
+        return [pscustomobject]@{ Process = $process; Metadata = $metadata }
+    } catch {
+        Remove-Item -Path $javaPidFile -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+}
+
+function Stop-ManagedJavaProcess {
+    # 停止由启动脚本创建的 Maven/Java 进程树，不处理未知的 8081 占用进程。
+    $managed = Get-ManagedJavaProcess
+    if (-not $managed) {
+        return $false
+    }
+    Write-Host "Stopping managed Java business-service (PID $($managed.Process.Id))..."
+    & taskkill.exe /PID $managed.Process.Id /T /F | Out-Null
+    Remove-Item -Path $javaPidFile -Force -ErrorAction SilentlyContinue
+    return $true
+}
+
+function Wait-JavaHealthy {
+    # 等待 Spring Boot 完成 Maven 编译、数据库初始化与 Actuator 就绪。
+    param([int]$TimeoutSeconds = 90)
+    for ($attempt = 0; $attempt -lt $TimeoutSeconds; $attempt++) {
+        if (Test-JavaHealthy) {
+            return $true
+        }
+        Start-Sleep -Seconds 1
+    }
+    return $false
+}
+
+function Start-ManagedJavaService {
+    # 启动并登记 Java 服务进程；失败时保留日志，供排查 Maven 或 Spring Boot 初始化错误。
+    if (Test-JavaHealthy) {
+        Write-Host "Java business-service is healthy on port 8081."
+        return $true
+    }
+    if (Test-PortOpen 8081) {
+        Write-Warning "Port 8081 is occupied but /actuator/health is unavailable. Refusing to replace an unmanaged process."
+        return $false
+    }
+    if (Get-ManagedJavaProcess) {
+        Stop-ManagedJavaProcess | Out-Null
+    }
+
+    New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
+    Remove-Item -Path $javaPidFile, $javaLogFile, $javaErrorLogFile -Force -ErrorAction SilentlyContinue
+    Write-Host "Starting managed Java business-service on port 8081..."
+    # 以 cmd /c 持有 Maven 父进程，关闭时使用 taskkill /T 能同时结束 Maven 与其 Java 子进程。
+    $process = Start-Process -FilePath "cmd.exe" -ArgumentList @("/d", "/c", "mvn spring-boot:run") `
+        -WorkingDirectory (Join-Path $Root "business-service") -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput $javaLogFile -RedirectStandardError $javaErrorLogFile
+    $metadata = [pscustomobject]@{
+        pid = $process.Id
+        started_at = $process.StartTime.ToUniversalTime().ToString("o")
+        command = "mvn spring-boot:run"
+        working_directory = (Join-Path $Root "business-service")
+    }
+    $metadata | ConvertTo-Json | Set-Content -Path $javaPidFile -Encoding UTF8
+
+    if (Wait-JavaHealthy 90) {
+        Write-Host "Java business-service is healthy (PID $($process.Id))."
+        return $true
+    }
+
+    Write-Warning "Java business-service did not become healthy within 90 seconds."
+    if (Test-Path $javaErrorLogFile) {
+        Write-Warning "Last Java error log lines:"
+        Get-Content -Path $javaErrorLogFile -Tail 30 -ErrorAction SilentlyContinue | ForEach-Object { Write-Warning $_ }
+    }
+    return $false
 }
 
 function Invoke-Docker {
@@ -219,14 +320,11 @@ if (-not $SkipDocker) {
     }
 }
 
-$javaReady = $SkipJava -or (Test-PortOpen 8081)
+$javaReady = $SkipJava -or (Test-JavaHealthy)
 if (-not $SkipJava -and -not $javaReady) {
-    Write-Host "Starting Java business-service on port 8081..."
-    Start-ServiceWindow "business-service :8081" (Join-Path $Root "business-service") "mvn spring-boot:run"
-    # Java 首次编译和 SQLite 初始化可能需要数秒；前端启动前必须等待业务接口可连接。
-    $javaReady = Wait-PortOpen 8081 60 "Java business-service"
+    $javaReady = Start-ManagedJavaService
 } elseif (-not $SkipJava) {
-    Write-Host "Java business-service is already listening on port 8081."
+    Write-Host "Java business-service is already healthy on port 8081."
 }
 
 $agentReady = $SkipAgent -or (Test-PortOpen 8000)

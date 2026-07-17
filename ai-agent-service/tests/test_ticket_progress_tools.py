@@ -86,6 +86,81 @@ class TicketProgressToolTest(unittest.TestCase):
         self.assertEqual(result["tool_results"][0]["query_type"], "ticket_urge")
         self.assertIsNone(result["ticket_result"])
 
+    def test_order_status_does_not_reuse_historical_ticket_context(self):
+        """明确查询订单状态时，历史工单不能抢占为工单状态查询。"""
+        calls: dict[str, list[str]] = {"order": [], "customer_orders": [], "ticket": []}
+        analysis = IntentResult(
+            intent="consult",
+            user_goal="status_query",
+            emotion="normal",
+            order_related=True,
+            order_no=[],
+            product_name=None,
+            need_order_query=True,
+            need_ticket=False,
+            need_human=False,
+            priority="medium",
+            confidence=0.95,
+            summary="客户查询订单状态",
+            risk_reasons=[],
+        )
+
+        def query_order(order_no, auth_token):
+            calls["order"].append(order_no)
+            return {
+                "status": "success",
+                "query_type": "order_detail",
+                "data": {"orderNo": order_no, "orderStatus": "PAID"},
+            }
+
+        def query_ticket_status(ticket_no, auth_token):
+            calls["ticket"].append(ticket_no)
+            return {"status": "success", "query_type": "ticket_status", "data": {"ticketNo": ticket_no}}
+
+        graph = build_ticket_process_graph(
+            analyzer_chain=RunnableLambda(lambda _: analysis),
+            retrieve_knowledge=lambda *args, **kwargs: [],
+            query_order=query_order,
+            query_customer_orders=lambda customer_id, auth_token: (
+                calls["customer_orders"].append(str(customer_id)) or {"status": "success", "data": []}
+            ),
+            query_order_logistics=lambda order_no, auth_token: {"status": "empty"},
+            create_ticket=lambda payload, auth_token: {"status": "failed"},
+            auto_assign_ticket=lambda ticket_no: {"status": "failed"},
+            list_customer_tickets=lambda auth_token: {"status": "success", "data": []},
+            query_ticket_status=query_ticket_status,
+            urge_ticket=lambda ticket_no, reason, auth_token: {"status": "empty"},
+            prepare_action=lambda state: {"analysis": state["analysis"]},
+            compose_answer=lambda state: "ok",
+            log_tool_call=lambda tool_name, input_data, output_data: None,
+        )
+
+        graph.invoke(
+            {
+                "message": "查询订单状态",
+                "selected_order_no": "EC202606220001",
+                "conversation_context": {"last_ticket": {"value": "T2026070822211522600"}},
+                "tool_results": [],
+                "citations": [],
+            }
+        )
+
+        self.assertEqual(calls["order"], ["EC202606220001"])
+        self.assertEqual(calls["ticket"], [])
+
+        # 未选中订单时也只能查询客户订单列表或追问，不能退化为历史工单状态。
+        graph.invoke(
+            {
+                "message": "查询订单状态",
+                "customer_id": "customer-001",
+                "conversation_context": {"last_ticket": {"value": "T2026070822211522600"}},
+                "tool_results": [],
+                "citations": [],
+            }
+        )
+        self.assertEqual(calls["customer_orders"], ["customer-001"])
+        self.assertEqual(calls["ticket"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

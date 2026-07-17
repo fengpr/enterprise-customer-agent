@@ -41,7 +41,7 @@ function productVisual(name?: string | null) {
     <el-skeleton v-if="!collapsed && loading" :rows="3" animated />
     <div v-else-if="!collapsed" class="order-card-grid">
       <article
-        v-for="order in orders.slice(0, 3)"
+        v-for="order in orders"
         :key="order.orderNo"
         :class="['modern-order-card', { active: order.orderNo === selectedOrderNo }]"
         role="button"

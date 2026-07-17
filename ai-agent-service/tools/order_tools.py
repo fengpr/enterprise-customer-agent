@@ -28,6 +28,24 @@ class OrderTools:
         except ResilienceError as exc:
             return self._failure("order_detail", exc, order_no=order_no)
 
+    def query_order_detail(self, order_no: str, auth_token: str | None = None) -> dict:
+        """查询客户订单页详情，返回已由 Java 鉴权后的收货、支付和配送字段。"""
+        if not order_no:
+            return {"status": "failed", "error": "order_no is required"}
+        try:
+            key = self.cache.key("order-page-detail", customer=self._customer_key(auth_token), order_no=order_no)
+            data = self.cache.get_or_load(
+                key,
+                int(os.getenv("ORDER_CACHE_TTL_SECONDS", "60")),
+                lambda: self.client.request_sync(
+                    "GET", f"{self.base_url}/api/orders/{order_no}/detail", headers=self._headers(auth_token)
+                ).json(),
+                metric="order_cache_hit",
+            )
+            return {"status": "empty", "order_no": order_no} if not data else {"status": "success", "order_no": order_no, "data": data}
+        except ResilienceError as exc:
+            return self._failure("order_page_detail", exc, order_no=order_no)
+
     def query_customer_orders(self, customer_id: int | str | None, auth_token: str | None = None) -> dict:
         """查询当前客户订单列表，不允许 Agent 直连业务数据库。"""
         if customer_id is None or str(customer_id).strip() == "":

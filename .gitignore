@@ -13,6 +13,10 @@ ai-agent-service/.idea/
 !*.env.example
 ai-agent-service/.env
 
+# 微调训练产物和隔离训练环境，Adapter 与日志通过受控制品存储分发
+ai-agent-service/artifacts/intent_sft/
+ai-agent-service/training/.venv/
+
 # Java 构建产物
 business-service/target/
 
@@ -26,3 +30,6 @@ frontend-vue/.vite/
 ai-agent-service/data/
 business-service/data/*
 !business-service/data/.gitkeep
+
+# 本地受管服务的 PID 与日志
+/.runtime/

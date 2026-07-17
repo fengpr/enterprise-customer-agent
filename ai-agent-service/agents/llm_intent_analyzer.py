@@ -5,7 +5,7 @@ import re
 from dotenv import load_dotenv
 from langchain_core.prompts import ChatPromptTemplate
 
-from agents.intent_normalizer import infer_user_goal
+from agents.intent_normalizer import infer_user_goal, is_order_query_message, is_order_statistics_message
 from schemas.intent_schema import IntentResult, LLMIntentDraft
 from services.resilient_client import ResilientInvoker
 
@@ -188,6 +188,7 @@ need_human, priority, confidence, summary, risk_reasons, action_type, action_slo
 19. 槽位命名使用通用字段：order_no, product_name, description, after_sale_reason, return_method, pickup_time_window, fault_description, invoice_title, invoice_type, tax_no, evidence_hint。
 20. 退货时必须从整条消息一次提取全部已提供信息：原因写入 after_sale_reason；“上门取件”写 return_method=pickup；“自行寄回/自己寄回”写 return_method=self_ship；客户提供的取件时间只截取时间短语写入 pickup_time_window。
 21. “商品有问题、用不上了、不合适、不喜欢”等可以作为 after_sale_reason，但单独出现时不代表客户已经授权创建退货工单；是否执行由后端状态机判断。
+22. “最近买了什么、一共几件、总计花费多少、统计本月消费”等购买汇总问题用 user_goal=info_query、order_related=true、need_order_query=true，不要归为 how_to，也不要让客户自行统计。
 22. 信息不全时 next_action=collect_slots；信息齐全时可以建议 create_ticket，但最终是否查单或建单只能由后端确定性规则决定。
 
 JSON 示例：
@@ -281,19 +282,26 @@ JSON 示例：
             if item not in order_no:
                 order_no.append(item)
 
-        order_related = draft.order_related or bool(order_no) or draft.intent in {
+        order_related = draft.order_related or bool(order_no) or is_order_query_message(message) or draft.intent in {
             "logistics",
             "refund",
             "exchange",
             "repair",
         }
         user_goal = self._infer_user_goal(message, draft.user_goal)
+        statistics_query = is_order_statistics_message(message)
+        if statistics_query:
+            # 统计类问题必须查询客户真实订单，不能沿用模型可能给出的操作指引分类。
+            user_goal = "info_query"
+            order_related = True
         need_order_query = draft.need_order_query
         if need_order_query is None:
             need_order_query = order_related
         if user_goal in {"policy_consult", "how_to"}:
             # 规则咨询和操作步骤咨询优先回答方法，不要求客户先补充订单号。
             need_order_query = False
+        elif statistics_query:
+            need_order_query = True
 
         need_human = draft.need_human
         priority = draft.priority
@@ -311,10 +319,12 @@ JSON 示例：
             if "refund_commitment" in risk_reasons:
                 risk_reasons.remove("refund_commitment")
 
-        if draft.confidence < 0.7 and user_goal not in {"out_of_scope"}:
+        if draft.confidence < 0.7 and user_goal not in {"out_of_scope"} and not statistics_query:
             need_human = True
             if "low_confidence" not in risk_reasons:
                 risk_reasons.append("low_confidence")
+        if statistics_query and "low_confidence" in risk_reasons:
+            risk_reasons.remove("low_confidence")
 
         need_ticket = draft.need_ticket
         if need_ticket is None:

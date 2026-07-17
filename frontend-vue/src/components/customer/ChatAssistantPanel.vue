@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { Connection, Headset, Link, Message, Position, Refresh, Service, Tickets } from '@element-plus/icons-vue'
+import { Connection, DocumentCopy, Headset, Link, Message, Position, Refresh, Service, Tickets } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
 import DOMPurify from 'dompurify'
 import MarkdownIt from 'markdown-it'
 import { computed, nextTick, ref, watch } from 'vue'
@@ -22,6 +23,7 @@ const emit = defineEmits<{
   'continue-ai': []
   submit: []
   quick: [action: string]
+  regenerate: [message: string]
 }>()
 
 const chatWindowRef = ref<HTMLElement | null>(null)
@@ -198,6 +200,44 @@ function messageClass(message: ChatMessage) {
   return 'from-agent'
 }
 
+/** 找到该 AI 回复之前的客户问题，用于通过现有受鉴权的回复链路重新生成。 */
+function regeneratePrompt(message: ChatMessage) {
+  const index = props.messages.findIndex((item) => item.id === message.id)
+  for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+    const candidate = props.messages[cursor]
+    if (candidate.sender_type === 'customer' && candidate.extra_data?.route_target !== 'human') return candidate.content
+  }
+  return ''
+}
+
+/** 复制客户可见的原始消息文本；Markdown 渲染结果不参与复制，避免混入页面结构。 */
+async function copyMessage(content: string) {
+  const text = String(content || '').trim()
+  if (!text) {
+    ElMessage.warning('暂无可复制内容')
+    return
+  }
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+    } else {
+      // HTTP 或受限浏览器无法使用 Clipboard API 时，使用临时文本框完成兼容复制。
+      const textarea = document.createElement('textarea')
+      textarea.value = text
+      textarea.setAttribute('readonly', '')
+      textarea.style.cssText = 'position:fixed;opacity:0;pointer-events:none;'
+      document.body.appendChild(textarea)
+      textarea.select()
+      const copied = document.execCommand('copy')
+      document.body.removeChild(textarea)
+      if (!copied) throw new Error('copy_failed')
+    }
+    ElMessage.success('已复制到剪贴板')
+  } catch {
+    ElMessage.error('复制失败，请手动选择文本复制')
+  }
+}
+
 function handleInputKeydown(event: KeyboardEvent) {
   if (event.key !== 'Enter' || event.shiftKey || event.isComposing || isComposing.value) return
   event.preventDefault()
@@ -322,6 +362,14 @@ watch(
                 <p v-if="entry.message.sender_type === 'customer'">{{ entry.message.content }}</p>
                 <div v-else class="message-markdown" v-html="renderMessageMarkdown(entry.message.content)" />
               </div>
+              <div class="message-bubble-actions">
+                <el-tooltip content="复制" placement="bottom">
+                  <el-button class="message-copy-action" text circle size="small" :icon="DocumentCopy" aria-label="复制消息" @click="copyMessage(entry.message.content)" />
+                </el-tooltip>
+                <el-tooltip v-if="entry.message.sender_type === 'ai'" content="重新生成" placement="bottom">
+                  <el-button class="message-regenerate-action" text circle size="small" :icon="Refresh" aria-label="重新生成回复" :disabled="submitting || !regeneratePrompt(entry.message)" @click="emit('regenerate', regeneratePrompt(entry.message))" />
+                </el-tooltip>
+              </div>
             </div>
           </div>
         </template>
@@ -334,6 +382,7 @@ watch(
               您好，我可以帮您咨询售后规则、发票、会员权益或转人工服务；如需查询物流或申请退货退款，请先选择对应订单。
             </p>
           </div>
+          <div class="message-bubble-actions"><el-tooltip content="复制" placement="bottom"><el-button class="message-copy-action" text circle size="small" :icon="DocumentCopy" aria-label="复制消息" @click="copyMessage('您好，我可以帮您咨询售后规则、发票、会员权益或转人工服务；如需查询物流或申请退货退款，请先选择对应订单。')" /></el-tooltip></div>
         </div>
       </div>
       <div v-else class="chat-message from-staff">
@@ -342,6 +391,7 @@ watch(
           <div class="chat-bubble">
             <p>人工客服会话已单独展示。您可以在下方补充信息，客服接入后会在这里回复。</p>
           </div>
+          <div class="message-bubble-actions"><el-tooltip content="复制" placement="bottom"><el-button class="message-copy-action" text circle size="small" :icon="DocumentCopy" aria-label="复制消息" @click="copyMessage('人工客服会话已单独展示。您可以在下方补充信息，客服接入后会在这里回复。')" /></el-tooltip></div>
         </div>
       </div>
       <div v-if="lastReply && activeTab === 'ai'" class="chat-message from-agent">
@@ -350,6 +400,8 @@ watch(
           <div class="chat-bubble">
             <div class="message-markdown" v-html="renderMessageMarkdown(lastReply.customer_message || lastReply.answer)" />
           </div>
+          <!-- 流式回复仅用于展示生成进度；在请求完成并落库前不提供复制，避免复制临时状态文案。 -->
+          <div v-if="!submitting" class="message-bubble-actions"><el-tooltip content="复制" placement="bottom"><el-button class="message-copy-action" text circle size="small" :icon="DocumentCopy" aria-label="复制消息" @click="copyMessage(lastReply.customer_message || lastReply.answer)" /></el-tooltip></div>
         </div>
       </div>
     </div>

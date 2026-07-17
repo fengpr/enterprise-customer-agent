@@ -13,6 +13,7 @@ public record OrderView(
         Long productId,
         String productName,
         String productCategory,
+        Integer quantity,
         Integer warrantyDays,
         Boolean returnable,
         String orderStatus,

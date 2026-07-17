@@ -377,7 +377,7 @@ textarea {
 .customer-service-page {
   min-height: 100vh;
   display: grid;
-  grid-template-columns: 300px minmax(0, 1fr);
+  grid-template-columns: 280px minmax(0, 1fr);
   background:
     radial-gradient(circle at 55% 0%, rgba(64, 158, 255, 0.1), transparent 34%),
     #f4f7fb;
@@ -694,9 +694,29 @@ textarea {
 
 .order-card-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-auto-columns: calc((100% - 20px) / 3);
+  grid-auto-flow: column;
   gap: 10px;
   margin-top: 8px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 8px;
+  scrollbar-gutter: stable;
+  scroll-snap-type: x proximity;
+}
+
+.order-card-grid::-webkit-scrollbar {
+  height: 7px;
+}
+
+.order-card-grid::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: #a9bdd8;
+}
+
+.order-card-grid::-webkit-scrollbar-track {
+  border-radius: 999px;
+  background: #edf2f8;
 }
 
 .modern-order-card {
@@ -720,6 +740,7 @@ textarea {
     background 0.18s ease,
     box-shadow 0.18s ease,
     transform 0.18s ease;
+  scroll-snap-align: start;
 }
 
 .modern-order-card.active {
@@ -912,6 +933,26 @@ textarea {
   top: 12px;
   right: 10px;
 }
+
+.sidebar-link { padding: 0; border: 0; background: transparent; color: #075df5; font-weight: 700; cursor: pointer; }
+.sidebar-empty { margin: 16px 0 0; color: #94a3b8; font-size: 13px; }
+
+/* 首页使用网格组织信息，避免为原型还原引入难维护的绝对定位。 */
+.dashboard-main { overflow-y: auto; background: #f6f9fd; }
+.dashboard-layout { display: grid; grid-template-columns: minmax(0, 1fr) 278px; gap: 16px; align-items: start; }
+.dashboard-content, .dashboard-side { min-width: 0; display: grid; gap: 12px; }
+.dashboard-card { border: 1px solid #e1eaf5; border-radius: 14px; background: #fff; box-shadow: 0 8px 28px rgba(32, 73, 124, .06); }
+.dashboard-error { margin-bottom: 12px; padding: 10px 14px; border-radius: 10px; color: #9a3412; background: #fff7ed; }
+.welcome-card { min-height: 180px; display: flex; justify-content: space-between; gap: 20px; padding: 24px 26px; overflow: hidden; background: linear-gradient(115deg, #f7fbff, #e5f1ff); }
+.welcome-card h2 { margin: 0; color: #102243; font-size: 25px; }.welcome-card p { margin: 8px 0 0; color: #60718c; font-size: 14px; }
+.welcome-stats { display: flex; gap: 28px; margin-top: 22px; }.welcome-stats span { display: grid; gap: 4px; }.welcome-stats i { color: #71829a; font-size: 12px; font-style: normal; }.welcome-stats b { color: #102243; font-size: 14px; }
+.welcome-art { position: relative; width: 220px; flex: 0 0 220px; color: #3b82f6; }.welcome-art .el-icon { position: absolute; right: 36px; top: 24px; font-size: 78px; opacity: .88; }.welcome-art .el-icon + .el-icon { right: 0; top: 54px; font-size: 100px; color: #60a5fa; opacity: .32; }.welcome-art span { position: absolute; right: 8px; top: 6px; width: 100px; height: 100px; border: 2px solid #bfdbfe; border-radius: 24px; transform: rotate(20deg); }
+.entry-grid, .metrics-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.entry-card { min-height: 116px; display: flex; gap: 13px; padding: 18px; border-color: #e6edf6; color: #17233b; text-align: left; cursor: pointer; transition: .18s ease; }.entry-card > .el-icon { flex: 0 0 42px; height: 42px; border-radius: 12px; color: #2563eb; background: #eaf3ff; font-size: 24px; }.entry-card:nth-child(2) > .el-icon { color: #20b65a; background: #e9fbf0; }.entry-card:nth-child(3) > .el-icon { color: #7c3aed; background: #f2ebff; }.entry-card:nth-child(4) > .el-icon { color: #f59e0b; background: #fff4df; }.entry-card strong { display: block; font-size: 16px; }.entry-card p { margin: 6px 0; color: #718096; font-size: 13px; }.entry-card em { color: #2672ff; font-size: 13px; font-style: normal; }.entry-card:hover, .entry-card:focus-visible { border-color: #a5c8ff; box-shadow: 0 12px 24px rgba(37, 99, 235, .12); outline: 2px solid transparent; transform: translateY(-2px); }
+.metric { min-height: 112px; padding: 17px 18px; }.metric .el-icon { float: right; padding: 10px; border-radius: 12px; color: #3b82f6; background: #eaf3ff; font-size: 22px; }.metric span, .metric small { display: block; color: #718096; font-size: 13px; }.metric strong { display: block; margin: 6px 0; color: #14213b; font-size: 26px; }.metric small { font-size: 12px; }
+.details-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }.detail-card { min-height: 245px; padding: 14px; }.detail-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }.detail-head h2, .quick-services h2, .side-card h2 { margin: 0; color: #17233b; font-size: 16px; }.detail-head button { border: 0; background: transparent; color: #2672ff; cursor: pointer; }.order-row, .ticket-row { width: 100%; display: grid; align-items: center; border: 0; border-top: 1px solid #edf2f7; background: transparent; color: #34445e; text-align: left; cursor: pointer; }.order-row { grid-template-columns: 38px minmax(0, 1fr) auto; gap: 9px; padding: 10px 2px; }.order-row span { min-width: 0; }.product-placeholder { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 8px; background: #f2f6fb; }.order-row b, .order-row small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.order-row small { margin-top: 3px; color: #8190a5; font-size: 11px; }.ticket-row { grid-template-columns: minmax(75px, 1.4fr) minmax(52px, .8fr) 56px 72px; gap: 6px; padding: 11px 3px; font-size: 12px; }.ticket-row b { overflow: hidden; color: #2672ff; text-overflow: ellipsis; white-space: nowrap; }.ticket-row em { padding: 3px 4px; border-radius: 4px; color: #d97706; background: #fff7e8; font-style: normal; }.ticket-row time { color: #718096; }.order-row:hover, .ticket-row:hover { background: #f5f9ff; }
+.quick-services { display: grid; grid-template-columns: 1fr repeat(5, minmax(0, 1fr)); gap: 12px; align-items: center; padding: 14px 16px; }.quick-services button { display: flex; justify-content: center; align-items: center; gap: 7px; min-height: 42px; border: 1px solid #edf1f6; border-radius: 9px; color: #465976; background: #fafcff; cursor: pointer; }.quick-services button:hover { color: #2563eb; border-color: #bfdbfe; background: #eff6ff; }
+.side-card { padding: 15px; }.side-card h2 { margin-bottom: 10px; }.side-card > button:not(.activity) { width: 100%; display: grid; grid-template-columns: minmax(0, 1fr) 24px auto; gap: 6px; align-items: center; padding: 11px 4px; border: 0; border-top: 1px solid #edf2f7; color: #465976; background: transparent; text-align: left; cursor: pointer; }.side-card > button b { text-align: center; color: #2563eb; }.side-card > button i { color: #2672ff; font-size: 12px; font-style: normal; }.activity { width: 100%; display: grid; gap: 3px; padding: 10px 0 10px 14px; border: 0; border-left: 2px solid #bfdbfe; background: transparent; text-align: left; cursor: pointer; }.activity time { color: #718096; font-size: 12px; }.activity b { color: #41526d; font-size: 13px; }.activity p { margin: 0; color: #718096; font-size: 12px; line-height: 1.5; }.loading-state, .empty-state { display: grid; min-height: 160px; place-items: center; color: #8291a6; font-size: 14px; }
 
 .ticket-refresh-state {
   display: inline-flex;
@@ -1201,6 +1242,35 @@ textarea {
   color: #0f2a4a;
   background: #d8eaff;
   border-color: #bfdbfe;
+}
+
+/* 聊天气泡下方保留低干扰的复制入口，用户消息与客服消息分别贴齐各自气泡。 */
+.message-bubble-actions {
+  align-self: flex-start;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-top: 1px;
+}
+
+.message-copy-action,
+.message-regenerate-action {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  color: #718096;
+  font-size: 12px;
+}
+
+.message-copy-action:hover,
+.message-copy-action:focus-visible,
+.message-regenerate-action:hover,
+.message-regenerate-action:focus-visible {
+  color: #1766ed;
+}
+
+.from-user .message-bubble-actions {
+  align-self: flex-end;
 }
 
 .from-staff .chat-bubble {
@@ -1502,6 +1572,7 @@ textarea {
   .progress-panel {
     min-height: auto;
   }
+  .dashboard-layout { grid-template-columns: 1fr; }.dashboard-side { grid-template-columns: repeat(3, minmax(0, 1fr)); }.welcome-art { display: none; }
 }
 
 @media (max-width: 900px) {
@@ -1527,4 +1598,161 @@ textarea {
   .order-card-grid {
     grid-template-columns: 1fr;
   }
+  .entry-grid, .metrics-grid, .details-grid, .dashboard-side { grid-template-columns: repeat(2, minmax(0, 1fr)); }.quick-services { grid-template-columns: repeat(2, minmax(0, 1fr)); }.quick-services h2 { grid-column: 1 / -1; }.welcome-stats { flex-wrap: wrap; gap: 14px 24px; }
 }
+
+@media (max-width: 620px) { .entry-grid, .metrics-grid, .details-grid, .dashboard-side { grid-template-columns: 1fr; }.ticket-row { grid-template-columns: 1fr 56px; }.ticket-row span, .ticket-row time { display: none; }.dashboard-main { padding: 16px; }.welcome-card { padding: 18px; }.welcome-card h2 { font-size: 21px; } }
+
+/* 客户首页原型：固定桌面信息密度，缩窄窗口时再逐级折叠。 */
+.prototype-home { min-height: 100vh; display: grid; grid-template-columns: 280px minmax(0, 1fr); color: #17213a; background: #f6f9fe; }
+.prototype-sidebar { min-height: 100vh; display: flex; flex-direction: column; background: #fff; border-right: 1px solid #e5edf7; }.prototype-brand { height: 88px; display: flex; align-items: center; gap: 12px; padding: 0 18px; color: #fff; background: linear-gradient(120deg, #061a3b, #03235a); font-size: 24px; }.prototype-brand span { display: grid; place-items: center; width: 40px; height: 40px; border-radius: 50%; background: #eef4ff; font-size: 23px; }.prototype-user-card { display: grid; grid-template-columns: 58px 1fr; gap: 12px; margin: 18px; padding: 20px; border-radius: 16px; background: #fff; box-shadow: 0 12px 30px rgba(34, 66, 116, .1); }.prototype-avatar { display: grid; place-items: center; width: 56px; height: 56px; border-radius: 50%; color: #1766ed; background: #eaf2ff; font-size: 22px; font-weight: 800; }.prototype-user-card h2 { margin: 4px 0 3px; font-size: 17px; }.prototype-user-card p { margin: 0; color: #75839a; font-size: 13px; }.prototype-points { grid-column: 1/-1; padding: 10px 12px; border-radius: 9px; color: #71809a; background: #f5f8fd; }.prototype-points b { color: #1766ed; }.prototype-nav { display: grid; gap: 8px; padding: 0 17px; }.prototype-nav button { height: 48px; display: flex; align-items: center; gap: 14px; border: 0; border-radius: 9px; color: #263550; background: transparent; font-weight: 700; text-align: left; cursor: pointer; }.prototype-nav button.active { color: #1265f4; background: #e8f1ff; }.prototype-sessions { margin: 28px 17px 0; padding-top: 20px; border-top: 1px solid #e7edf5; }.prototype-sessions > div { display: flex; justify-content: space-between; align-items: center; }.prototype-sessions h2 { margin: 0; font-size: 15px; }.prototype-sessions > div button, .prototype-sessions button { border: 0; background: transparent; cursor: pointer; }.prototype-sessions > div button { color: #1766ed; font-weight: 700; }.prototype-session { width: 100%; display: grid; grid-template-columns: 34px minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 13px 0; color: #263550; text-align: left; }.prototype-session i { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 50%; background: #eef4ff; font-style: normal; font-size: 16px; }.prototype-session b, .prototype-session small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.prototype-session b { font-size: 13px; }.prototype-session small, .prototype-session time { color: #8290a6; font-size: 11px; }.prototype-contact { height: 48px; display: flex; align-items: center; justify-content: center; gap: 10px; margin: auto 17px 48px; border: 1px solid #c9ddff; border-radius: 9px; color: #1766ed; background: #fff; font-weight: 700; cursor: pointer; }
+.prototype-main { min-width: 0; padding: 22px 26px 30px; overflow: auto; }.prototype-header { display: flex; justify-content: space-between; gap: 24px; margin-bottom: 18px; }.prototype-header h1 { margin: 0; font-size: 27px; letter-spacing: -.5px; }.prototype-header p { margin: 6px 0 0; color: #697890; font-size: 13px; }.prototype-header-actions { display: flex; gap: 12px; align-items: 6px; }.prototype-header-actions .el-button { height: 36px; min-width: 106px; }.prototype-grid { display: grid; grid-template-columns: minmax(0, 1fr) 284px; gap: 24px; align-items: start; }.prototype-center { min-width: 0; display: grid; gap: 12px; }.welcome-prototype-card, .prototype-entry, .prototype-metric, .prototype-panel, .prototype-services, .prototype-side-card { border: 1px solid #e1eaf7; border-radius: 14px; background: #fff; box-shadow: 0 7px 18px rgba(49, 83, 139, .035); }.welcome-prototype-card { min-height: 201px; display: flex; justify-content: space-between; padding: 26px 22px; overflow: hidden; background: linear-gradient(105deg, #f8fcff, #e5f1ff); }.welcome-copy h2 { margin: 0; font-size: 25px; }.welcome-copy p { margin: 7px 0 0; color: #62738d; font-size: 13px; }.welcome-summary { display: flex; gap: 26px; margin-top: 24px; }.welcome-summary span { display: grid; grid-template-columns: 30px auto; column-gap: 8px; }.welcome-summary i { grid-row: 1 / 3; display: grid; place-items: center; height: 30px; border-radius: 7px; color: #4387ff; background: #e7f1ff; font-style: normal; }.welcome-summary small { color: #74839b; font-size: 11px; }.welcome-summary b { font-size: 13px; }.welcome-illustration { position: relative; width: 250px; flex: 0 0 250px; }.illus-panel { position: absolute; right: 25px; top: 20px; width: 126px; height: 115px; padding: 35px 17px 10px; border: 4px solid #f8fbff; border-radius: 16px; background: rgba(255,255,255,.45); transform: rotate(12deg); box-shadow: 0 16px 24px rgba(63, 133, 240, .12); }.illus-panel b { display: inline-block; width: 13px; margin: 0 5px; background: linear-gradient(#3c97f6, #1766ed); border-radius: 4px 4px 0 0; }.illus-panel b:nth-child(1) { height: 26px; }.illus-panel b:nth-child(2) { height: 45px; }.illus-panel b:nth-child(3) { height: 68px; }.illus-phone { position: absolute; left: 20px; top: 48px; display: grid; place-items: center; width: 62px; height: 75px; border-radius: 14px; color: #fff; background: linear-gradient(150deg,#4ca9ff,#1e67e8); font-size: 38px; transform: rotate(12deg); box-shadow: 0 13px 23px #9fc8fd; }.illus-chart { position: absolute; bottom: 11px; right: 36px; color: #55adff; font-size: 30px; letter-spacing: 6px; }
+.prototype-entry-grid, .prototype-metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 12px; }.prototype-entry { min-height: 116px; display: flex; gap: 13px; padding: 18px 15px; color: #1d2a42; text-align: left; cursor: pointer; transition: .16s ease; }.prototype-entry:hover, .prototype-entry:focus-visible { border-color: #9fc5ff; transform: translateY(-2px); box-shadow: 0 12px 22px rgba(35,105,218,.1); outline: 0; }.prototype-entry .el-icon { flex: 0 0 43px; width: 43px; height: 43px; border-radius: 11px; color: #2778f3; background: #eaf3ff; font-size: 25px; }.prototype-entry.green .el-icon { color: #29bd63; background: #e8fbef; }.prototype-entry.purple .el-icon { color: #8353ef; background: #f1eaff; }.prototype-entry.orange .el-icon { color: #ef9a21; background: #fff1dc; }.prototype-entry b, .prototype-entry small, .prototype-entry em { display: block; }.prototype-entry b { font-size: 15px; }.prototype-entry small { margin: 7px 0 13px; color: #7a889d; font-size: 12px; white-space: nowrap; }.prototype-entry em { color: #2475f2; font-size: 12px; font-style: normal; }.prototype-metric { min-height: 100px; padding: 16px; }.prototype-metric .el-icon { float: right; display: grid; width: 43px; height: 43px; border-radius: 50%; color: #4e8eff; background: #edf4ff; font-size: 23px; }.prototype-metric .el-icon.orange { color: #eb9c27; background: #fff4e3; }.prototype-metric .el-icon.green { color: #32bc63; background: #e9fbee; }.prototype-metric .el-icon.purple { color: #8a5dec; background: #f1ecff; }.prototype-metric span, .prototype-metric small { display: block; color: #68778f; font-size: 12px; }.prototype-metric b { display: block; margin: 4px 0 6px; font-size: 24px; }.prototype-metric small { font-size: 11px; }.prototype-list-grid { display: grid; grid-template-columns: 1.05fr .95fr; gap: 12px; }.prototype-panel { min-width: 0; padding: 12px; }.prototype-panel-head { display: flex; justify-content: space-between; align-items: center; padding: 0 2px 6px; }.prototype-panel h2, .prototype-services h2, .prototype-side-card h2 { margin: 0; font-size: 16px; }.prototype-panel-head button { border: 0; color: #2374f2; background: transparent; font-size: 12px; cursor: pointer; }.prototype-order { width: 100%; display: grid; grid-template-columns: 51px minmax(0,1fr) auto auto; gap: 10px; align-items: center; padding: 8px 4px; border: 0; border-top: 1px solid #edf1f6; color: #34435d; background: transparent; text-align: left; cursor: pointer; }.prototype-order i { display: grid; place-items: center; width: 43px; height: 43px; border-radius: 7px; color: #60748c; background: #f0f3f7; font-size: 26px; font-style: normal; }.prototype-order b, .prototype-order small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.prototype-order b { font-size: 12px; }.prototype-order small { margin-top: 4px; color: #8a96aa; font-size: 10px; }.prototype-order em { padding: 4px 7px; border-radius: 4px; color: #42a85c; background: #edf9ee; font-size: 11px; font-style: normal; }.prototype-order em.运输中 { color: #367bed; background: #edf5ff; }.prototype-ticket-head, .prototype-ticket { display: grid; grid-template-columns: 1.45fr .75fr .65fr .75fr; gap: 6px; align-items: center; }.prototype-ticket-head { padding: 9px 7px; border-radius: 8px; color: #728198; background: #f4f7fb; font-size: 11px; }.prototype-ticket { width: 100%; padding: 10px 7px; border: 0; border-bottom: 1px solid #eef2f6; color: #495871; background: transparent; text-align: left; cursor: pointer; font-size: 11px; }.prototype-ticket b { overflow: hidden; color: #2674ee; text-overflow: ellipsis; white-space: nowrap; }.prototype-ticket em { width: fit-content; padding: 3px 6px; border-radius: 4px; color: #ef9624; background: #fff4e4; font-style: normal; }.prototype-ticket em.待分派 { color: #3d7df1; background: #edf5ff; }.prototype-ticket em.已完成 { color: #3fa95c; background: #edf9ef; }.prototype-ticket em.已关闭 { color: #748093; background: #f0f2f5; }.prototype-ticket time { color: #718096; }.prototype-services { display: grid; grid-template-columns: 1.15fr repeat(5, 1fr); gap: 12px; align-items: center; padding: 12px 15px; }.prototype-services button { display: flex; justify-content: center; align-items: center; gap: 7px; height: 44px; border: 1px solid #edf1f6; border-radius: 8px; color: #53627b; background: #fafcff; font-size: 12px; cursor: pointer; }.prototype-services button:hover { color: #2374f2; border-color: #bad6ff; }.prototype-right { display: grid; gap: 12px; }.prototype-side-card { padding: 14px; }.prototype-side-card h2 { display: flex; justify-content: space-between; padding: 0 2px 10px; }.prototype-side-card h2 span { color: #667892; font-weight: 400; }.prototype-reminder { width: 100%; display: grid; grid-template-columns: 14px minmax(0,1fr) auto; gap: 8px; align-items: center; padding: 11px 7px; border: 0; border-top: 1px solid #eef2f6; background: transparent; text-align: left; cursor: pointer; }.prototype-reminder i { width: 10px; height: 10px; border-radius: 50%; background: #f7a429; }.prototype-reminder i.blue { background: #4688f5; }.prototype-reminder b, .prototype-reminder small { display: block; }.prototype-reminder b { font-size: 13px; }.prototype-reminder small { margin-top: 4px; color: #8390a4; font-size: 11px; }.prototype-reminder em, .side-all { color: #2876ee; font-size: 11px; font-style: normal; }.prototype-todo { width: 100%; display: flex; justify-content: space-between; padding: 11px 4px; border: 0; border-top: 1px solid #edf1f6; color: #52617a; background: transparent; text-align: left; cursor: pointer; font-size: 12px; }.prototype-todo b { padding: 2px 7px; border-radius: 4px; color: #64748b; background: #f0f3f7; font-size: 11px; }.side-all { width: 100%; margin-top: 9px; padding: 8px 0 0; border: 0; background: transparent; text-align: center; cursor: pointer; }.prototype-activity { position: relative; width: 100%; display: grid; gap: 5px; padding: 11px 2px 11px 25px; border: 0; border-left: 1px solid #dfe8f3; color: #52617a; background: transparent; text-align: left; cursor: pointer; }.prototype-activity i { position: absolute; left: -5px; top: 15px; width: 9px; height: 9px; border-radius: 50%; background: #2bbb67; }.prototype-activity i.blue { background: #4385f5; }.prototype-activity time { color: #77869d; font-size: 11px; }.prototype-activity p { margin: 0; font-size: 12px; line-height: 1.6; }.progress-side { min-height: 315px; }
+@media (max-width: 1350px) { .prototype-grid { grid-template-columns: 1fr; }.prototype-right { grid-template-columns: repeat(3,minmax(0,1fr)); }.prototype-home { grid-template-columns: 260px minmax(0,1fr); }.prototype-entry-grid { grid-template-columns: repeat(2,minmax(0,1fr)); } }
+@media (max-width: 900px) { .prototype-home { display: block; }.prototype-sidebar { min-height: auto; }.prototype-sessions, .prototype-contact { display: none; }.prototype-main { padding: 18px; }.prototype-header { align-items: flex-start; flex-direction: column; }.prototype-list-grid, .prototype-right { grid-template-columns: 1fr; }.prototype-entry-grid, .prototype-metric-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }.welcome-illustration { display: none; } }
+@media (max-width: 600px) { .prototype-main { padding: 13px; }.prototype-header-actions { flex-wrap: wrap; }.prototype-entry-grid, .prototype-metric-grid { grid-template-columns: 1fr; }.prototype-list-grid { overflow: hidden; }.prototype-services { grid-template-columns: repeat(2,1fr); }.prototype-services h2 { grid-column: 1/-1; }.welcome-summary { flex-wrap: wrap; }.prototype-order { grid-template-columns: 42px minmax(0,1fr) auto; }.prototype-order > span:last-of-type { display: none; }.prototype-ticket-head, .prototype-ticket { grid-template-columns: 1fr .7fr .7fr; }.prototype-ticket > span { display: none; } }
+
+/* 功能入口 hover 不改变元素几何位置，避免阴影和位移触发横向滚动范围变化。 */
+.prototype-main { overflow-x: clip; }
+.prototype-entry {
+  transition: border-color .16s ease, box-shadow .16s ease, background-color .16s ease;
+}
+.prototype-entry:hover,
+.prototype-entry:focus-visible {
+  border-color: #9fc5ff;
+  background: #fbfdff;
+  box-shadow: 0 7px 18px rgba(49, 83, 139, .08);
+  transform: none;
+}
+
+/* 展开全部历史会话时只在侧栏内部滚动，避免挤压主内容区。 */
+.prototype-sidebar {
+  height: 100vh;
+  min-height: 0;
+  overflow: hidden;
+}
+.prototype-contact {
+  margin: auto 17px 32px;
+}
+.prototype-session-list {
+  display: grid !important;
+  grid-template-columns: minmax(0, 1fr);
+  width: 100%;
+}
+.prototype-session-list .prototype-session { min-width: 0; }
+.prototype-session-list.expanded {
+  max-height: 360px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.prototype-session-list.expanded::-webkit-scrollbar { width: 5px; }
+.prototype-session-list.expanded::-webkit-scrollbar-thumb { border-radius: 999px; background: #cbd8e8; }
+
+/* 固定侧栏网格：历史会话始终在自己的剩余区域内滚动，不再推动顶部内容或遮盖联系按钮。 */
+.prototype-sidebar { display: grid; grid-template-rows: 88px auto auto minmax(0, 1fr) 80px; position: relative; box-sizing: border-box; height: 100vh; min-height: 0; padding: 0; overflow: hidden; }
+.prototype-sessions { min-height: 0; display: flex; flex-direction: column; margin-bottom: 0; }
+.prototype-session-list { min-height: 0; }
+.prototype-session-list.expanded { position: static; flex: 1; max-height: none; padding-bottom: 0; overflow-y: auto; background: transparent; }
+.prototype-contact { position: static; align-self: stretch; margin: 0 17px 32px; }
+@media (max-width: 900px) { .prototype-sidebar { display: flex; height: auto; min-height: auto; } }
+
+/* 会话右键管理：主点击区与更多操作分离，菜单固定在点击坐标且不影响侧栏布局。 */
+.prototype-session { position: relative; display: block; padding: 0; }
+.prototype-session-main { width: 100%; display: grid; grid-template-columns: 34px minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 13px 32px 13px 0; border: 0; color: inherit; background: transparent; text-align: left; cursor: pointer; }
+.prototype-session-more { position: absolute; top: 50%; right: 0; display: grid; width: 26px; height: 26px; place-items: center; border: 0; border-radius: 6px; color: #6d7d95; background: transparent; cursor: pointer; opacity: 0; transform: translateY(-50%); }
+.prototype-session:hover .prototype-session-more, .prototype-session:focus-within .prototype-session-more { opacity: 1; }.prototype-session-more:hover, .prototype-session-more:focus-visible { color: #1766ed; background: #edf4ff; outline: 0; }
+.prototype-session-menu { position: fixed; z-index: 3000; width: 132px; padding: 5px; border: 1px solid #dce6f3; border-radius: 8px; background: #fff; box-shadow: 0 10px 24px rgba(30, 52, 85, .18); }.prototype-session-menu button { width: 100%; padding: 8px 10px; border: 0; border-radius: 5px; color: #33435d; background: transparent; text-align: left; cursor: pointer; }.prototype-session-menu button:hover, .prototype-session-menu button:focus-visible { color: #1766ed; background: #edf4ff; outline: 0; }.prototype-session-menu .danger:hover, .prototype-session-menu .danger:focus-visible { color: #dc2626; background: #fff1f1; }
+
+/* 快捷服务中的 SVG 来自不同图标组件，统一尺寸以避免撑高底部卡片。 */
+.prototype-services button > svg,
+.prototype-services button > .el-icon {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 18px;
+}
+.quick-service-glyph {
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  flex: 0 0 18px;
+  color: #4d85ef;
+  font-size: 16px;
+  line-height: 1;
+}
+
+/* 首页直接复用订单页快捷服务卡片，确保四项服务的尺寸、图标和文字层级一致。 */
+.prototype-services.orders-quick-services { grid-template-columns: 1.05fr repeat(4, 1fr); min-height: 0; padding: 12px 16px; }
+
+/* 我的订单：沿用客户侧固定侧栏，在桌面端以订单列表和详情栏形成稳定三栏布局。 */
+.customer-orders-page { min-height: 100vh; display: grid; grid-template-columns: 280px minmax(0, 1fr); color: #17213a; background: #f6f9fe; }
+.customer-orders-main { min-width: 0; padding: 22px 26px 30px; overflow: hidden; }
+.orders-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; margin-bottom: 18px; }.orders-header h1 { margin: 0; font-size: 28px; letter-spacing: -.5px; }.orders-header p { margin: 6px 0 0; color: #697890; font-size: 13px; }.orders-header-actions { display: flex; gap: 12px; }.orders-header-actions .el-button { min-width: 106px; height: 38px; }
+.order-metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 14px; }.order-metric-grid article { position: relative; min-height: 108px; padding: 18px 18px 16px 96px; border: 1px solid #e2eaf6; border-radius: 13px; background: #fff; box-shadow: 0 7px 18px rgba(49, 83, 139, .035); }.order-metric-grid i { position: absolute; left: 20px; top: 22px; display: grid; place-items: center; width: 58px; height: 58px; border-radius: 14px; font-style: normal; font-size: 28px; }.order-metric-grid i svg { width: 30px; height: 30px; }.order-metric-grid i.blue { color: #2879f5; background: #e8f1ff; }.order-metric-grid i.orange { color: #ec961d; background: #fff0d9; }.order-metric-grid i.green { color: #28b85e; background: #e5f9ec; }.order-metric-grid i.purple { color: #8060e9; background: #f0ebff; }.order-metric-grid span, .order-metric-grid small { display: block; color: #748199; font-size: 12px; }.order-metric-grid b { display: block; margin: 3px 0 5px; font-size: 26px; }
+.orders-workspace { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 18px; align-items: start; }.orders-left { min-width: 0; display: grid; gap: 14px; }.orders-filter-card, .orders-list-card, .orders-quick-services, .order-detail-panel { border: 1px solid #e2eaf6; border-radius: 13px; background: #fff; box-shadow: 0 7px 18px rgba(49, 83, 139, .035); }.orders-filter-card { display: grid; grid-template-columns: 315px minmax(0, 1fr); gap: 14px 22px; padding: 18px; }.status-tabs { display: flex; gap: 4px; align-items: center; min-width: 0; }.status-tabs button { min-width: 66px; height: 36px; border: 0; border-radius: 7px; color: #53627b; background: transparent; cursor: pointer; }.status-tabs button.active { color: #1265f4; background: #edf4ff; font-weight: 700; }.filter-controls { grid-column: 1 / -1; display: flex; gap: 12px; align-items: center; }.filter-controls .el-date-editor { width: 280px; }.filter-controls .el-button { margin-left: auto; }.filter-controls .el-button + .el-button { margin-left: 0; }
+.orders-list-card { padding: 13px; }.orders-list-title { display: flex; align-items: center; padding: 0 3px 10px; }.orders-list-title h2, .orders-quick-services h2, .order-detail-panel h2 { margin: 0; font-size: 16px; }.orders-list-title small { color: #75839a; font-weight: 400; }
+/* 旧客服工作台也使用 order-list 等类名，必须将订单页列表规则限定在本页容器内。 */
+.orders-list-card .order-list { display: block; border: 1px solid #edf1f6; border-radius: 10px; overflow: hidden; }.orders-list-card .order-row { width: 100%; display: grid; grid-template-columns: 70px minmax(170px, 1fr) 105px 74px 178px; gap: 14px; align-items: center; min-height: 90px; padding: 10px 12px; border: 0; border-bottom: 1px solid #edf1f6; cursor: pointer; transition: background-color .16s ease, border-color .16s ease; }.orders-list-card .order-row:last-child { border-bottom: 0; }.orders-list-card .order-row:hover, .orders-list-card .order-row.selected { background: #f7fbff; }.orders-list-card .order-row.selected { box-shadow: inset 3px 0 #2878f5; }.orders-list-card .order-product-placeholder { display: grid; place-items: center; width: 58px; height: 58px; border-radius: 9px; color: #5b7698; background: linear-gradient(135deg, #f2f5f8, #e7edf4); }.orders-list-card .order-product-placeholder svg { width: 28px; height: 28px; }.orders-list-card .order-ident { min-width: 0; }.orders-list-card .order-ident small, .orders-list-card .order-ident span, .orders-list-card .order-price small { display: block; overflow: hidden; color: #8090a6; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }.orders-list-card .order-ident b { display: block; margin: 6px 0 3px; overflow: hidden; color: #273750; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }.orders-list-card .order-price b { display: block; margin-bottom: 5px; }.orders-list-card .order-row em, .detail-order-no em { width: fit-content; padding: 5px 8px; border-radius: 5px; font-size: 12px; font-style: normal; white-space: nowrap; }.shipping { color: #2476ed; background: #edf5ff; }.completed { color: #29a557; background: #eaf8ef; }.pending { color: #eb9425; background: #fff4e4; }.after-sale { color: #7957df; background: #f1edff; }.orders-list-card .order-actions { grid-column: auto; display: flex; justify-content: flex-end; gap: 8px; min-width: 0; }.orders-list-card .order-actions .el-button { width: auto; min-width: 76px; height: 30px; }.orders-pagination { display: flex; justify-content: flex-end; padding-top: 13px; }
+.orders-quick-services { display: grid; grid-template-columns: 1.05fr repeat(4, 1fr); gap: 12px; align-items: center; padding: 12px 16px; }.orders-quick-services button { min-width: 0; height: 52px; display: grid; grid-template-columns: 23px minmax(0, 1fr); grid-template-rows: 18px 16px; align-items: center; column-gap: 6px; padding: 7px 10px; border: 1px solid #edf1f6; border-radius: 8px; color: #52617a; background: #fafcff; text-align: left; cursor: pointer; }.orders-quick-services button svg, .orders-quick-services button i { grid-row: 1 / -1; width: 20px; height: 20px; color: #2f80f4; font-size: 18px; font-style: normal; }.orders-quick-services button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.orders-quick-services button small { grid-column: 2; overflow: hidden; color: #8996aa; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }.orders-quick-services button:hover { border-color: #b9d5ff; color: #1766ed; }
+.order-detail-panel { position: sticky; top: 16px; max-height: calc(100vh - 48px); padding: 18px; overflow-y: auto; }.detail-order-no { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 17px 0 7px; color: #687890; font-size: 12px; }.detail-order-no b { color: #283951; font-size: 15px; }.detail-order-no em { margin-left: auto; }.detail-time, .detail-muted { margin: 0; color: #8090a6; font-size: 12px; }.detail-section { margin-top: 16px; padding-top: 16px; border-top: 1px solid #e8eef6; }.detail-section h3 { margin: 0 0 14px; font-size: 13px; }.order-progress { display: grid; gap: 15px; }.order-progress > div { display: grid; grid-template-columns: 24px minmax(0, 1fr); gap: 9px; color: #a1afc0; }.order-progress i { display: grid; place-items: center; width: 20px; height: 20px; border: 2px solid #ced9e8; border-radius: 50%; background: #fff; }.order-progress .done { color: #1f67d5; }.order-progress .done i { color: #fff; border-color: #1d6dfa; background: #1d6dfa; }.order-progress i svg { width: 13px; height: 13px; }.order-progress span { display: grid; gap: 3px; font-size: 13px; }.order-progress small { color: #8a98ab; font-size: 11px; }.detail-line { display: grid; grid-template-columns: 62px minmax(0, 1fr); gap: 8px; margin: 9px 0; color: #53627b; font-size: 12px; line-height: 1.55; word-break: break-word; }.detail-line span { color: #8a98ab; }.logistics-traces { display: grid; gap: 12px; }.logistics-traces > div { position: relative; padding-left: 15px; border-left: 1px solid #dce6f3; }.logistics-traces i { position: absolute; left: -4px; top: 5px; width: 7px; height: 7px; border-radius: 50%; background: #2e7df1; }.logistics-traces time { color: #8a98ab; font-size: 10px; }.logistics-traces p { margin: 3px 0 0; color: #53627b; font-size: 12px; line-height: 1.5; }.detail-contact { width: 100%; margin-top: 20px; }
+@media (max-width: 1350px) { .customer-orders-page { grid-template-columns: 260px minmax(0, 1fr); }.orders-workspace { grid-template-columns: 1fr; }.order-detail-panel { position: static; max-height: none; }.orders-filter-card { grid-template-columns: 260px minmax(0, 1fr); } }
+@media (max-width: 980px) { .customer-orders-page { display: block; }.customer-orders-page .prototype-sidebar { min-height: auto; }.customer-orders-main { padding: 18px; }.orders-header { flex-direction: column; }.order-metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }.orders-filter-card { grid-template-columns: 1fr; }.filter-controls { grid-column: auto; flex-wrap: wrap; }.orders-list-card .order-row { grid-template-columns: 58px minmax(0, 1fr) auto; }.orders-list-card .order-price, .orders-list-card .order-row > em { display: none; }.orders-list-card .order-actions { grid-column: 2 / -1; justify-content: flex-start; }.orders-quick-services { grid-template-columns: repeat(2, minmax(0, 1fr)); }.orders-quick-services h2 { grid-column: 1 / -1; } }
+@media (max-width: 600px) { .customer-orders-main { padding: 13px; }.orders-header-actions { flex-wrap: wrap; }.order-metric-grid { grid-template-columns: 1fr; }.filter-controls .el-date-editor { width: 100%; }.orders-list-card .order-row { gap: 9px; padding: 9px; }.orders-list-card .order-product-placeholder { width: 48px; height: 48px; }.orders-pagination { justify-content: center; }.orders-quick-services { grid-template-columns: 1fr; } }
+
+/* 我的工单：复用客户固定侧栏，桌面端保持列表与详情三栏结构。 */
+.customer-tickets-page { height: 100vh; min-height: 720px; display: grid; grid-template-columns: 280px minmax(0, 1fr); overflow: hidden; color: #17213a; background: #f6f9fe; }
+/* 桌面端三栏共用同一视口高度，列表在内部滚动，避免左中右底部出现错位。 */
+.customer-tickets-main { min-width: 0; height: 100vh; min-height: 0; display: flex; flex-direction: column; box-sizing: border-box; padding: 22px 26px 30px; overflow: hidden; }
+.tickets-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; margin-bottom: 18px; }
+.tickets-header h1 { margin: 0; font-size: 28px; letter-spacing: -.5px; }
+.tickets-header p { margin: 6px 0 0; color: #697890; font-size: 13px; }
+.tickets-header-actions { display: flex; gap: 12px; }
+.tickets-header-actions .el-button { min-width: 106px; height: 38px; }
+.ticket-metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 14px; }
+.ticket-metric-grid article { position: relative; min-height: 108px; padding: 18px 18px 16px 96px; border: 1px solid #e2eaf6; border-radius: 13px; background: #fff; box-shadow: 0 7px 18px rgba(49,83,139,.035); }
+.ticket-metric-grid i { position: absolute; left: 20px; top: 22px; display: grid; place-items: center; width: 58px; height: 58px; border-radius: 14px; font-style: normal; }
+.ticket-metric-grid i svg { width: 30px; height: 30px; }
+.ticket-metric-grid i.blue { color: #2879f5; background: #e8f1ff; }.ticket-metric-grid i.orange { color: #f09a24; background: #fff0df; }.ticket-metric-grid i.purple { color: #8661ed; background: #f1ecff; }.ticket-metric-grid i.green { color: #29b968; background: #e6f9ed; }
+.ticket-metric-grid span, .ticket-metric-grid small { display: block; color: #748199; font-size: 12px; }.ticket-metric-grid b { display: block; margin: 3px 0 5px; font-size: 26px; }
+.tickets-workspace { min-height: 0; flex: 1 1 auto; display: grid; grid-template-columns: minmax(0, 1fr) 294px; gap: 18px; align-items: stretch; }
+.tickets-left { min-width: 0; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; gap: 14px; }
+.tickets-filter-card, .tickets-list-card, .ticket-detail-panel { border: 1px solid #e2eaf6; border-radius: 13px; background: #fff; box-shadow: 0 7px 18px rgba(49,83,139,.035); }
+.tickets-filter-card { display: grid; gap: 14px; padding: 18px; }
+.tickets-filter-top { display: grid; grid-template-columns: 290px minmax(0, 1fr); gap: 28px; align-items: center; }
+.ticket-status-tabs { display: flex; align-items: center; gap: 3px; min-width: 0; }
+.ticket-status-tabs button { min-width: 68px; height: 36px; border: 0; border-radius: 7px; color: #53627b; background: transparent; cursor: pointer; }
+.ticket-status-tabs button.active { color: #1265f4; background: #edf4ff; font-weight: 700; }
+.tickets-filter-bottom { display: grid; grid-template-columns: auto 260px auto 190px minmax(140px, 1fr); gap: 10px; align-items: center; color: #66758c; font-size: 12px; }
+.tickets-filter-actions { display: flex; justify-content: flex-end; gap: 10px; }
+.tickets-filter-actions .el-button { min-width: 72px; }
+.tickets-list-card { min-height: 0; display: flex; flex-direction: column; padding: 13px; }
+.tickets-list-card > h2 { margin: 0; padding: 1px 3px 11px; font-size: 16px; }.tickets-list-card > h2 small { color: #75839a; font-weight: 400; }
+.ticket-table-scroll { min-width: 0; min-height: 0; flex: 1 1 auto; overflow: auto; border: 1px solid #edf1f6; border-radius: 10px; }
+.customer-ticket-table { min-width: 900px; display: grid; grid-template-columns: 24px minmax(128px,1.08fr) minmax(90px,.72fr) minmax(120px,1fr) 126px 82px 126px minmax(172px,1.15fr); gap: 10px; align-items: center; }
+.customer-ticket-table-head { min-height: 42px; padding: 0 10px; color: #68778e; background: #f5f7fb; font-size: 12px; }
+.customer-ticket-table-row { min-height: 58px; padding: 8px 10px; border-bottom: 1px solid #edf1f6; color: #41516a; background: #fff; font-size: 12px; cursor: pointer; outline: 0; transition: background-color .16s ease, box-shadow .16s ease; }
+.customer-ticket-table-row:last-child { border-bottom: 0; }.customer-ticket-table-row:hover, .customer-ticket-table-row.selected { background: #f7fbff; }.customer-ticket-table-row.selected { box-shadow: inset 3px 0 #2677f4; }
+.customer-ticket-table-row > b, .customer-ticket-table-row > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.customer-ticket-table-row > b { color: #314158; font-size: 12px; }
+.customer-ticket-radio { display: grid; place-items: center; }.customer-ticket-radio i { width: 16px; height: 16px; border: 1px solid #cad7e8; border-radius: 50%; }.customer-ticket-table-row.selected .customer-ticket-radio i { border: 5px solid #2376f5; }
+.customer-ticket-table-row > em, .ticket-detail-id em { width: fit-content; padding: 4px 8px; border-radius: 5px; font-size: 12px; font-style: normal; white-space: nowrap; }
+.customer-ticket-table-row > em.processing, .ticket-detail-id em.processing { color: #e98a18; background: #fff1df; }.customer-ticket-table-row > em.assign, .ticket-detail-id em.assign { color: #2978ec; background: #eaf3ff; }.customer-ticket-table-row > em.supplement, .ticket-detail-id em.supplement { color: #7e58df; background: #f1edff; }.customer-ticket-table-row > em.completed, .ticket-detail-id em.completed { color: #25a65a; background: #e9f8ef; }.customer-ticket-table-row > em.closed, .ticket-detail-id em.closed { color: #718096; background: #eef2f6; }
+.customer-ticket-row-actions { display: flex; justify-content: flex-end; gap: 7px; overflow: visible !important; }.customer-ticket-row-actions .el-button { min-width: 72px; height: 29px; padding: 5px 9px; }.customer-ticket-row-actions .el-button + .el-button { margin-left: 0; }
+.tickets-pagination { display: flex; justify-content: flex-end; padding-top: 13px; }
+.ticket-detail-panel { min-height: 0; height: 100%; box-sizing: border-box; padding: 18px; overflow-y: auto; }
+.ticket-detail-panel > h2 { margin: 0 0 16px; font-size: 17px; }.ticket-detail-id { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }.ticket-detail-id b { overflow: hidden; color: #24354e; font-size: 15px; text-overflow: ellipsis; }.ticket-detail-id em { margin-left: auto; }
+.ticket-detail-panel > p, .ticket-safe-fields > p { display: grid; grid-template-columns: 68px minmax(0,1fr); gap: 8px; margin: 8px 0; color: #52627a; font-size: 12px; line-height: 1.55; word-break: break-word; }.ticket-detail-panel p > span { color: #8794a8; }
+.ticket-detail-section { margin-top: 16px; padding-top: 16px; border-top: 1px solid #e7edf5; }
+.ticket-timeline-step { position: relative; display: grid; grid-template-columns: 23px minmax(0,1fr); gap: 9px; min-height: 63px; color: #9ba9bc; }.ticket-timeline-step::after { content: ''; position: absolute; left: 9px; top: 22px; bottom: 0; width: 1px; background: #dce5f1; }.ticket-timeline-step:last-child::after { display: none; }
+.ticket-timeline-step > i { z-index: 1; display: grid; place-items: center; width: 19px; height: 19px; border: 2px solid #ced9e8; border-radius: 50%; background: #fff; }.ticket-timeline-step > i svg { width: 12px; height: 12px; }.ticket-timeline-step.done, .ticket-timeline-step.active { color: #1f6ce5; }.ticket-timeline-step.done > i { color: #fff; border-color: #1e70f5; background: #1e70f5; }.ticket-timeline-step.active > i { border: 5px solid #1970fa; }
+.ticket-timeline-step > div { display: grid; grid-template-columns: minmax(0,1fr) auto; column-gap: 8px; align-content: start; }.ticket-timeline-step b { font-size: 13px; }.ticket-timeline-step time { color: #8a98ac; font-size: 10px; }.ticket-timeline-step p { grid-column: 1/-1; margin: 5px 0 0; color: #8794a8; font-size: 11px; line-height: 1.45; }
+.ticket-safe-fields { display: block; }.ticket-safe-fields > p { grid-template-columns: 66px minmax(0,1fr); }
+.ticket-detail-contact { width: 100%; margin-top: 18px; }
+.tickets-quick-services { margin-top: 0; }
+@media (max-width: 1350px) { .customer-tickets-page { height: auto; min-height: 100vh; overflow: visible; grid-template-columns: 260px minmax(0,1fr); }.customer-tickets-main { height: auto; min-height: 100vh; display: block; }.tickets-workspace { min-height: auto; display: grid; grid-template-columns: 1fr; }.tickets-left { min-height: auto; grid-template-rows: none; }.tickets-list-card { display: block; }.ticket-table-scroll { overflow-x: auto; overflow-y: visible; }.ticket-detail-panel { height: auto; min-height: 0; }.tickets-filter-top { grid-template-columns: 260px minmax(0,1fr); }.tickets-filter-bottom { grid-template-columns: auto minmax(210px,1fr) auto minmax(170px,.7fr) auto; } }
+@media (max-width: 980px) { .customer-tickets-page { display: block; }.customer-tickets-page .prototype-sidebar { min-height: auto; }.customer-tickets-main { padding: 18px; }.tickets-header { flex-direction: column; }.ticket-metric-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }.tickets-filter-top { grid-template-columns: 1fr; }.ticket-status-tabs { flex-wrap: wrap; }.tickets-filter-bottom { grid-template-columns: 1fr 2fr; }.tickets-filter-actions { grid-column: 1/-1; }.tickets-quick-services { grid-template-columns: repeat(2,minmax(0,1fr)); }.tickets-quick-services h2 { grid-column: 1/-1; } }
+@media (max-width: 600px) { .customer-tickets-main { padding: 13px; }.tickets-header-actions { flex-wrap: wrap; }.ticket-metric-grid { grid-template-columns: 1fr; }.tickets-filter-bottom { grid-template-columns: 1fr; }.ticket-status-tabs button { min-width: 62px; }.tickets-pagination { justify-content: center; }.tickets-quick-services { grid-template-columns: 1fr; } }
+
+/* 首页真实订单状态沿用原型色彩，补齐待付款、售后与待补充等真实状态。 */
+.prototype-order em.待付款 { color: #e68d20; background: #fff4e4; }
+.prototype-order em.售后中 { color: #7c5be1; background: #f1edff; }
+.prototype-ticket em.待补充 { color: #7c5be1; background: #f1edff; }

@@ -488,6 +488,18 @@ def delete_chat_session(session_id: str, authorization: str | None = Header(defa
     return {"status": "success", "session_id": session_id}
 
 
+@app.patch("/api/chat/session/{session_id}/pin")
+def pin_chat_session(session_id: str, payload: dict[str, Any] | None = None,
+                     authorization: str | None = Header(default=None)) -> dict:
+    """置顶或取消置顶当前客户自己的会话，不允许通过会话编号操作其他客户数据。"""
+    current_user_data = _current_login_user(authorization)
+    pinned = bool((payload or {}).get("pinned"))
+    session = chat_sessions.set_pinned_for_customer(session_id, current_user_data["customer_id"], pinned)
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在或已删除")
+    return session
+
+
 @app.get("/api/customer/tickets/{ticket_no}")
 def get_customer_ticket(ticket_no: str, authorization: str | None = Header(default=None)) -> dict:
     """代理查询客户自己的工单详情，让客户侧页面能刷新 Java 业务系统中的最新状态。"""
@@ -533,6 +545,30 @@ def list_customer_orders(authorization: str | None = Header(default=None)) -> li
     if result.get("status") in {"success", "empty"}:
         return result.get("data", [])
     raise HTTPException(status_code=503, detail="业务订单服务暂时不可用")
+
+
+@app.get("/api/customer/orders/{order_no}")
+def get_customer_order_detail(order_no: str, authorization: str | None = Header(default=None)) -> dict:
+    """代理当前客户订单详情，避免浏览器绕过 Agent 服务直接访问核心业务系统。"""
+    _current_login_user(authorization)
+    result = order_tools.query_order_detail(order_no, _bearer_token(authorization))
+    if result.get("status") == "success":
+        return result["data"]
+    if result.get("status") == "empty":
+        raise HTTPException(status_code=404, detail="订单不存在或无权查看")
+    raise HTTPException(status_code=503, detail="业务订单服务暂时不可用")
+
+
+@app.get("/api/customer/orders/{order_no}/logistics")
+def get_customer_order_logistics(order_no: str, authorization: str | None = Header(default=None)) -> dict:
+    """代理当前客户订单的物流轨迹，订单归属由 Java 服务二次校验。"""
+    _current_login_user(authorization)
+    result = order_tools.query_order_logistics(order_no, _bearer_token(authorization))
+    if result.get("status") == "success":
+        return result["data"]
+    if result.get("status") == "empty":
+        raise HTTPException(status_code=404, detail="物流信息暂不可用")
+    raise HTTPException(status_code=503, detail="物流服务暂时不可用")
 
 
 @app.post("/api/staff/tickets/{ticket_no}/reply/draft")

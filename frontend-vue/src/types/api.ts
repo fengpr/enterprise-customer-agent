@@ -46,6 +46,7 @@ export interface ChatSession {
   created_at: string
   updated_at: string
   deleted_at?: string | null
+  pinned_at?: string | null
 }
 
 export interface Ticket {
@@ -72,6 +73,9 @@ export interface Ticket {
   urgeCount?: number | null
   lastUrgedAt?: string | null
   lastUrgeReason?: string | null
+  returnMethod?: string | null
+  pickupTimeWindow?: string | null
+  pickupStatus?: string | null
   createdAt?: string
   updatedAt?: string
 }
@@ -121,6 +125,7 @@ export interface CustomerOrder {
   productId: number
   productName?: string | null
   productCategory?: string | null
+  quantity: number
   warrantyDays?: number | null
   returnable?: boolean | null
   orderStatus: string
@@ -129,6 +134,35 @@ export interface CustomerOrder {
   signTime?: string | null
   amount?: number | string | null
   afterSaleStatus?: string | null
+}
+
+/** 订单详情页使用的客户安全字段，手机号由业务服务脱敏后返回。 */
+export interface CustomerOrderDetail extends CustomerOrder {
+  receiverName?: string | null
+  receiverPhoneMasked?: string | null
+  shippingAddress?: string | null
+  paymentMethod?: string | null
+  deliveryMethod?: string | null
+  freightAmount?: number | string | null
+}
+
+export interface LogisticsTrace {
+  status: string
+  description: string
+  location?: string | null
+  stationName?: string | null
+  occurredAt?: string | null
+}
+
+export interface CustomerOrderLogistics {
+  orderNo: string
+  carrierName?: string | null
+  trackingNo?: string | null
+  logisticsStatus?: string | null
+  latestLocation?: string | null
+  estimatedDeliveryTime?: string | null
+  routeSummary?: string | null
+  traces: LogisticsTrace[]
 }
 
 export interface StaffReplyDraft {

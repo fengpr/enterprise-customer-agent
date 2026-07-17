@@ -1,6 +1,7 @@
 package com.example.business.controller;
 
 import com.example.business.dto.LogisticsView;
+import com.example.business.dto.OrderDetailView;
 import com.example.business.dto.OrderView;
 import com.example.business.service.AuthService;
 import com.example.business.service.AgentExecutionCredentialService;
@@ -72,6 +73,20 @@ public class OrderController {
     ) {
         Long currentCustomerId = resolveCustomerId(authorization, executionCredential, agentCustomerId, requestId);
         return orderService.findViewByOrderNo(orderNo)
+                .filter(order -> order.customerId().equals(currentCustomerId));
+    }
+
+    /** 返回当前客户自己的订单详情，避免通过订单号读取他人的收货与支付信息。 */
+    @GetMapping("/{orderNo}/detail")
+    public Optional<OrderDetailView> detailForCustomer(
+            @PathVariable("orderNo") String orderNo,
+            @RequestHeader(value = "Authorization", required = false) String authorization,
+            @RequestHeader(value = "X-Agent-Execution-Credential", required = false) String executionCredential,
+            @RequestHeader(value = "X-Agent-Customer-ID", required = false) Long agentCustomerId,
+            @RequestHeader(value = "X-Request-ID", required = false) String requestId
+    ) {
+        Long currentCustomerId = resolveCustomerId(authorization, executionCredential, agentCustomerId, requestId);
+        return orderService.findDetailViewByOrderNo(orderNo)
                 .filter(order -> order.customerId().equals(currentCustomerId));
     }
 

@@ -1,6 +1,7 @@
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from langchain_core.runnables import RunnableLambda
@@ -18,6 +19,7 @@ from agents.intent_normalizer import (
     is_identity_message as normalize_is_identity_message,
     is_logistics_message as normalize_is_logistics_message,
     is_order_query_message as normalize_is_order_query_message,
+    is_order_statistics_message,
     is_out_of_scope_message,
 )
 from agents.llm_intent_analyzer import LLMIntentAnalyzer
@@ -513,6 +515,11 @@ class CustomerServiceAgent:
 
         if analysis.user_goal == "human_request":
             return self._compose_human_request_answer(state)
+
+        order_statistics_answer = self._compose_order_statistics_answer(state)
+        if order_statistics_answer:
+            # 件数和金额由确定性代码聚合，避免 LLM 算术误差或把真实查询改写成操作指引。
+            return order_statistics_answer
 
         if analysis.user_goal == "policy_consult" and analysis.action_type == "return_goods" and not analysis.need_human:
             return self._compose_return_goods_policy_answer(state, citations)
@@ -1479,6 +1486,114 @@ class CustomerServiceAgent:
         """判断是否已经尝试按客户查询订单，即使失败也不再要求用户重复提供订单号。"""
         return any(item.get("query_type") == "customer_orders" for item in state.get("tool_results", []))
 
+    def _compose_order_statistics_answer(self, state: TicketProcessState) -> str:
+        """基于客户订单工具结果确定性统计商品件数与实付金额。"""
+        message = state.get("message", "")
+        if not is_order_statistics_message(message):
+            return ""
+
+        result = next(
+            (item for item in state.get("tool_results", []) if item.get("query_type") == "customer_orders"),
+            None,
+        )
+        if not result:
+            return "暂时没有取得您的订单数据，无法准确完成统计。请稍后重试或联系人工客服。"
+        if result.get("status") == "failed":
+            return "订单服务暂时不可用，当前无法准确统计购买件数和实付金额。请稍后重试或联系人工客服。"
+        if result.get("status") == "empty":
+            range_label, _, _ = self._resolve_order_statistics_range(message)
+            return f"我已查询您的账户，{range_label}没有找到订单记录。"
+
+        range_label, start_time, end_time = self._resolve_order_statistics_range(message)
+        paid_orders: list[tuple[dict[str, Any], datetime, Decimal, int]] = []
+        for order in result.get("data") or []:
+            raw_pay_time = order.get("payTime")
+            if not raw_pay_time:
+                # 没有支付时间的订单尚未形成真实消费，不纳入实付统计。
+                continue
+            pay_time = self._parse_order_datetime(raw_pay_time)
+            if pay_time is None:
+                return "查询到的订单中存在无法识别的支付时间，当前无法给出准确统计结果。请稍后重试。"
+            if (start_time and pay_time < start_time) or pay_time > end_time:
+                continue
+            try:
+                amount = Decimal(str(order.get("amount")))
+            except (InvalidOperation, TypeError, ValueError):
+                return "查询到的已支付订单金额不完整，当前无法准确计算总花费。请稍后重试。"
+            if not amount.is_finite() or amount < 0:
+                return "查询到的已支付订单金额异常，当前无法准确计算总花费。请稍后重试。"
+            try:
+                quantity = int(order.get("quantity"))
+            except (TypeError, ValueError):
+                return "查询到的订单商品数量不完整，当前无法准确计算购买件数。请稍后重试。"
+            if quantity < 1:
+                return "查询到的订单商品数量异常，当前无法准确计算购买件数。请稍后重试。"
+            paid_orders.append((order, pay_time, amount, quantity))
+
+        if not paid_orders:
+            return f"我已查询您的账户，{range_label}没有已支付订单，因此暂无可统计的购买件数和实付金额。"
+
+        paid_orders.sort(key=lambda item: item[1], reverse=True)
+        total_amount = sum((item[2] for item in paid_orders), Decimal("0.00"))
+        total_quantity = sum(item[3] for item in paid_orders)
+        product_groups: dict[str, dict[str, Any]] = {}
+        for order, pay_time, amount, quantity in paid_orders:
+            product_name = str(order.get("productName") or "商品信息暂不可用")
+            group = product_groups.setdefault(
+                product_name,
+                {"quantity": 0, "amount": Decimal("0.00"), "latest_pay_time": pay_time},
+            )
+            group["quantity"] += quantity
+            group["amount"] += amount
+            if pay_time > group["latest_pay_time"]:
+                group["latest_pay_time"] = pay_time
+
+        sorted_products = sorted(product_groups.items(), key=lambda item: item[1]["latest_pay_time"], reverse=True)
+        lines = [
+            f"{range_label}，您共有 {len(paid_orders)} 笔已支付订单，购买 {total_quantity} 件商品，订单实付合计 ¥{total_amount:.2f}。",
+            "购买明细：",
+        ]
+        for product_name, group in sorted_products[:10]:
+            lines.append(f"- {product_name} × {group['quantity']}，小计 ¥{group['amount']:.2f}")
+        if len(sorted_products) > 10:
+            lines.append(f"- 另有 {len(sorted_products) - 10} 种商品未逐项展开，已计入上述总件数和总金额。")
+        lines.append("以上按订单支付时间和订单实付金额统计，未支付订单不计入；退款金额因当前订单数据未提供实退明细，暂未另行扣减。")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _resolve_order_statistics_range(
+        message: str,
+        now: datetime | None = None,
+    ) -> tuple[str, datetime | None, datetime]:
+        """解析客户指定的统计周期；未明确时按近九十天处理。"""
+        current = now or datetime.now()
+        if any(word in message for word in ["全部历史", "所有历史", "历史全部", "全部订单", "所有订单"]):
+            return "全部历史范围内", None, current
+
+        day_match = re.search(r"(?:近|最近|过去)\s*(\d{1,5})\s*天", message)
+        if day_match:
+            days = max(1, int(day_match.group(1)))
+            return f"近 {days} 天内", current - timedelta(days=days), current
+        if "本月" in message or "这个月" in message:
+            return "本月内", current.replace(day=1, hour=0, minute=0, second=0, microsecond=0), current
+        if "今年" in message or "本年度" in message:
+            return "今年内", current.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0), current
+        return "近 90 天内", current - timedelta(days=90), current
+
+    @staticmethod
+    def _parse_order_datetime(value: Any) -> datetime | None:
+        """把业务接口的 ISO 时间统一为可比较的本地无时区时间。"""
+        if isinstance(value, datetime):
+            parsed = value
+        else:
+            try:
+                parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                return None
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone().replace(tzinfo=None)
+        return parsed
+
     def _format_order_tool_text(self, tool_results: list[dict[str, Any]]) -> str:
         """把订单工具结果转换为客服可读回复，避免用户只能看到右侧调试 JSON。"""
         for item in tool_results:
@@ -2056,6 +2171,28 @@ class CustomerServiceAgent:
             normalized.risk_reasons = ["high_risk_out_of_scope"] if is_high_risk_out_of_scope_message(message) else ["out_of_scope"]
             return normalized
 
+        if is_order_statistics_message(message):
+            # 订单统计属于低风险只读查询，即使模型误判为 how_to 或置信度偏低也必须调用真实订单工具。
+            normalized.intent = "consult"
+            normalized.user_goal = "info_query"
+            normalized.order_related = True
+            normalized.order_no = []
+            normalized.action_type = None
+            normalized.action_slots = {}
+            normalized.missing_slots = []
+            normalized.next_action = None
+            normalized.need_order_query = True
+            normalized.need_human = False
+            normalized.need_ticket = False
+            normalized.priority = "medium"
+            normalized.confidence = max(normalized.confidence, 0.92)
+            normalized.risk_reasons = [
+                reason
+                for reason in normalized.risk_reasons
+                if reason not in {"low_confidence", "action_or_dispute_requires_human", "refund_commitment"}
+            ]
+            return normalized
+
         inferred_intent = normalize_intent(message, normalized.intent)
         if normalized.intent in {"other", "consult"} and inferred_intent != normalized.intent:
             normalized.intent = inferred_intent
@@ -2339,6 +2476,12 @@ class CustomerServiceAgent:
         if not conversation_context:
             return result
         normalized = result.model_copy(deep=True)
+        if is_order_statistics_message(message):
+            # 汇总必须覆盖完整客户订单列表，不能被侧栏当前选中的单笔订单上下文劫持。
+            normalized.order_no = []
+            normalized.order_related = True
+            normalized.need_order_query = True
+            return normalized
         order_resolution = resolve_order_context(conversation_context, message)
         if order_resolution.get("status") == "usable":
             order_no = str(order_resolution.get("order_no") or "")
