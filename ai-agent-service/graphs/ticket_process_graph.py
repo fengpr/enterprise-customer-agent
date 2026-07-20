@@ -86,7 +86,8 @@ def build_ticket_process_graph(
         if not selected_order_no and context_resolution.get("status") == "usable":
             # 只有 5 分钟内明确确认过的模糊订单上下文才可直接用于查单。
             selected_order_no = context_resolution.get("order_no")
-        should_use_selected_order = bool(selected_order_no and analysis.order_related and analysis.user_goal in {"status_query", "action_request"})
+        # 当前前端明确选中的订单可服务于状态、动作及只读商品咨询；历史订单仍必须经过有效期与确认判断。
+        should_use_selected_order = bool(selected_order_no and analysis.order_related and analysis.user_goal in {"status_query", "action_request", "info_query"})
         ticket_result = _query_or_urge_ticket_if_needed(state, list_customer_tickets, query_ticket_status, urge_ticket, log_tool_call)
         if ticket_result is not None:
             return {"tool_results": ticket_result}
@@ -145,6 +146,10 @@ def build_ticket_process_graph(
         analysis = state["analysis"]
         if analysis.user_goal in {"human_request", "out_of_scope"}:
             # 明确转人工和非客服越界问题不依赖知识库检索，避免出现知识库缺失模板。
+            return {"citations": []}
+        if _can_skip_rag_for_realtime_entity_query(analysis):
+            # 订单详情、物流和工单进度以 Java 业务系统实时数据为准。此类请求继续做
+            # pgvector 检索既不会增加事实性，反而增加嵌入与重排等待，故直接复用工具结果。
             return {"citations": []}
         business_scope = (
             "return_goods"
@@ -773,6 +778,17 @@ def _is_logistics_query(message: str, intent: str) -> bool:
     """识别需要查询物流轨迹的只读问题，供图节点决定是否调用物流工具。"""
     logistics_words = ["物流", "快递", "配送", "发货", "签收", "送达", "到达", "到哪", "什么时候到", "转运", "路线", "全流程"]
     return intent == "logistics" or any(word in message for word in logistics_words)
+
+
+def _can_skip_rag_for_realtime_entity_query(analysis: IntentResult) -> bool:
+    """判断实时实体查询是否应跳过 RAG，避免权威工具结果之后的无效检索等待。"""
+    # 退款、退货、换货和维修即使带有订单上下文，也可能需要售后政策证据，不能跳过 RAG。
+    if analysis.action_type or analysis.user_goal in {"action_request", "policy_consult", "complaint", "dispute"}:
+        return False
+    # 工单进度、订单详情和物流轨迹的真实性由 Java 业务服务保证，知识库无法提供更实时的数据。
+    return analysis.user_goal in {"status_query", "info_query"} and (
+        analysis.need_order_query or analysis.order_related or analysis.intent == "logistics"
+    )
 
 
 def _call_tool(state: TicketProcessState, tool: Callable[..., dict[str, Any]], *args: Any) -> dict[str, Any]:

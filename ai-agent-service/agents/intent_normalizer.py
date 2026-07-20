@@ -226,6 +226,47 @@ def is_order_detail_query_message(message: str) -> bool:
     return entity_reference and detail_goal
 
 
+def is_selected_order_product_inquiry(message: str) -> bool:
+    """识别已选订单下的商品了解、评价和适用性咨询，避免仅支持固定“商品详情”说法。"""
+    text = re.sub(r"[\s？?。！!，,；;：:]+", "", message.strip().lower())
+    if not text:
+        return False
+    # 售后动作、故障争议和投诉由受控动作流处理，不能被商品介绍语义覆盖。
+    if contains_any(text, ["退货", "退款", "换货", "维修", "投诉", "举报", "赔偿", "坏了", "故障", "质量问题"]):
+        return False
+
+    product_reference = contains_any(
+        text,
+        ["这款", "此款", "这件", "该商品", "这个商品", "这个产品", "这台", "这副", "这个"],
+    )
+    inquiry_goal = contains_any(
+        text,
+        [
+            "怎么样",
+            "如何",
+            "好不好",
+            "值不值",
+            "值得",
+            "性价比",
+            "适合",
+            "用途",
+            "功能",
+            "优点",
+            "缺点",
+            "评价",
+            "口碑",
+            "评测",
+            "参数",
+            "配置",
+            "推荐",
+            "能干什么",
+            "可以做什么",
+            "适用",
+        ],
+    )
+    return product_reference and inquiry_goal
+
+
 def is_order_statistics_message(message: str) -> bool:
     """识别需要查询真实订单并汇总件数、金额或商品清单的表达。"""
     purchase_scope = contains_any(message, ["买了", "买过", "购买", "订单", "消费", "花费", "实付"])

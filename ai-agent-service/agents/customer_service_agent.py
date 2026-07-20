@@ -20,6 +20,7 @@ from agents.intent_normalizer import (
     is_logistics_message as normalize_is_logistics_message,
     is_order_detail_query_message,
     is_order_query_message as normalize_is_order_query_message,
+    is_selected_order_product_inquiry,
     is_order_statistics_message,
     is_out_of_scope_message,
 )
@@ -618,7 +619,7 @@ class CustomerServiceAgent:
         order_answer = self._format_order_intent_answer(state, citations)
 
         if order_answer and not analysis.need_human:
-            if is_order_detail_query_message(state["message"]):
+            if self._is_current_order_product_inquiry(state):
                 # 可信字段先确定性展示，再由模型补充自然解读；模型失败时不影响订单事实回复。
                 supplement = self._compose_llm_customer_answer(
                     state,
@@ -1773,7 +1774,7 @@ class CustomerServiceAgent:
             return self._format_order_tool_text(state.get("tool_results", []))
 
         order_summary = self._format_order_summary(order)
-        if is_order_detail_query_message(message):
+        if self._is_current_order_product_inquiry(state):
             # 订单商品介绍只展示 Java 已核验的业务字段，不能凭商品名编造功能、参数或营销卖点。
             return self._format_selected_order_product_answer(order)
         if self._is_logistics_message(message) or analysis.intent == "logistics":
@@ -2222,8 +2223,9 @@ class CustomerServiceAgent:
         """优先调用真实 LLM 做结构化识别，模型失败时降级为转人工结果。"""
         message = payload.get("message") if isinstance(payload, dict) else str(payload)
         conversation_context = payload.get("conversation_context") if isinstance(payload, dict) else None
-        if self._is_return_goods_policy_message(message):
-            # 退货规则是规则可确定识别的低风险意图，无需在 RAG 前再阻塞一次意图 LLM。
+        if self._can_use_deterministic_intent_fast_path(message):
+            # 明确的只读查单、查物流和规则咨询不依赖模型判定；跳过一次 LLM 往返，
+            # 同时仍经过统一业务与会话安全护栏，不能用于退款、退货等动作执行。
             return self._apply_context_guardrails(
                 message,
                 self._apply_business_guardrails(message, self._rule_based_analyze(message)),
@@ -2261,6 +2263,36 @@ class CustomerServiceAgent:
                 {"status": "failed", "error_type": error_type, "error": str(exc)},
             )
             return self._fallback_or_model_failure(message, error_type, str(exc), conversation_context)
+
+    def _can_use_deterministic_intent_fast_path(self, message: str) -> bool:
+        """判断是否可跳过意图 LLM，限定为无副作用且语义明确的客服只读请求。"""
+        text = (message or "").strip()
+        if not text:
+            return False
+
+        # 动作、投诉、争议和人工诉求必须保留完整编排，不能因性能优化降低风控强度。
+        if (
+            self._is_action_request_message(text)
+            or self._is_after_sale_dispute_message(text)
+            or is_human_request_message(text)
+            or self._contains_any(text, ["投诉", "举报", "维权", "赔偿"])
+        ):
+            return False
+
+        # 身份、会话记忆和常见只读实体查询均有确定性处理或 Java 权威数据来源。
+        return any(
+            [
+                self._is_return_goods_policy_message(text),
+                self._is_agent_identity_message(text),
+                self._is_user_identity_message(text),
+                self._is_session_memory_question(text),
+                self._is_logistics_message(text),
+                self._is_order_query_message(text),
+                is_order_detail_query_message(text),
+                self._is_ticket_progress_message(text),
+                self._is_ticket_urge_message(text),
+            ]
+        )
 
     def _apply_business_guardrails(self, message: str, result: IntentResult) -> IntentResult:
         """对 LLM 输出补充强制业务规则，防止高风险场景被错误自动回复。"""
@@ -2629,13 +2661,22 @@ class CustomerServiceAgent:
         return fallback
 
     def _message_for_intent_analysis(self, message: str, conversation_context: dict[str, Any] | None) -> str:
-        """在存在指代表达时，将安全摘要注入意图识别输入，帮助模型解析上下文。"""
+        """在存在指代或前端已选实体时，将安全摘要注入意图识别输入。"""
         safe_summary = (conversation_context or {}).get("safe_context_summary")
-        if not safe_summary or not self._has_context_reference(message):
+        has_current_selected_order = self._has_current_selected_order(conversation_context)
+        if not safe_summary and not has_current_selected_order:
             return message
+        if not self._has_context_reference(message) and not has_current_selected_order:
+            return message
+        selected_hint = (
+            "当前前端已明确选中一笔订单。若本轮在询问这款/这件商品的用途、适用性、评价、性价比、"
+            "参数或订单进度，应识别为订单相关只读咨询；与该订单无关的常识问题不得强行关联。\n"
+            if has_current_selected_order
+            else ""
+        )
         return (
             "以下会话上下文仅用于解析本轮消息中的指代，不得覆盖用户当前明确表达的诉求。\n"
-            f"安全上下文摘要：{safe_summary}\n"
+            f"{selected_hint}安全上下文摘要：{safe_summary}\n"
             f"本轮用户消息：{message}"
         )
 
@@ -2655,6 +2696,26 @@ class CustomerServiceAgent:
             normalized.order_related = True
             normalized.need_order_query = True
             return normalized
+        if self._is_selected_order_product_inquiry(message, conversation_context):
+            # “这款商品怎么样”等表达属于已选订单的只读商品咨询。这里按实体类型路由，
+            # 而非依赖某个固定句式；订单归属仍由后续 Java 工具校验。
+            selected_order_no = self._current_selected_order_no(conversation_context)
+            if selected_order_no:
+                normalized.intent = "consult"
+                normalized.user_goal = "info_query"
+                normalized.order_related = True
+                normalized.order_no = [selected_order_no]
+                normalized.action_type = None
+                normalized.action_slots = {}
+                normalized.missing_slots = []
+                normalized.next_action = None
+                normalized.need_order_query = True
+                normalized.need_human = False
+                normalized.need_ticket = False
+                normalized.priority = "medium"
+                normalized.confidence = max(normalized.confidence, 0.9)
+                normalized.risk_reasons = [reason for reason in normalized.risk_reasons if reason != "low_confidence"]
+                return normalized
         order_resolution = resolve_order_context(conversation_context, message)
         if order_resolution.get("status") == "usable":
             order_no = str(order_resolution.get("order_no") or "")
@@ -2752,7 +2813,30 @@ class CustomerServiceAgent:
 
     def _has_context_reference(self, message: str) -> bool:
         """识别需要依赖历史上下文解析的指代表达。"""
-        return self._contains_any(message, ["刚才", "刚刚", "上面", "之前", "上一句", "前面", "那个", "这个", "这单", "那单", "还是", "继续", "它", "那就"])
+        return self._contains_any(message, ["刚才", "刚刚", "上面", "之前", "上一句", "前面", "那个", "这个", "这款", "此款", "这件", "该商品", "这单", "那单", "还是", "继续", "它", "那就"])
+
+    @staticmethod
+    def _current_selected_order_no(conversation_context: dict[str, Any] | None) -> str | None:
+        """只读取本轮前端显式选中的订单，不把历史推断订单提升为当前实体。"""
+        order_context = (conversation_context or {}).get("order_context") or {}
+        if order_context.get("source") != "selected_by_user":
+            return None
+        order_no = str(order_context.get("order_no") or "").strip()
+        return order_no or None
+
+    def _has_current_selected_order(self, conversation_context: dict[str, Any] | None) -> bool:
+        """判断当前请求是否携带前端明确选中订单，用于安全地补充意图模型上下文。"""
+        return bool(self._current_selected_order_no(conversation_context))
+
+    def _is_selected_order_product_inquiry(self, message: str, conversation_context: dict[str, Any] | None) -> bool:
+        """把通用商品咨询语义与当前选中订单绑定，禁止历史订单自动介入。"""
+        return bool(self._current_selected_order_no(conversation_context)) and is_selected_order_product_inquiry(message)
+
+    def _is_current_order_product_inquiry(self, state: TicketProcessState) -> bool:
+        """判断当前图状态是否应按商品详情与自然解读方式回复。"""
+        return is_order_detail_query_message(state["message"]) or self._is_selected_order_product_inquiry(
+            state["message"], state.get("conversation_context")
+        )
 
     def _is_user_identity_message(self, message: str) -> bool:
         """识别客户询问自身登录身份的问题，必须用登录态确定性回答。"""

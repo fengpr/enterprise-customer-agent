@@ -44,6 +44,59 @@ def _status_analysis(**overrides):
 class ConversationContextTest(unittest.TestCase):
     """覆盖上下文构建、安全摘要和跨节点使用。"""
 
+    def test_clear_logistics_query_skips_intent_llm(self):
+        """明确物流查询应走确定性识别，避免额外等待一次意图模型调用。"""
+        agent = object.__new__(CustomerServiceAgent)
+
+        class UnexpectedLLM:
+            """若快速路径失效则主动报错，确保本测试能发现性能回归。"""
+
+            def invoke(self, message):
+                raise AssertionError(f"明确物流查询不应调用 LLM：{message}")
+
+        agent.llm_analyzer = UnexpectedLLM()
+        result = agent._analyze_with_llm_fallback({"message": "查询当前订单物流状态"})
+
+        self.assertEqual(result.intent, "logistics")
+        self.assertEqual(result.user_goal, "status_query")
+        self.assertTrue(result.need_order_query)
+
+    def test_realtime_order_query_skips_rag_retrieval(self):
+        """订单实时查询已有 Java 权威结果时，不应再等待 RAG 检索。"""
+        retrieval_calls: list[dict] = []
+        graph = build_ticket_process_graph(
+            analyzer_chain=RunnableLambda(lambda _: _status_analysis()),
+            retrieve_knowledge=lambda payload: retrieval_calls.append(payload) or [],
+            query_order=lambda order_no, auth_token: {
+                "status": "success",
+                "query_type": "order_detail",
+                "data": {"orderNo": order_no, "productName": "测试商品", "orderStatus": "SIGNED"},
+            },
+            query_customer_orders=lambda customer_id, auth_token: {"status": "empty", "data": []},
+            query_order_logistics=lambda order_no, auth_token: {"status": "success", "query_type": "order_logistics", "data": {}},
+            create_ticket=lambda payload, auth_token: {"status": "skipped"},
+            auto_assign_ticket=lambda ticket_no: {"status": "skipped"},
+            list_customer_tickets=lambda auth_token: {"status": "empty", "data": []},
+            query_ticket_status=lambda ticket_no, auth_token: {"status": "empty"},
+            urge_ticket=lambda ticket_no, reason, auth_token: {"status": "empty"},
+            prepare_action=lambda state: {"analysis": state["analysis"]},
+            compose_answer=lambda state: "订单状态已查询",
+            log_tool_call=lambda tool_name, input_data, output_data: None,
+        )
+
+        result = graph.invoke(
+            {
+                "message": "查询订单状态",
+                "customer_id": 7,
+                "selected_order_no": "EC202607160009",
+                "tool_results": [],
+                "citations": [],
+            }
+        )
+
+        self.assertEqual(retrieval_calls, [])
+        self.assertEqual(result["citations"], [])
+
     def test_selected_order_tool_failure_does_not_request_order_number_again(self):
         """前端已选订单时，下游查询失败应提示重试，不能错误要求客户再次提供订单号。"""
         agent = object.__new__(CustomerServiceAgent)
@@ -67,6 +120,78 @@ class ConversationContextTest(unittest.TestCase):
 
         self.assertIn("已关联您当前选中的订单 EC202607160008", answer)
         self.assertNotIn("提供订单号", answer)
+
+    def test_selected_order_product_inquiry_uses_entity_semantics_not_fixed_phrase(self):
+        """已选订单下的“这款商品怎么样”应作为商品咨询，而非越界兜底。"""
+        agent = object.__new__(CustomerServiceAgent)
+        context = build_conversation_context(
+            messages=[],
+            pending_action_request=None,
+            selected_order_no="EC202607160010",
+            selected_ticket_no=None,
+        )
+        out_of_scope = IntentResult(
+            intent="other",
+            user_goal="out_of_scope",
+            emotion="normal",
+            order_related=False,
+            order_no=[],
+            product_name=None,
+            need_order_query=False,
+            need_ticket=False,
+            need_human=False,
+            priority="low",
+            confidence=0.6,
+            summary="用户询问商品怎么样",
+            risk_reasons=["out_of_scope"],
+        )
+
+        result = agent._apply_context_guardrails("这款商品怎么样", out_of_scope, context)
+
+        self.assertEqual(result.intent, "consult")
+        self.assertEqual(result.user_goal, "info_query")
+        self.assertTrue(result.order_related)
+        self.assertTrue(result.need_order_query)
+        self.assertEqual(result.order_no, ["EC202607160010"])
+        self.assertFalse(result.need_human)
+
+    def test_selected_order_product_inquiry_builds_product_answer(self):
+        """同一语义路由应进入可信商品事实与自然补充回复，而不是无证据兜底。"""
+        agent = object.__new__(CustomerServiceAgent)
+        agent.llm_analyzer = None
+        context = build_conversation_context(
+            messages=[],
+            pending_action_request=None,
+            selected_order_no="EC202607160010",
+            selected_ticket_no=None,
+        )
+        analysis = _status_analysis(intent="consult", user_goal="info_query", order_no=["EC202607160010"])
+        answer = agent._compose_answer(
+            {
+                "message": "这款商品怎么样",
+                "analysis": analysis,
+                "conversation_context": context,
+                "tool_results": [
+                    {
+                        "status": "success",
+                        "query_type": "order_detail",
+                        "data": {
+                            "orderNo": "EC202607160010",
+                            "productName": "Noise Cancelling Headset",
+                            "productCategory": "audio",
+                            "amount": 699,
+                            "orderStatus": "SHIPPED",
+                            "afterSaleStatus": "NONE",
+                        },
+                    }
+                ],
+                "citations": [],
+            }
+        )
+
+        self.assertIn("Noise Cancelling Headset", answer)
+        self.assertIn("订单实付：¥699", answer)
+        self.assertNotIn("没有找到足够明确的业务依据", answer)
 
     def test_selected_order_product_question_uses_current_order_context(self):
         """本轮已选订单的商品详情问题应绑定该订单并触发只读查询。"""

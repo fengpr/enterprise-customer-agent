@@ -1402,6 +1402,25 @@ textarea {
   font-size: 13px;
 }
 
+/* 售后快捷入口使用独立提示条表达订单语境，避免将“需要补充”等系统占位语写进客户输入框。 */
+.composer-context-hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 5px;
+  padding: 6px 8px;
+  border: 1px solid #dbeafe;
+  border-radius: 8px;
+  color: #2563eb;
+  background: #eff6ff;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.composer-context-hint .el-icon {
+  flex: 0 0 auto;
+}
+
 .chat-input-box .el-textarea__inner {
   min-height: 36px !important;
   line-height: 1.5;

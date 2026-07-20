@@ -195,6 +195,9 @@ need_human, priority, confidence, summary, risk_reasons, action_type, action_slo
 21. “商品有问题、用不上了、不合适、不喜欢”等可以作为 after_sale_reason，但单独出现时不代表客户已经授权创建退货工单；是否执行由后端状态机判断。
 22. “最近买了什么、一共几件、总计花费多少、统计本月消费”等购买汇总问题用 user_goal=info_query、order_related=true、need_order_query=true，不要归为 how_to，也不要让客户自行统计。
 22. 信息不全时 next_action=collect_slots；信息齐全时可以建议 create_ticket，但最终是否查单或建单只能由后端确定性规则决定。
+23. 如果输入上下文明确说明“当前前端已选中一笔订单”，且用户使用“这款商品怎么样、适合什么场景、值不值、有什么用途、评价如何”等自然表达，
+   应识别为 intent=consult、user_goal=info_query、order_related=true、need_order_query=true 的只读商品咨询；
+   不要误判为 out_of_scope。仅当用户问题确实指向该商品或订单时才可关联，普通常识问题不能因存在选中订单而被强行绑定。
 
 JSON 示例：
 {{

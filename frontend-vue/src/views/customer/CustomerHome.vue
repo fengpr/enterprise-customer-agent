@@ -42,6 +42,8 @@ const selectedOrderNo = ref<string | null>(null)
 const selectedTicketNo = ref<string | null>(null)
 const messageText = ref('')
 const routeTarget = ref<RouteTarget>('ai')
+// 售后快捷入口只切换输入框的业务语境，订单号仍通过独立字段传给后端，避免把占位文案当成用户真实诉求。
+const composerMode = ref<'default' | 'after_sale'>('default')
 const lastReply = ref<AgentReply | null>(null)
 const loadingOrders = ref(false)
 const loadingTickets = ref(false)
@@ -72,6 +74,10 @@ const layoutState = ref({
 
 const selectedOrder = computed(() => orders.value.find((item) => item.orderNo === selectedOrderNo.value) ?? null)
 const selectedTicket = computed(() => tickets.value.find((item) => item.ticketNo === selectedTicketNo.value) ?? null)
+const composerHint = computed(() => {
+  if (composerMode.value !== 'after_sale' || !selectedOrder.value) return ''
+  return `正在为订单 ${selectedOrder.value.orderNo} 发起退货申请`
+})
 const selectedSession = computed(() => sessions.value.find((item) => item.session_id === selectedSessionId.value) ?? null)
 const layoutStyle = computed(() => ({
   '--ticket-column-width': layoutState.value.ticketsCollapsed ? '56px' : `${layoutState.value.ticketWidth}px`,
@@ -358,7 +364,12 @@ async function submitQuestion() {
   if (submitting.value) {
     return
   }
-  const content = messageText.value.trim()
+  // 售后模式下空白发送也代表“开始退货申请”，后端会基于已选订单继续追问真正缺失的槽位。
+  const rawContent = messageText.value.trim()
+  const submittedComposerMode = composerMode.value
+  const content = submittedComposerMode === 'after_sale'
+    ? (rawContent ? `我要申请退货，补充信息：${rawContent}` : '我要申请退货')
+    : rawContent
   if (!content) {
     ElMessage.warning('请先输入问题')
     return
@@ -369,6 +380,7 @@ async function submitQuestion() {
   stoppingGeneration.value = false
   activeStreamController = new AbortController()
   messageText.value = ''
+  composerMode.value = 'default'
   messages.value = [
     ...messages.value,
     {
@@ -531,7 +543,9 @@ async function submitQuestion() {
     // 主动 AbortController 关闭 SSE 是正常取消路径，不删除已显示的用户问题或部分回答。
     if (stoppingGeneration.value) return
     messages.value = messages.value.filter((item) => item.id !== tempMessageId)
-    messageText.value = content
+    // 请求建立失败时恢复客户原本输入的补充信息，而不是恢复带有系统拼接前缀的提交文本。
+    messageText.value = rawContent
+    composerMode.value = submittedComposerMode
     throw error
   } finally {
     submitting.value = false
@@ -565,11 +579,13 @@ function selectOrder(orderNo: string) {
   if (selectedOrderNo.value === orderNo) {
     selectedOrderNo.value = null
     selectedTicketNo.value = null
+    composerMode.value = 'default'
     ElMessage.info('已取消当前咨询订单')
     return
   }
   selectedOrderNo.value = orderNo
   selectedTicketNo.value = null
+  composerMode.value = 'default'
   ElMessage.success(`已选择订单 ${orderNo}`)
 }
 
@@ -578,6 +594,8 @@ function selectTicket(ticketNo: string) {
 }
 
 function fillAndMaybeSend(action: string) {
+  // 新的快捷操作不能沿用上一轮售后草稿语境，避免把普通咨询误包装为退货申请。
+  if (action !== '申请退货') composerMode.value = 'default'
   if (action === '查询物流') {
     if (!selectedOrder.value) {
       ElMessage.warning('请先选择要查询物流的订单')
@@ -591,7 +609,11 @@ function fillAndMaybeSend(action: string) {
       ElMessage.warning('请先选择要申请售后的订单')
       return
     }
-    messageText.value = `我要退货，订单 ${selectedOrder.value.orderNo}，原因是需要补充`
+    routeTarget.value = 'ai'
+    composerMode.value = 'after_sale'
+    // 输入框只承载用户自行补充的内容；已选订单会由 selected_order_no 安全传递。
+    messageText.value = ''
+    ElMessage.info('请补充退货原因；也可以直接发送，由助手继续引导')
     return
   }
   if (action === '催办工单') {
@@ -615,6 +637,7 @@ function fillAndMaybeSend(action: string) {
 function regenerateAnswer(message: string) {
   if (submitting.value || !message.trim()) return
   routeTarget.value = 'ai'
+  composerMode.value = 'default'
   messageText.value = message
   ElMessage.info('正在重新生成回复')
   void submitQuestion()
@@ -771,6 +794,7 @@ watch(() => route.fullPath, () => {
               :session="selectedSession"
               :selected-order="selectedOrder"
               :selected-ticket="selectedTicket"
+              :composer-hint="composerHint"
               :submitting="submitting || loadingMessages"
               @continue-ai="routeTarget = 'ai'"
               @cancel-handoff="cancelHandoff"

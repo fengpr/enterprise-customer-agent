@@ -15,6 +15,8 @@ const props = defineProps<{
   submitting?: boolean
   selectedOrder: CustomerOrder | null
   selectedTicket: Ticket | null
+  /** 当前输入框的受控业务语境，仅用于引导客户补充信息。 */
+  composerHint?: string
 }>()
 
 const emit = defineEmits<{
@@ -34,6 +36,8 @@ const activeTab = ref<RouteTarget>('ai')
 const inputPlaceholder = computed(() =>
   activeTab.value === 'human'
     ? '请输入要补充给人工客服的信息...'
+    : props.composerHint
+      ? '请说明退货原因；可补充上门取件或方便取件的时间'
     : '请输入您的问题...'
 )
 const hasHumanSession = computed(() => ['PENDING', 'ACTIVE', 'CLOSED'].includes(String(props.session?.handoff_status || '')))
@@ -421,6 +425,10 @@ watch(
       <div class="route-target-row">
         <span>当前发送给</span>
         <strong>{{ activeTab === 'human' ? '人工客服' : '智能助手' }}</strong>
+      </div>
+      <div v-if="composerHint && activeTab === 'ai'" class="composer-context-hint">
+        <el-icon><Refresh /></el-icon>
+        <span>{{ composerHint }}，请补充原因；不填写也可直接发送。</span>
       </div>
       <el-input
         :model-value="modelValue"

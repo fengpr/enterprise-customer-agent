@@ -17,6 +17,10 @@ $runtimeDir = Join-Path $Root ".runtime"
 $javaPidFile = Join-Path $runtimeDir "business-service.json"
 $javaLogFile = Join-Path $runtimeDir "business-service.log"
 $javaErrorLogFile = Join-Path $runtimeDir "business-service-error.log"
+$agentLogFile = Join-Path $runtimeDir "agent-api.log"
+$agentWorkerLogFile = Join-Path $runtimeDir "agent-worker-v2.log"
+$followupWorkerLogFile = Join-Path $runtimeDir "followup-worker-v2.log"
+$frontendLogFile = Join-Path $runtimeDir "frontend-vue.log"
 
 function Test-PortOpen {
     param([int]$Port)
@@ -72,7 +76,8 @@ function Test-RedisReady {
     }
     try {
         # 使用 Worker 相同的 Python Redis 客户端验证 PONG，避免端口探测误判。
-        & $PythonPath -c "import redis, sys; raise SystemExit(0 if redis.Redis.from_url(sys.argv[1]).ping() else 1)" $Url 2>$null
+        # 显式配置连接和读取超时：端口存在但 Redis 卡死时，启动脚本不能无限停在首行。
+        & $PythonPath -c "import redis, sys; client=redis.Redis.from_url(sys.argv[1], socket_connect_timeout=1, socket_timeout=2); raise SystemExit(0 if client.ping() else 1)" $Url 2>$null
         return $LASTEXITCODE -eq 0
     } catch {
         return $false
@@ -100,9 +105,34 @@ function Wait-TcpEndpoint {
 }
 
 function Start-ServiceWindow {
-    param([string]$Title, [string]$WorkingDirectory, [string]$Command)
-    $script = "`$Host.UI.RawUI.WindowTitle = '$Title'; Set-Location '$WorkingDirectory'; $Command"
+    param([string]$Title, [string]$WorkingDirectory, [string]$Command, [string]$LogFile = "")
+    # 使用 Transcript 记录子窗口输出。不能用 `*>&1 | Tee-Object`：Uvicorn 会把正常 INFO
+    # 写入 stderr，PowerShell 会将其格式化成 NativeCommandError，造成“启动报错”的误解。
+    if ($LogFile) {
+        $script = "`$Host.UI.RawUI.WindowTitle = '$Title'; Set-Location '$WorkingDirectory'; Start-Transcript -Path '$LogFile' -Append -Force | Out-Null; try { $Command } finally { Stop-Transcript | Out-Null }"
+    } else {
+        $script = "`$Host.UI.RawUI.WindowTitle = '$Title'; Set-Location '$WorkingDirectory'; $Command"
+    }
     Start-Process powershell.exe -ArgumentList "-NoExit", "-ExecutionPolicy", "Bypass", "-Command", $script -WorkingDirectory $WorkingDirectory -WindowStyle Normal
+}
+
+function Test-AgentHealthy {
+    # 端口监听并不代表 Uvicorn 已完成 RAG、Repository 等启动检查，必须探测健康端点。
+    try {
+        $response = Invoke-WebRequest -Uri "http://127.0.0.1:8000/health" -UseBasicParsing -TimeoutSec 3
+        return $response.StatusCode -eq 200
+    } catch {
+        return $false
+    }
+}
+
+function Wait-AgentHealthy {
+    param([int]$TimeoutSeconds = 120)
+    for ($attempt = 0; $attempt -lt $TimeoutSeconds; $attempt++) {
+        if (Test-AgentHealthy) { return $true }
+        Start-Sleep -Seconds 1
+    }
+    return $false
 }
 
 function Test-JavaHealthy {
@@ -317,6 +347,7 @@ Write-Host "== Enterprise Customer Agent startup =="
 
 # 固定使用 IPv4，并通过真实 Redis PONG 判断队列依赖是否可用。
 $redisReady = Test-RedisReady $python $RedisUrl
+$pgReady = Test-PortOpen 5432
 if (-not $SkipDocker) {
     if (Test-DockerReady) {
         try {
@@ -340,22 +371,42 @@ if (-not $SkipJava -and -not $javaReady) {
     Write-Host "Java business-service is already healthy on port 8081."
 }
 
-$agentReady = $SkipAgent -or (Test-PortOpen 8000)
+$agentReady = $SkipAgent -or (Test-AgentHealthy)
 if (-not $SkipAgent) {
     if (-not (Test-Path $python)) {
         Write-Warning "Python virtual environment is missing: $python"
     } else {
         $queueEnabled = if ($redisReady) { "true" } else { "false" }
+        # Docker/PostgreSQL 未启动时仍应让本地 Demo 使用 SQLite + 内存 RAG 正常启动，
+        # 不能继承终端中的 pgvector/PostgreSQL 配置而在启动阶段长时间阻塞。
+        $databaseProvider = if ($pgReady) { $env:DB_PROVIDER } else { "sqlite" }
+        if (-not $databaseProvider) { $databaseProvider = "sqlite" }
+        $ragStoreBackend = if ($pgReady) { $env:RAG_STORE_BACKEND } else { "memory" }
+        if (-not $ragStoreBackend) { $ragStoreBackend = "memory" }
+        if (-not $pgReady) {
+            Write-Warning "PostgreSQL is unavailable. Agent will use SQLite + memory RAG for this local run."
+        }
         if (-not $redisReady) {
             Write-Warning "Redis is not available on port 6379. Agent Worker will not be started; intelligent replies may degrade."
         }
         if (-not $agentReady) {
-            Write-Host "Starting AI Agent API on port 8000..."
-            Start-ServiceWindow "ai-agent-service :8000" $agentDir "`$env:REDIS_URL='$RedisUrl'; `$env:BUSINESS_SERVICE_URL='$BusinessServiceUrl'; `$env:AGENT_EXECUTION_QUEUE_ENABLED='$queueEnabled'; .\.venv\Scripts\python.exe -m uvicorn app:app --reload --port 8000"
-            # Agent 初始化包含 RAG、Repository 和模型配置加载，必须就绪后才能让 Vite 发起首屏请求。
-            $agentReady = Wait-PortOpen 8000 120 "AI Agent API"
+            if (Test-PortOpen 8000) {
+                Write-Warning "Port 8000 is occupied but /health is unavailable. Refusing to replace an unmanaged process."
+                $agentReady = $false
+            } else {
+                New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
+                Remove-Item -Path $agentLogFile -Force -ErrorAction SilentlyContinue
+                Write-Host "Starting AI Agent API on port 8000..."
+                Start-ServiceWindow "ai-agent-service :8000" $agentDir "`$env:REDIS_URL='$RedisUrl'; `$env:BUSINESS_SERVICE_URL='$BusinessServiceUrl'; `$env:AGENT_EXECUTION_QUEUE_ENABLED='$queueEnabled'; `$env:DB_PROVIDER='$databaseProvider'; `$env:RAG_STORE_BACKEND='$ragStoreBackend'; .\.venv\Scripts\python.exe -m uvicorn app:app --reload --port 8000" $agentLogFile
+                # Agent 初始化包含 RAG、Repository 和模型配置加载，必须通过健康检查再启动前端。
+                $agentReady = Wait-AgentHealthy 120
+            }
+            if (-not $agentReady) {
+                Write-Warning "AI Agent API did not become healthy within 120 seconds. See $agentLogFile"
+                Get-Content -Path $agentLogFile -Tail 40 -ErrorAction SilentlyContinue | ForEach-Object { Write-Warning $_ }
+            }
         } else {
-            Write-Host "AI Agent API is already listening on port 8000."
+            Write-Host "AI Agent API is already healthy on port 8000."
         }
         if ($redisReady) {
             $env:REDIS_URL = $RedisUrl
@@ -363,13 +414,14 @@ if (-not $SkipAgent) {
             $workerAlive = Test-AgentWorkerAlive $agentDir
             if (-not $workerAlive) {
                 Write-Host "Starting Agent Worker..."
-                Start-ServiceWindow "agent-worker" $agentDir "`$env:REDIS_URL='$RedisUrl'; `$env:BUSINESS_SERVICE_URL='$BusinessServiceUrl'; `$env:AGENT_EXECUTION_QUEUE_ENABLED='true'; `$env:AGENT_WORKER_NAME='local-agent-worker'; .\.venv\Scripts\python.exe -m rag.agent_execution_worker"
+                Remove-Item -Path $agentWorkerLogFile -Force -ErrorAction SilentlyContinue
+                Start-ServiceWindow "agent-worker" $agentDir "`$env:REDIS_URL='$RedisUrl'; `$env:BUSINESS_SERVICE_URL='$BusinessServiceUrl'; `$env:AGENT_EXECUTION_QUEUE_ENABLED='true'; `$env:AGENT_WORKER_NAME='local-agent-worker'; `$env:DB_PROVIDER='$databaseProvider'; `$env:RAG_STORE_BACKEND='$ragStoreBackend'; .\.venv\Scripts\python.exe -m rag.agent_execution_worker" $agentWorkerLogFile
                 for ($attempt = 0; $attempt -lt 10 -and -not $workerAlive; $attempt++) {
                     Start-Sleep -Seconds 1
                     $workerAlive = Test-AgentWorkerAlive $agentDir
                 }
                 if (-not $workerAlive) {
-                    Write-Warning "Agent Worker heartbeat was not detected within 10 seconds. Check the agent-worker window."
+                    Write-Warning "Agent Worker heartbeat was not detected within 10 seconds. See $agentWorkerLogFile"
                 } else {
                     Write-Host "Agent Worker heartbeat is healthy."
                 }
@@ -380,13 +432,14 @@ if (-not $SkipAgent) {
             $followupWorkerAlive = Test-FollowupWorkerAlive $agentDir
             if (-not $followupWorkerAlive) {
                 Write-Host "Starting Scheduled Follow-up Worker..."
-                Start-ServiceWindow "followup-worker" $agentDir "`$env:REDIS_URL='$RedisUrl'; `$env:BUSINESS_SERVICE_URL='$BusinessServiceUrl'; .\.venv\Scripts\python.exe -m rag.scheduled_followup_worker"
+                Remove-Item -Path $followupWorkerLogFile -Force -ErrorAction SilentlyContinue
+                Start-ServiceWindow "followup-worker" $agentDir "`$env:REDIS_URL='$RedisUrl'; `$env:BUSINESS_SERVICE_URL='$BusinessServiceUrl'; `$env:DB_PROVIDER='$databaseProvider'; .\.venv\Scripts\python.exe -m rag.scheduled_followup_worker" $followupWorkerLogFile
                 for ($attempt = 0; $attempt -lt 10 -and -not $followupWorkerAlive; $attempt++) {
                     Start-Sleep -Seconds 1
                     $followupWorkerAlive = Test-FollowupWorkerAlive $agentDir
                 }
                 if (-not $followupWorkerAlive) {
-                    Write-Warning "Scheduled Follow-up Worker heartbeat was not detected within 10 seconds."
+                    Write-Warning "Scheduled Follow-up Worker heartbeat was not detected within 10 seconds. See $followupWorkerLogFile"
                 }
             } else {
                 Write-Host "Scheduled Follow-up Worker is already running."
@@ -402,8 +455,14 @@ if (-not $SkipFrontend -and -not (Test-PortOpen 5173)) {
         # 默认一键启动不在后端失败时继续拉起前端，避免首屏持续出现 ECONNREFUSED。
         Write-Warning "Frontend was not started because Java or Agent API is unavailable. Check the corresponding service window first."
     } else {
+        New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
+        Remove-Item -Path $frontendLogFile -Force -ErrorAction SilentlyContinue
         Write-Host "Starting frontend-vue on port 5173..."
-        Start-ServiceWindow "frontend-vue :5173" (Join-Path $Root "frontend-vue") "npm run dev"
+        Start-ServiceWindow "frontend-vue :5173" (Join-Path $Root "frontend-vue") "npm run dev" $frontendLogFile
+        if (-not (Wait-PortOpen 5173 45 "frontend-vue")) {
+            Write-Warning "frontend-vue did not become ready. See $frontendLogFile"
+            Get-Content -Path $frontendLogFile -Tail 40 -ErrorAction SilentlyContinue | ForEach-Object { Write-Warning $_ }
+        }
     }
 } elseif (-not $SkipFrontend) {
     Write-Host "frontend-vue is already listening on port 5173."
@@ -413,3 +472,10 @@ Write-Host "Frontend: http://localhost:5173"
 Write-Host "Agent:    http://localhost:8000/health"
 Write-Host "Java:     http://localhost:8081/actuator/health"
 Write-Host "Redis:    $RedisUrl"
+
+# 启动脚本必须把核心服务失败以非零退出码返回给 bat/终端，避免表面“启动完成”而前端持续 ECONNREFUSED。
+$criticalFailure = (-not $SkipJava -and -not $javaReady) -or (-not $SkipAgent -and -not $agentReady)
+if ($criticalFailure) {
+    Write-Error "Startup failed: Java business-service or AI Agent API is unavailable. Check .runtime logs and the service window."
+    exit 1
+}
