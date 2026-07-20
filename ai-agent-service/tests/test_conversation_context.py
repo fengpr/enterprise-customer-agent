@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from agents.action_request import enrich_action_analysis
 from agents.conversation_context import build_conversation_context
 from agents.customer_service_agent import CustomerServiceAgent
+from agents.intent_normalizer import is_order_detail_query_message
 from agents.llm_intent_analyzer import LLMIntentAnalyzer
 from graphs.ticket_process_graph import build_ticket_process_graph
 from schemas.intent_schema import IntentResult, LLMIntentDraft
@@ -42,6 +43,211 @@ def _status_analysis(**overrides):
 
 class ConversationContextTest(unittest.TestCase):
     """覆盖上下文构建、安全摘要和跨节点使用。"""
+
+    def test_selected_order_tool_failure_does_not_request_order_number_again(self):
+        """前端已选订单时，下游查询失败应提示重试，不能错误要求客户再次提供订单号。"""
+        agent = object.__new__(CustomerServiceAgent)
+        analysis = _status_analysis()
+        answer = agent._compose_answer(
+            {
+                "message": "查询订单状态",
+                "analysis": analysis,
+                "selected_order_no": "EC202607160008",
+                "tool_results": [
+                    {
+                        "status": "failed",
+                        "query_type": "order_detail",
+                        "order_no": "EC202607160008",
+                        "error": "5xx",
+                    }
+                ],
+                "citations": [],
+            }
+        )
+
+        self.assertIn("已关联您当前选中的订单 EC202607160008", answer)
+        self.assertNotIn("提供订单号", answer)
+
+    def test_selected_order_product_question_uses_current_order_context(self):
+        """本轮已选订单的商品详情问题应绑定该订单并触发只读查询。"""
+        agent = object.__new__(CustomerServiceAgent)
+        context = build_conversation_context(
+            messages=[],
+            pending_action_request=None,
+            selected_order_no="EC202607160009",
+            selected_ticket_no=None,
+        )
+        draft = _status_analysis(
+            intent="other",
+            user_goal="info_query",
+            order_related=False,
+            need_order_query=False,
+            order_no=[],
+        )
+
+        guarded = agent._apply_context_guardrails("介绍一下该订单的商品", draft, context)
+
+        self.assertTrue(is_order_detail_query_message("介绍一下该订单的商品"))
+        self.assertEqual(guarded.order_no, ["EC202607160009"])
+        self.assertTrue(guarded.order_related)
+        self.assertTrue(guarded.need_order_query)
+
+    def test_selected_order_product_answer_uses_verified_fields(self):
+        """商品介绍应展示订单工具返回的可信字段，不再索要已选订单号或编造产品能力。"""
+        agent = object.__new__(CustomerServiceAgent)
+        answer = agent._compose_answer(
+            {
+                "message": "介绍一下该订单的商品",
+                "analysis": _status_analysis(intent="other", user_goal="info_query"),
+                "selected_order_no": "EC202607160009",
+                "tool_results": [
+                    {
+                        "status": "success",
+                        "query_type": "order_detail",
+                        "order_no": "EC202607160009",
+                        "data": {
+                            "orderNo": "EC202607160009",
+                            "productName": "Smart Router AX3000",
+                            "productCategory": "智能网络设备",
+                            "quantity": 1,
+                            "amount": 399,
+                            "warrantyDays": 365,
+                            "returnable": True,
+                            "orderStatus": "SIGNED",
+                            "afterSaleStatus": "NONE",
+                        },
+                    }
+                ],
+                "citations": [],
+            }
+        )
+
+        self.assertIn("Smart Router AX3000", answer)
+        self.assertIn("智能网络设备", answer)
+        self.assertIn("质保期：365 天", answer)
+        self.assertNotIn("补充订单号", answer)
+        self.assertNotIn("足够明确的业务依据", answer)
+
+    def test_selected_order_product_answer_appends_grounded_llm_overview(self):
+        """商品事实后可追加自然用途说明，但必须把缺少评价证据的边界传给模型。"""
+        class FakeProductLLM:
+            def __init__(self):
+                self.payloads = []
+
+            def generate_customer_reply(self, payload):
+                self.payloads.append(payload)
+                return "从品类看，它通常用于家庭或小型办公网络。是否划算还需结合实际覆盖需求；目前暂无可核验的用户评价数据。"
+
+        fake_llm = FakeProductLLM()
+        agent = object.__new__(CustomerServiceAgent)
+        agent.llm_analyzer = fake_llm
+        agent._log = lambda *args, **kwargs: None
+        answer = agent._compose_answer(
+            {
+                "message": "介绍一下该订单的商品",
+                "analysis": _status_analysis(intent="other", user_goal="info_query"),
+                "selected_order_no": "EC202607160009",
+                "tool_results": [
+                    {
+                        "status": "success",
+                        "query_type": "order_detail",
+                        "order_no": "EC202607160009",
+                        "data": {
+                            "orderNo": "EC202607160009",
+                            "productName": "Smart Router AX3000",
+                            "productCategory": "network",
+                            "quantity": 1,
+                            "amount": 399,
+                            "orderStatus": "SIGNED",
+                        },
+                    }
+                ],
+                "citations": [],
+            }
+        )
+
+        self.assertIn("订单 EC202607160009", answer)
+        self.assertIn("补充说明", answer)
+        self.assertIn("家庭或小型办公网络", answer)
+        self.assertIn("暂无可核验的用户评价数据", answer)
+        self.assertEqual(fake_llm.payloads[0]["reply_mode"], "product_overview")
+        self.assertFalse(fake_llm.payloads[0]["extra_context"]["review_evidence_available"])
+
+    def test_logistics_status_keeps_absolute_expired_delivery_time(self):
+        """物流工具中的历史预计时间必须保留绝对日期，不能被模型改写成今天或明天。"""
+        agent = object.__new__(CustomerServiceAgent)
+        analysis = _status_analysis(intent="logistics")
+        answer = agent._compose_answer(
+            {
+                "message": "查询订单状态",
+                "analysis": analysis,
+                "selected_order_no": "EC202607160008",
+                "tool_results": [
+                    {
+                        "status": "success",
+                        "query_type": "order_detail",
+                        "order_no": "EC202607160008",
+                        "data": {
+                            "orderNo": "EC202607160008",
+                            "productName": "Noise Cancelling Headset",
+                            "orderStatus": "SHIPPED",
+                        },
+                    },
+                    {
+                        "status": "success",
+                        "query_type": "order_logistics",
+                        "order_no": "EC202607160008",
+                        "data": {
+                            "orderNo": "EC202607160008",
+                            "logisticsStatus": "OUT_FOR_DELIVERY",
+                            "estimatedDeliveryTime": "2000-01-01T09:00:00",
+                            "traces": [],
+                        },
+                    },
+                ],
+                "citations": [],
+            }
+        )
+
+        self.assertIn("2000-01-01 09:00", answer)
+        self.assertIn("该预计时间已过", answer)
+        self.assertNotIn("今天", answer)
+
+    def test_delivery_contingency_without_order_gives_actionable_order_guidance(self):
+        """未来未收到再售后的表达应说明核查路径，而不是退化成泛化安慰话术。"""
+        agent = object.__new__(CustomerServiceAgent)
+        answer = agent._compose_answer(
+            {
+                "message": "明天收不到就帮我退了吧",
+                "analysis": _status_analysis(intent="refund", user_goal="action_request"),
+                "selected_order_no": None,
+                "tool_results": [],
+                "citations": [],
+            }
+        )
+
+        self.assertIn("还没有关联具体订单", answer)
+        self.assertIn("先核查最新物流和签收记录", answer)
+        self.assertIn("不能提前承诺退货一定成功", answer)
+        self.assertNotIn("已为您提交退货申请", answer)
+
+    def test_delivery_contingency_uses_selected_order_without_creating_return_early(self):
+        """已选订单的条件售后应带出订单上下文，但不能在未来条件尚未发生时提前建单。"""
+        agent = object.__new__(CustomerServiceAgent)
+        answer = agent._compose_answer(
+            {
+                "message": "如果明天还收不到就帮我退货",
+                "analysis": _status_analysis(intent="refund", user_goal="action_request"),
+                "selected_order_no": "EC202607160008",
+                "tool_results": [],
+                "citations": [],
+            }
+        )
+
+        self.assertIn("订单 EC202607160008", answer)
+        self.assertIn("现在不宜提前提交退货申请", answer)
+        self.assertIn("系统显示已签收但您未收到", answer)
+        self.assertNotIn("提供订单号", answer)
 
     def test_llm_draft_accepts_null_order_no(self):
         """LLM 返回 order_no=null 时应视为无订单号，不能让整轮意图识别降级。"""

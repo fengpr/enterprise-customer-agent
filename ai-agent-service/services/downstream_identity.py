@@ -2,10 +2,27 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import os
+import time
+
 from services.observability import current_context
 
 
 _EXECUTION_PREFIX = "agent-execution:"
+
+
+def issue_execution_credential(customer_id: int, request_id: str, ttl_seconds: int | None = None) -> str:
+    """签发不含客户 Token 的短期内部执行凭证，供独立 Worker 调用 Java。"""
+    expires_at = int(time.time()) + int(ttl_seconds or os.getenv("AGENT_JOB_TTL_SECONDS", "600"))
+    content = f"{customer_id}:{request_id}:{expires_at}"
+    secret = os.getenv(
+        "AGENT_EXECUTION_SECRET",
+        os.getenv("AGENT_INTERNAL_SECRET", "enterprise-customer-agent-demo-internal-secret"),
+    )
+    signature = hmac.new(secret.encode("utf-8"), content.encode("utf-8"), hashlib.sha256).hexdigest()[:24]
+    return f"v1.{expires_at}.{signature}"
 
 
 def build_execution_identity(customer_id: int, request_id: str, credential: str) -> str:

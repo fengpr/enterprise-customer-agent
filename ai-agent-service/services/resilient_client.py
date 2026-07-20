@@ -80,19 +80,21 @@ class ResilientClient:
         """异步 HTTP 调用入口；非幂等写请求无幂等键时只执行一次。"""
         async def operation() -> httpx.Response:
             timeout = httpx.Timeout(self.total_timeout, connect=self.connect_timeout, read=self.read_timeout)
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            # Java 业务服务通常位于本机或内网，不能被 Windows 的 HTTP(S)_PROXY 误转发到外部代理。
+            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
                 return await client.request(method, url, **kwargs)
 
         return await self.invoke(operation, method=method, idempotency_key=idempotency_key)
 
-    def request_sync(self, method: str, url: str, *, idempotency_key: str | None = None, **kwargs: Any) -> httpx.Response:
+    def request_sync(self, method: str, url: str, *, idempotency_key: str | None = None, cancellation_token: Any | None = None, **kwargs: Any) -> httpx.Response:
         """为现有同步 Agent 图提供适配入口，仍复用相同错误分类、熔断与舱壁。"""
         def operation() -> httpx.Response:
             timeout = httpx.Timeout(self.total_timeout, connect=self.connect_timeout, read=self.read_timeout)
-            with httpx.Client(timeout=timeout) as client:
+            # 统一下游客户端不继承进程代理，避免本地业务服务被代理返回 502。
+            with httpx.Client(timeout=timeout, trust_env=False) as client:
                 return client.request(method, url, **kwargs)
 
-        return self._invoke_sync(operation, method=method, idempotency_key=idempotency_key)
+        return self._invoke_sync(operation, method=method, idempotency_key=idempotency_key, cancellation_token=cancellation_token)
 
     async def invoke(self, operation: Callable[[], Awaitable[Any]], *, method: str = "GET", idempotency_key: str | None = None) -> Any:
         """包装任意异步下游调用，例如 LLM 的 ainvoke。"""
@@ -123,7 +125,7 @@ class ResilientClient:
         finally:
             semaphore.release()
 
-    def _invoke_sync(self, operation: Callable[[], Any], *, method: str, idempotency_key: str | None) -> Any:
+    def _invoke_sync(self, operation: Callable[[], Any], *, method: str, idempotency_key: str | None, cancellation_token: Any | None = None) -> Any:
         """同步适配器，供当前同步 Tool 和 FastAPI 同步路由调用。"""
         semaphore = self._get_bulkhead()
         if not semaphore.acquire(blocking=False):
@@ -133,8 +135,12 @@ class ResilientClient:
             attempts = self._attempts(method, idempotency_key)
             for attempt in range(attempts):
                 try:
+                    if cancellation_token:
+                        cancellation_token.check()
                     with observe_downstream(self.downstream):
-                        result = operation()
+                        result = self._run_cancellable_sync(operation, cancellation_token)
+                    if cancellation_token:
+                        cancellation_token.check()
                     self._raise_for_response(result)
                     self._record_success()
                     return result
@@ -142,15 +148,46 @@ class ResilientClient:
                     if not exc.retryable or attempt == attempts - 1:
                         self._record_failure(exc)
                         raise
-                    time.sleep(self._backoff(attempt))
+                    self._cancellable_sleep(self._backoff(attempt), cancellation_token)
                 except Exception as exc:
                     error = self._classify_exception(exc)
                     if not error.retryable or attempt == attempts - 1:
                         self._record_failure(error)
                         raise error from exc
-                    time.sleep(self._backoff(attempt))
+                    self._cancellable_sleep(self._backoff(attempt), cancellation_token)
         finally:
             semaphore.release()
+
+    @staticmethod
+    def _run_cancellable_sync(operation: Callable[[], Any], cancellation_token: Any | None) -> Any:
+        """同步 SDK/HTTP 调用在线程中等待，取消时立刻放弃等待并丢弃迟到响应。"""
+        if cancellation_token is None:
+            return operation()
+        output: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+        def invoke() -> None:
+            try:
+                output.put((True, operation()))
+            except Exception as exc:
+                output.put((False, exc))
+        threading.Thread(target=invoke, name="cancellable-downstream", daemon=True).start()
+        while True:
+            cancellation_token.check()
+            try:
+                ok, value = output.get(timeout=0.15)
+                if ok:
+                    return value
+                raise value
+            except queue.Empty:
+                continue
+
+    @staticmethod
+    def _cancellable_sleep(seconds: float, cancellation_token: Any | None) -> None:
+        """重试退避期间也响应客户停止，避免取消请求进入下一次调用。"""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if cancellation_token:
+                cancellation_token.check()
+            time.sleep(min(0.1, deadline - time.monotonic()))
 
     def _attempts(self, method: str, idempotency_key: str | None) -> int:
         """限制非幂等写操作重试，防止网络抖动造成重复建单或重复催办。"""
@@ -228,15 +265,15 @@ class ResilientInvoker:
     def __init__(self, client: ResilientClient | None = None) -> None:
         self.client = client or ResilientClient(downstream="online_llm")
 
-    def invoke(self, operation: Callable[[], Any]) -> Any:
+    def invoke(self, operation: Callable[[], Any], cancellation_token: Any | None = None) -> Any:
         """包装同步 LangChain invoke，统一纳入在线 LLM 韧性策略。"""
-        return self.client._invoke_sync(operation, method="POST", idempotency_key="llm-inference")
+        return self.client._invoke_sync(operation, method="POST", idempotency_key="llm-inference", cancellation_token=cancellation_token)
 
     async def ainvoke(self, operation: Callable[[], Awaitable[Any]]) -> Any:
         """包装异步 LangChain ainvoke，供未来异步 Agent 节点复用。"""
         return await self.client.invoke(operation, method="POST", idempotency_key="llm-inference")
 
-    def stream(self, operation: Callable[[], Any]):
+    def stream(self, operation: Callable[[], Any], cancellation_token: Any | None = None):
         """包装 LangChain 原生 stream，并为首个 token 与总生成时间设置看门狗。
 
         模型供应商或 SDK 可能在建立流式连接后永久不返回任何 chunk。若直接在
@@ -284,6 +321,8 @@ class ResilientInvoker:
             received_first_chunk = False
             with observe_downstream(self.client.downstream):
                 while True:
+                    if cancellation_token:
+                        cancellation_token.check()
                     elapsed = time.monotonic() - started_at
                     remaining_total = total_timeout - elapsed
                     if remaining_total <= 0:
@@ -295,13 +334,10 @@ class ResilientInvoker:
                     # 首 token 前使用更短的等待窗口；之后仍以总时限防止长时间卡住。
                     wait_timeout = min(remaining_total, first_token_timeout if not received_first_chunk else remaining_total)
                     try:
-                        event_type, payload = messages.get(timeout=wait_timeout)
+                        event_type, payload = messages.get(timeout=min(wait_timeout, 0.15))
                     except queue.Empty as exc:
-                        raise self.client._error(
-                            "timeout",
-                            retryable=True,
-                            safe_message="模型响应超时，请稍后重试。",
-                        ) from exc
+                        # 每 150ms 检查取消；真正超时仍由总时限判定。
+                        continue
                     if event_type == "chunk":
                         received_first_chunk = True
                         yield payload

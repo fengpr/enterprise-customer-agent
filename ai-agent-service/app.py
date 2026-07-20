@@ -15,6 +15,7 @@ from agents.customer_service_agent import CustomerServiceAgent
 from rag.evaluate import evaluate as evaluate_rag
 from repositories.chat_repository import ChatMessageRepository, ChatSessionRepository
 from repositories.evaluation_repository import EvaluationRepository
+from repositories.conversation_state_repository import FollowupNotificationRepository
 from schemas.intent_schema import AgentExecutionJob, AgentReplyRequest, AnalyzeRequest, ToolCallRequest
 from services.agent_execution_queue import AgentExecutionQueue
 from services.agent_execution_service import AgentExecutionAccessDenied, AgentExecutionService
@@ -47,6 +48,7 @@ agent_execution_queue = AgentExecutionQueue()
 stream_event_service = StreamEventService()
 business_client = ResilientClient(downstream="java_business")
 identity_cache = AuthIdentityCache()
+followup_notifications = agent_execution_service.followup_notifications
 BUSINESS_SERVICE_URL = os.getenv("BUSINESS_SERVICE_URL", "http://localhost:8081")
 AGENT_INTERNAL_SECRET = os.getenv("AGENT_INTERNAL_SECRET", "enterprise-customer-agent-demo-internal-secret")
 handoff_recovery_task: asyncio.Task | None = None
@@ -341,12 +343,12 @@ async def reply_stream_v2(payload: AgentReplyRequest, request: Request, authoriz
             for event in stream_event_service.replay(request_id, cursor):
                 cursor = event["event_id"]
                 yield stream_event_service.to_sse(event)
-                if event["event_type"] in {"completed", "degraded", "error"}:
+                if event["event_type"] in {"completed", "degraded", "cancelled", "error"}:
                     return
             state = agent_execution_queue.get(request_id) or {}
-            if state.get("status") in {"SUCCESS", "DEGRADED", "FAILED", "DEAD_LETTER"}:
+            if state.get("status") in {"SUCCESS", "DEGRADED", "FAILED", "DEAD_LETTER", "CANCELLED"}:
                 result = state.get("result") or {}
-                event_type = "completed" if state.get("status") == "SUCCESS" else "degraded"
+                event_type = "completed" if state.get("status") == "SUCCESS" else ("cancelled" if state.get("status") == "CANCELLED" else "degraded")
                 event = stream_event_service.publish(request_id, event_type, {"answer": result.get("customer_message") or result.get("answer", ""), "status": state.get("status")})
                 yield stream_event_service.to_sse(event)
                 return
@@ -375,6 +377,30 @@ def get_queued_reply(request_id: str, authorization: str | None = Header(default
     if result.get("owner") != _queue_owner(authorization):
         raise HTTPException(status_code=403, detail="无权读取该请求结果")
     return result
+
+
+@app.post("/api/agent/replies/{request_id}/cancel")
+def cancel_queued_reply(request_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """停止当前 request_id 的生成；不影响同一会话中的其他请求或已提交工单。"""
+    cancelled = agent_execution_queue.cancel(request_id, _queue_owner(authorization))
+    if not cancelled:
+        # 不区分不存在与非归属任务，避免通过接口枚举其他客户请求。
+        raise HTTPException(status_code=404, detail="请求不存在或无权取消")
+    status = str(cancelled.get("status") or "CANCEL_REQUESTED")
+    result = cancelled.get("result") or {}
+    stream_event_service.publish(request_id, "cancelled" if status == "CANCELLED" else "cancelling", {
+        "answer": result.get("partial_answer") or result.get("customer_message") or "",
+        "partial": True,
+        "ticket_no": result.get("ticket_no"),
+        "service_status": result.get("service_status") or ("已停止处理" if status == "CANCELLED" else "正在停止生成"),
+    })
+    return {
+        "request_id": request_id,
+        "status": status,
+        "partial_answer": result.get("partial_answer") or result.get("customer_message") or "",
+        "ticket_no": result.get("ticket_no"),
+        "service_status": result.get("service_status") or ("已停止处理" if status == "CANCELLED" else "正在停止生成"),
+    }
 
 
 @app.post("/api/agent/tool/call")
@@ -620,6 +646,85 @@ def get_customer_order_logistics(order_no: str, authorization: str | None = Head
     if result.get("status") == "empty":
         raise HTTPException(status_code=404, detail="物流信息暂不可用")
     raise HTTPException(status_code=503, detail="物流服务暂时不可用")
+
+
+@app.get("/api/customer/notifications")
+def list_customer_notifications(
+    limit: int = 50,
+    authorization: str | None = Header(default=None),
+) -> list[dict[str, Any]]:
+    """查询当前客户自己的站内通知，不返回内部错误和工具原始结果。"""
+    current_user = _current_login_user(authorization)
+    rows = followup_notifications.list_notifications(int(current_user["customer_id"]), min(max(limit, 1), 100))
+    return [
+        {
+            "notification_id": row.get("notification_id"),
+            "session_id": row.get("session_no"),
+            "followup_id": row.get("followup_id"),
+            "type": row.get("notification_type"),
+            "title": row.get("title"),
+            "content": row.get("content"),
+            "is_read": bool(row.get("is_read")),
+            "created_at": row.get("created_at"),
+            "read_at": row.get("read_at"),
+        }
+        for row in rows
+    ]
+
+
+@app.get("/api/customer/notifications/unread-count")
+def customer_notification_unread_count(authorization: str | None = Header(default=None)) -> dict[str, int]:
+    """返回当前客户未读通知数量，供前端角标轻量轮询。"""
+    current_user = _current_login_user(authorization)
+    return {"count": followup_notifications.unread_count(int(current_user["customer_id"]))}
+
+
+@app.post("/api/customer/notifications/{notification_id}/read")
+def mark_customer_notification_read(
+    notification_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """仅允许通知所属客户标记已读。"""
+    current_user = _current_login_user(authorization)
+    if not followup_notifications.mark_read(notification_id, int(current_user["customer_id"])):
+        raise HTTPException(status_code=404, detail="通知不存在")
+    return {"notification_id": notification_id, "is_read": True}
+
+
+@app.get("/api/customer/follow-ups")
+def list_customer_followups(
+    limit: int = 50,
+    authorization: str | None = Header(default=None),
+) -> list[dict[str, Any]]:
+    """查询当前客户的复核任务，只展示调度状态与安全结果摘要。"""
+    current_user = _current_login_user(authorization)
+    rows = followup_notifications.list_followups(int(current_user["customer_id"]), min(max(limit, 1), 100))
+    return [
+        {
+            "followup_id": row.get("followup_id"),
+            "session_id": row.get("session_no"),
+            "task_type": row.get("task_type"),
+            "order_no": row.get("order_no"),
+            "scheduled_at": row.get("scheduled_at"),
+            "status": row.get("status"),
+            "result": row.get("result_summary"),
+            "created_at": row.get("created_at"),
+            "updated_at": row.get("updated_at"),
+        }
+        for row in rows
+    ]
+
+
+@app.post("/api/customer/follow-ups/{followup_id}/cancel")
+def cancel_customer_followup(
+    followup_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """取消尚未执行的本人复核任务；运行中或已完成任务不能伪装取消成功。"""
+    current_user = _current_login_user(authorization)
+    if not followup_notifications.cancel_followup(followup_id, int(current_user["customer_id"])):
+        raise HTTPException(status_code=409, detail="任务不存在或当前状态不可取消")
+    return {"followup_id": followup_id, "status": "CANCELLED"}
 
 
 @app.post("/api/staff/tickets/{ticket_no}/reply/draft")
@@ -1064,14 +1169,9 @@ def _safe_login_user_context(current_user: dict[str, Any]) -> dict[str, Any]:
 
 def _queue_execution_credential(customer_id: int, request_id: str) -> str:
     """签发短期内部执行凭证；队列不保存客户 Authorization 原始 Token。"""
-    import hashlib
-    import hmac
+    from services.downstream_identity import issue_execution_credential
 
-    expires_at = int(time.time()) + int(os.getenv("AGENT_JOB_TTL_SECONDS", "600"))
-    content = f"{customer_id}:{request_id}:{expires_at}"
-    secret = os.getenv("AGENT_EXECUTION_SECRET", AGENT_INTERNAL_SECRET)
-    signature = hmac.new(secret.encode("utf-8"), content.encode("utf-8"), hashlib.sha256).hexdigest()[:24]
-    return f"v1.{expires_at}.{signature}"
+    return issue_execution_credential(customer_id, request_id)
 
 
 def _response_detail(response: httpx.Response) -> Any:

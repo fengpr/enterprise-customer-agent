@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ChatLineRound, Headset, HomeFilled, MoreFilled, Notebook, QuestionFilled, Tickets } from '@element-plus/icons-vue'
+import { Bell, ChatLineRound, Headset, HomeFilled, MoreFilled, Notebook, QuestionFilled, Tickets } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
@@ -10,6 +10,8 @@ const props = defineProps<{ prototypeUser?: { name: string; level: string; point
 const emit = defineEmits<{ contactService: []; unavailable: []; selectSession: [sessionId: string]; sessionsChanged: [payload: { sessionId: string; deleted: boolean }] }>()
 const router = useRouter()
 const showAllSessions = ref(false)
+const unreadNotifications = ref(0)
+let notificationTimer: number | undefined
 const user = computed(() => props.prototypeUser || { name: props.user?.display_name || 'Demo Customer', level: '普通客户', points: '—' })
 type SidebarSession = { title: string; desc: string; time: string; sessionId: string; pinned: boolean }
 const sessions = computed<SidebarSession[]>(() => {
@@ -65,17 +67,46 @@ async function deleteSession(session: SidebarSession) {
     if (error !== 'cancel' && error !== 'close') return
   }
 }
-onMounted(() => window.addEventListener('click', closeContextMenu))
-onBeforeUnmount(() => window.removeEventListener('click', closeContextMenu))
+async function loadUnreadNotifications() {
+  try {
+    unreadNotifications.value = (await customerApi.notificationUnreadCount()).data.count
+  } catch {
+    // 通知角标失败不影响客户主流程，进入通知页后仍会重新读取权威数据。
+  }
+}
+onMounted(() => {
+  window.addEventListener('click', closeContextMenu)
+  void loadUnreadNotifications()
+  notificationTimer = window.setInterval(() => void loadUnreadNotifications(), 30_000)
+})
+onBeforeUnmount(() => {
+  window.removeEventListener('click', closeContextMenu)
+  window.clearInterval(notificationTimer)
+})
 </script>
 
 <template>
   <aside class="prototype-sidebar">
     <div class="prototype-brand"><span>🤖</span><strong>智能客服中心</strong></div>
     <section class="prototype-user-card"><div class="prototype-avatar">{{ user.name.slice(0, 1) }}</div><div><h2>{{ user.name }}</h2><p>{{ user.level }}</p></div><div class="prototype-points">积分 <b>{{ user.points }}</b></div></section>
-    <nav class="prototype-nav"><button v-for="item in menuItems" :key="item.label" :class="{ active: isActive(item.path) }" @click="handleMenu(item)"><el-icon><component :is="item.icon" /></el-icon>{{ item.label }}</button></nav>
+    <nav class="prototype-nav"><button v-for="item in menuItems" :key="item.label" :class="{ active: isActive(item.path) }" @click="handleMenu(item)"><el-icon><component :is="item.icon" /></el-icon>{{ item.label }}</button><button :class="{ active: isActive('/customer/notifications') }" @click="router.push('/customer/notifications')"><el-icon><Bell /></el-icon>消息通知<span v-if="unreadNotifications" class="prototype-notification-badge">{{ unreadNotifications > 99 ? '99+' : unreadNotifications }}</span></button></nav>
     <section class="prototype-sessions"><div><h2>最近会话</h2><button @click="toggleAllSessions">{{ showAllSessions ? '收起' : '查看全部' }}</button></div><div :class="['prototype-session-list', { expanded: showAllSessions }]"><div v-for="session in sessions" :key="session.sessionId || session.time" class="prototype-session" :class="{ pinned: session.pinned }" @contextmenu.prevent="openContextMenu($event, session)"><button class="prototype-session-main" @click="openSession(session.sessionId)"><i>🤖</i><span><b><svg v-if="session.pinned" class="prototype-session-pin" viewBox="0 0 16 16" role="img" aria-label="已置顶"><path d="M5.2 2.5h5.6l-1 3v1.6l1.7 1.7h-7l1.7-1.7V5.5l-1-3Z"/><path d="M8 8.8v4.7"/></svg><span>{{ session.title }}</span></b><small>{{ session.desc }}</small></span><time>{{ session.time }}</time></button><button v-if="session.sessionId" class="prototype-session-more" :aria-label="`${session.title}更多操作`" @click.stop="openContextMenu($event, session)"><el-icon><MoreFilled /></el-icon></button></div></div></section>
     <button class="prototype-contact" @click="emit('contactService')"><el-icon><Headset /></el-icon>联系客服</button>
     <div v-if="contextMenu" class="prototype-session-menu" :style="{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }" role="menu" @click.stop><button role="menuitem" @click="togglePinned(contextMenu.session)">{{ contextMenu.session.pinned ? '取消置顶' : '置顶会话' }}</button><button class="danger" role="menuitem" @click="deleteSession(contextMenu.session)">删除会话</button></div>
   </aside>
 </template>
+
+<style scoped>
+.prototype-notification-badge {
+  min-width: 18px;
+  height: 18px;
+  margin-left: auto;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: #ff5a62;
+  color: #fff;
+  font-size: 11px;
+  line-height: 18px;
+  text-align: center;
+}
+</style>

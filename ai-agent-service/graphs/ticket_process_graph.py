@@ -32,6 +32,7 @@ class TicketProcessState(TypedDict, total=False):
     ticket_result: dict[str, Any] | None
     risk_reasons: list[str]
     pending_action_request: dict[str, Any] | None
+    cancellation_token: Any
 
 
 def build_ticket_process_graph(
@@ -54,8 +55,15 @@ def build_ticket_process_graph(
     """构建客服处理 LangGraph，将 PRD 主流程显式编排为可追踪节点。"""
     graph = StateGraph(TicketProcessState)
 
+    def check_cancelled(state: TicketProcessState) -> None:
+        """每个图节点边界检查取消，阻止后续检索、工具调用和建单。"""
+        token = state.get("cancellation_token")
+        if token:
+            token.check()
+
     def analyze_node(state: TicketProcessState) -> TicketProcessState:
         """调用 LangChain 识别链，生成后续节点依赖的结构化分析结果。"""
+        check_cancelled(state)
         analysis = analyzer_chain.invoke(
             {
                 "message": state["message"],
@@ -66,10 +74,12 @@ def build_ticket_process_graph(
 
     def prepare_action_node(state: TicketProcessState) -> TicketProcessState:
         """合并通用业务动作槽位和 pending 状态，决定后续是否追问、查单或建单。"""
+        check_cancelled(state)
         return prepare_action(state)
 
     def query_order_node(state: TicketProcessState) -> TicketProcessState:
         """根据订单号或客户 ID 调用业务系统，查询结果进入后续回复依据。"""
+        check_cancelled(state)
         analysis = state["analysis"]
         selected_order_no = state.get("selected_order_no")
         context_resolution = resolve_order_context(state.get("conversation_context"), state["message"])
@@ -85,7 +95,7 @@ def build_ticket_process_graph(
         if not analysis.need_order_query and not should_use_selected_order:
             if should_list_orders_for_slots and state.get("customer_id") is not None:
                 # 动作申请缺订单时查询客户订单列表，追问时给出可选订单，减少客户重复输入成本。
-                result = query_customer_orders(state.get("customer_id"), state.get("auth_token"))
+                result = _call_tool(state, query_customer_orders, state.get("customer_id"), state.get("auth_token"))
                 log_tool_call("query_customer_orders", {"customer_id": state.get("customer_id")}, result)
                 return {"tool_results": [result]}
             # 非订单相关问题不调用业务系统，避免无意义工具调用扩大影响面。
@@ -100,19 +110,19 @@ def build_ticket_process_graph(
 
         for order_no in order_nos:
             # 用户给出明确订单号时，优先查询订单详情，避免返回过多无关订单。
-            result = query_order(order_no, state.get("auth_token"))
+            result = _call_tool(state, query_order, order_no, state.get("auth_token"))
             tool_results.append(result)
             log_tool_call("query_order", {"order_no": order_no}, result)
             if should_query_logistics:
                 # 物流意图需要继续查询完整轨迹，订单归属由 Java 物流接口再次校验。
-                logistics_result = query_order_logistics(order_no, state.get("auth_token"))
+                logistics_result = _call_tool(state, query_order_logistics, order_no, state.get("auth_token"))
                 tool_results.append(logistics_result)
                 log_tool_call("query_order_logistics", {"order_no": order_no}, logistics_result)
 
         if not order_nos and state.get("customer_id") is not None and not unresolved_fuzzy_order:
             # 没有订单号但有客户上下文时，走客户订单列表接口支持“查询我的订单”。
             customer_id = state.get("customer_id")
-            result = query_customer_orders(customer_id, state.get("auth_token"))
+            result = _call_tool(state, query_customer_orders, customer_id, state.get("auth_token"))
             tool_results.append(result)
             log_tool_call("query_customer_orders", {"customer_id": customer_id}, result)
             if should_query_logistics and result.get("status") == "success":
@@ -120,7 +130,7 @@ def build_ticket_process_graph(
                 first_order_no = orders[0].get("orderNo") if orders else None
                 if first_order_no:
                     # 客户未提供订单号时，按最近订单查询物流，避免要求客户重复补充信息。
-                    logistics_result = query_order_logistics(first_order_no, state.get("auth_token"))
+                    logistics_result = _call_tool(state, query_order_logistics, first_order_no, state.get("auth_token"))
                     tool_results.append(logistics_result)
                     log_tool_call("query_order_logistics", {"order_no": first_order_no}, logistics_result)
 
@@ -128,6 +138,7 @@ def build_ticket_process_graph(
 
     def retrieve_knowledge_node(state: TicketProcessState) -> TicketProcessState:
         """检索已发布知识库片段，为回复生成和风险校验提供依据。"""
+        check_cancelled(state)
         if "model_analyze_failed" in state["analysis"].risk_reasons:
             # 模型识别失败时直接转人工，不再用 RAG 包装成自动回复依据。
             return {"citations": []}
@@ -154,6 +165,7 @@ def build_ticket_process_graph(
 
     def risk_check_node(state: TicketProcessState) -> TicketProcessState:
         """根据知识库命中和识别风险决定是否允许自动回复。"""
+        check_cancelled(state)
         analysis = state["analysis"].model_copy(deep=True)
         risk_reasons = list(analysis.risk_reasons)
 
@@ -300,6 +312,7 @@ def build_ticket_process_graph(
 
     def create_ticket_node(state: TicketProcessState) -> TicketProcessState:
         """高风险或需建单场景通过 Java 业务系统创建工单，Python 不直接写工单主表。"""
+        check_cancelled(state)
         analysis = state["analysis"]
         if analysis.user_goal == "human_request":
             # 转人工是当前会话接管请求，不等同于创建售后/投诉等业务工单。
@@ -318,7 +331,7 @@ def build_ticket_process_graph(
             current_ticket = duplicate
             if append_ticket_information is not None and analysis.user_goal == "action_request":
                 supplement_payload = _build_ticket_supplement_payload(state)
-                supplement_result = append_ticket_information(
+                supplement_result = _call_tool(state, append_ticket_information,
                     str(duplicate.get("ticketNo") or ""),
                     supplement_payload,
                     state.get("auth_token"),
@@ -350,7 +363,7 @@ def build_ticket_process_graph(
             return {"ticket_result": duplicate_result, "tool_results": tool_results, "pending_action_request": pending}
 
         payload = _build_ticket_payload(state)
-        result = create_ticket(payload, state.get("auth_token"))
+        result = _call_tool(state, create_ticket, payload, state.get("auth_token"))
         log_tool_call("create_ticket", payload, result)
 
         tool_results = list(state.get("tool_results", []))
@@ -362,7 +375,7 @@ def build_ticket_process_graph(
             if ticket_no and should_auto_assign_ticket(state):
                 # 只有低风险且配置允许的工单才由 Agent 触发自动派单；默认进入调度队列。
                 try:
-                    assign_result = auto_assign_ticket(ticket_no)
+                    assign_result = _call_tool(state, auto_assign_ticket, ticket_no)
                 except Exception as exc:
                     # 自动派单失败不能回滚已创建工单，保持 PENDING_ASSIGN 交由调度员处理。
                     assign_result = {"status": "failed", "error": str(exc)}
@@ -383,7 +396,10 @@ def build_ticket_process_graph(
 
     def generate_reply_node(state: TicketProcessState) -> TicketProcessState:
         """在风险校验之后生成最终候选回复，确保高风险场景只给人工建议。"""
-        return {"answer": compose_answer(state)}
+        check_cancelled(state)
+        answer = compose_answer(state)
+        check_cancelled(state)
+        return {"answer": answer}
 
     # 节点顺序对应 PRD 主流程，避免 Agent 自由跳步造成不可控工具调用。
     graph.add_node("analyze", analyze_node)
@@ -757,6 +773,20 @@ def _is_logistics_query(message: str, intent: str) -> bool:
     """识别需要查询物流轨迹的只读问题，供图节点决定是否调用物流工具。"""
     logistics_words = ["物流", "快递", "配送", "发货", "签收", "送达", "到达", "到哪", "什么时候到", "转运", "路线", "全流程"]
     return intent == "logistics" or any(word in message for word in logistics_words)
+
+
+def _call_tool(state: TicketProcessState, tool: Callable[..., dict[str, Any]], *args: Any) -> dict[str, Any]:
+    """向支持取消令牌的新 Tool 透传 request 级控制；兼容旧测试替身。"""
+    token = state.get("cancellation_token")
+    if token:
+        token.check()
+    try:
+        result = tool(*args, cancellation_token=token)
+    except TypeError:
+        result = tool(*args)
+    if token:
+        token.check()
+    return result
 
 
 def _is_how_to_query(message: str) -> bool:

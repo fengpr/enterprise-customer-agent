@@ -1425,6 +1425,38 @@ textarea {
   color: #64748b;
 }
 
+/* 生成中采用克制的暖色胶囊按钮，保留停止操作辨识度但避免危险色抢占输入区视觉焦点。 */
+.generation-stop-button {
+  min-width: 94px;
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid #fed7aa;
+  border-radius: 999px;
+  color: #b45309;
+  background: #fffaf0;
+  box-shadow: 0 2px 8px rgb(180 83 9 / 8%);
+  font-weight: 600;
+  transition: border-color .18s ease, background-color .18s ease, box-shadow .18s ease, transform .18s ease;
+}
+
+.generation-stop-button:hover,
+.generation-stop-button:focus-visible {
+  border-color: #fb923c;
+  color: #9a3412;
+  background: #fff7ed;
+  box-shadow: 0 4px 12px rgb(194 65 12 / 14%);
+  transform: translateY(-1px);
+}
+
+.generation-stop-button:active {
+  transform: translateY(0);
+  box-shadow: none;
+}
+
+.generation-stop-button .el-icon {
+  margin-right: 4px;
+}
+
 .chat-input-box > p {
   margin: 2px 0 0;
   text-align: center;

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Connection, DocumentCopy, Headset, Link, Message, Position, Refresh, Service, Tickets } from '@element-plus/icons-vue'
+import { Connection, DocumentCopy, Headset, Link, Message, Position, Refresh, Service, Tickets, VideoPause } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import DOMPurify from 'dompurify'
 import MarkdownIt from 'markdown-it'
@@ -23,6 +23,7 @@ const emit = defineEmits<{
   'continue-ai': []
   'cancel-handoff': []
   submit: []
+  cancel: []
   quick: [action: string]
   regenerate: [message: string]
 }>()
@@ -436,7 +437,12 @@ watch(
           <el-icon><Message /></el-icon>
           <el-icon><Link /></el-icon>
         </div>
-        <el-button :icon="Position" :loading="submitting" circle type="primary" @click="emit('submit')" />
+        <el-tooltip v-if="submitting" content="停止本次生成，已显示的内容会保留" placement="top">
+          <el-button class="generation-stop-button" :icon="VideoPause" aria-label="停止生成" @click="emit('cancel')">
+            停止生成
+          </el-button>
+        </el-tooltip>
+        <el-button v-else :icon="Position" circle type="primary" @click="emit('submit')" />
       </div>
       <p>内容由 AI 生成，仅供参考</p>
     </div>

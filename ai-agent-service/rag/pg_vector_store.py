@@ -35,6 +35,7 @@ class PgVectorStore:
         business_scope: str | None = None,
         collection: str | None = None,
         top_k: int = 5,
+        rewrite_mode: str = "rule_fallback",
     ) -> list[Citation]:
         """执行 pgvector 检索，并在低于阈值时返回空 citations 触发 no_kb_hit。"""
         started = time.perf_counter()
@@ -48,6 +49,7 @@ class PgVectorStore:
             "user_goal": user_goal,
             "business_scope": resolved_scope,
             "rewritten_query": rewritten_query,
+            "query_rewrite_mode": rewrite_mode,
             "collection": collection,
             "allowed_collections": allowed_collections,
             "answerable_intent_filter": self.config.answerable_intent_filter,
@@ -72,7 +74,7 @@ class PgVectorStore:
         no_hit = not ranked or best_similarity < self.config.min_similarity_score
         selected = [] if no_hit else ranked[:top_n_context]
         citations = [
-            self._to_citation(row, query=rewritten_query, final_rank=index + 1)
+            self._to_citation(row, query=rewritten_query, final_rank=index + 1, rewrite_mode=rewrite_mode)
             for index, row in enumerate(selected)
         ]
         self._log_retrieval(
@@ -182,7 +184,7 @@ class PgVectorStore:
         ranked.sort(key=lambda item: item["rerank_score"], reverse=True)
         return ranked
 
-    def _to_citation(self, row: dict[str, Any], *, query: str, final_rank: int) -> Citation:
+    def _to_citation(self, row: dict[str, Any], *, query: str, final_rank: int, rewrite_mode: str = "rule_fallback") -> Citation:
         """把数据库行转换为 Agent 可消费的 Citation，隐藏原始向量。"""
         metadata = dict(row.get("metadata") or {})
         metadata.update(
@@ -197,6 +199,7 @@ class PgVectorStore:
                 "similarity_score": float(row["similarity_score"]),
                 "rerank_score": float(row["rerank_score"]),
                 "rewritten_query": query,
+                "query_rewrite_mode": rewrite_mode,
                 "final_rank": final_rank,
             }
         )

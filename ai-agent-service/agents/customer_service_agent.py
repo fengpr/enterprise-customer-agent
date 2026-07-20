@@ -18,6 +18,7 @@ from agents.intent_normalizer import (
     is_human_request_message,
     is_identity_message as normalize_is_identity_message,
     is_logistics_message as normalize_is_logistics_message,
+    is_order_detail_query_message,
     is_order_query_message as normalize_is_order_query_message,
     is_order_statistics_message,
     is_out_of_scope_message,
@@ -47,6 +48,7 @@ class CustomerServiceAgent:
         self.llm_analyzer = self._create_llm_analyzer()
         # 流式回调只在单次 Worker 执行期间设置，避免跨请求泄露输出。
         self._stream_delta_callback = None
+        self._cancellation_token = None
 
         # 真实 LLM 识别失败时自动降级，保证客服链路不会因模型异常中断。
         self.analyzer_chain = RunnableLambda(self._analyze_with_llm_fallback)
@@ -85,9 +87,13 @@ class CustomerServiceAgent:
             "response_temperature": self.llm_analyzer.response_temperature,
         }
 
-    def reply(self, request: AgentReplyRequest) -> AgentReply:
+    def reply(self, request: AgentReplyRequest, cancellation_token=None) -> AgentReply:
         """执行完整客服 Agent 图，输出回复内容、是否转人工、引用和工具结果。"""
-        state = self.graph.invoke(
+        if cancellation_token:
+            cancellation_token.check()
+        self._cancellation_token = cancellation_token
+        try:
+            state = self.graph.invoke(
             {
                 "message": request.message,
                 "session_id": request.session_id,
@@ -99,8 +105,15 @@ class CustomerServiceAgent:
                 "conversation_context": request.conversation_context,
                 "tool_results": [],
                 "citations": [],
+                "cancellation_token": cancellation_token,
             }
-        )
+            )
+        finally:
+            # 实例会被 Worker 复用，必须避免取消令牌跨请求泄漏。
+            self._cancellation_token = None
+
+        if cancellation_token:
+            cancellation_token.check()
 
         customer_message = self._build_customer_message(state)
         # 记录回答与本轮召回证据的对应关系，供线上审计和离线回归使用。
@@ -332,11 +345,11 @@ class CustomerServiceAgent:
             "后续将由专人跟进，请您稍候。"
         )
 
-    def reply_with_stream(self, request: AgentReplyRequest, on_delta) -> AgentReply:
+    def reply_with_stream(self, request: AgentReplyRequest, on_delta, cancellation_token=None) -> AgentReply:
         """执行既有 Agent 图，并把最终生成节点的模型原生 token 回调给 Worker。"""
         self._stream_delta_callback = on_delta
         try:
-            return self.reply(request)
+            return self.reply(request, cancellation_token=cancellation_token)
         finally:
             # 无论模型、工具或图节点是否异常，都不能让后续请求复用旧连接回调。
             self._stream_delta_callback = None
@@ -499,6 +512,10 @@ class CustomerServiceAgent:
         if self._is_session_memory_question(state["message"]):
             return self._compose_session_memory_answer(state)
 
+        delivery_contingency_answer = self._compose_delivery_contingency_answer(state)
+        if delivery_contingency_answer:
+            return delivery_contingency_answer
+
         order_context_answer = self._compose_order_context_guardrail_answer(state)
         if order_context_answer:
             return order_context_answer
@@ -506,6 +523,10 @@ class CustomerServiceAgent:
         other_identity_order_answer = self._compose_other_identity_order_answer(state)
         if other_identity_order_answer:
             return other_identity_order_answer
+
+        # 前端已明确选中订单时，工具失败只能说明下游暂时不可用，绝不能误导客户再次提供订单号。
+        if self._has_failed_selected_order_query(state):
+            return order_text or "已关联您当前选中的订单，但暂时无法获取最新状态。请稍后重试，或联系人工客服继续核实。"
 
         if analysis.user_goal == "info_query" and self._is_agent_identity_message(state["message"]):
             return self._compose_agent_identity_answer(state)
@@ -597,6 +618,34 @@ class CustomerServiceAgent:
         order_answer = self._format_order_intent_answer(state, citations)
 
         if order_answer and not analysis.need_human:
+            if is_order_detail_query_message(state["message"]):
+                # 可信字段先确定性展示，再由模型补充自然解读；模型失败时不影响订单事实回复。
+                supplement = self._compose_llm_customer_answer(
+                    state,
+                    reply_mode="product_overview",
+                    service_instruction=(
+                        "只生成两到四句商品补充说明，不要重复订单号、数量、金额、状态等已展示字段。"
+                        "可以根据已核验的商品名称和分类，用‘从品类看’‘通常适合’等审慎表达说明常见用途；"
+                        "不得编造芯片、速率、覆盖范围、材质、兼容协议等具体参数。"
+                        "性价比只能结合当前成交价作条件式说明，不得声称全网最低或绝对值得购买。"
+                        "输入没有真实评价摘要时，必须明确暂无可核验的用户评价数据，不得虚构评分、好评率或用户口碑。"
+                    ),
+                    extra_context={
+                        "product_interpretation_scope": "仅允许常见用途和条件式性价比分析",
+                        "review_summary": None,
+                        "review_evidence_available": False,
+                    },
+                )
+                if supplement:
+                    return f"{order_answer}\n\n补充说明：{supplement}"
+                return order_answer
+            # 物流状态、位置与预计送达时间属于实时业务事实；直接使用工具格式化结果，禁止 LLM 把绝对日期误写成“今天/明天”。
+            if (
+                analysis.user_goal == "status_query"
+                and (analysis.intent == "logistics" or self._is_logistics_message(state["message"]))
+                and (self._first_logistics_result(state.get("tool_results", [])) or {}).get("status") == "success"
+            ):
+                return order_answer
             # 订单信息只是上下文，最终回答需要按用户真实意图区分物流、政策或普通查单。
             llm_answer = self._compose_llm_customer_answer(
                 state,
@@ -629,7 +678,12 @@ class CustomerServiceAgent:
                 "当前涉及换货争议，需要人工客服核实订单、商品问题描述和商家处理记录。"
                 f"{order_context}客服会结合企业售后规则继续跟进。{ticket_text}"
             )
-        if analysis.need_order_query and not analysis.order_no and not self._has_customer_order_attempt(state):
+        if (
+            analysis.need_order_query
+            and not analysis.order_no
+            and not state.get("selected_order_no")
+            and not self._has_customer_order_attempt(state)
+        ):
             # 物流、退款、售后类问题需要订单号才能查业务系统，先引导用户补充关键信息。
             llm_answer = self._compose_llm_customer_answer(
                 state,
@@ -985,6 +1039,9 @@ class CustomerServiceAgent:
         """在历史订单需要确认或已过期时，优先给出确定性追问，避免误查单或误建单。"""
         message = state["message"]
         if not has_fuzzy_order_reference(message):
+            return ""
+        if str(state.get("selected_order_no") or "").strip():
+            # 本轮前端明确选择优先于历史模糊指代；订单归属仍由本轮 Java Tool 查询结果校验。
             return ""
         resolution = resolve_order_context(state.get("conversation_context"), message)
         if resolution.get("status") == "needs_confirmation" and resolution.get("order_no"):
@@ -1463,9 +1520,15 @@ class CustomerServiceAgent:
 
     def _generate_llm_reply(self, payload: dict) -> str:
         """兼容旧 LLM 测试替身；仅真实流式执行时向生成器传入 token 回调。"""
-        if getattr(self, "_stream_delta_callback", None) is None:
-            return self.llm_analyzer.generate_customer_reply(payload)
-        return self.llm_analyzer.generate_customer_reply(payload, on_delta=self._stream_delta_callback)
+        try:
+            if getattr(self, "_stream_delta_callback", None) is None:
+                return self.llm_analyzer.generate_customer_reply(payload, cancellation_token=getattr(self, "_cancellation_token", None))
+            return self.llm_analyzer.generate_customer_reply(payload, on_delta=self._stream_delta_callback, cancellation_token=getattr(self, "_cancellation_token", None))
+        except TypeError:
+            # 旧版测试替身与扩展点尚未声明取消参数时保持既有调用协议。
+            if getattr(self, "_stream_delta_callback", None) is None:
+                return self.llm_analyzer.generate_customer_reply(payload)
+            return self.llm_analyzer.generate_customer_reply(payload, on_delta=self._stream_delta_callback)
 
     @staticmethod
     def _is_safe_customer_reply(answer: str) -> bool:
@@ -1620,6 +1683,11 @@ class CustomerServiceAgent:
                     return "\n".join(lines)
 
             if item.get("query_type") == "order_detail":
+                if item.get("status") == "failed":
+                    return (
+                        f"已关联您当前选中的订单 {item.get('order_no')}，"
+                        "但订单服务暂时无法获取最新信息。请稍后重试，或联系人工客服继续核实。"
+                    )
                 if item.get("status") == "empty":
                     return f"没有查询到订单 {item.get('order_no')}，请核对订单号是否正确。"
                 if item.get("status") == "success":
@@ -1630,6 +1698,19 @@ class CustomerServiceAgent:
                         f"售后状态 {order.get('afterSaleStatus') or 'NONE'}。"
                     )
         return ""
+
+    @staticmethod
+    def _has_failed_selected_order_query(state: TicketProcessState) -> bool:
+        """判断当前前端已选订单是否在查询阶段失败，防止失败时退化为索要订单号。"""
+        selected_order_no = str(state.get("selected_order_no") or "").strip()
+        if not selected_order_no:
+            return False
+        return any(
+            item.get("query_type") in {"order_detail", "order_logistics"}
+            and str(item.get("order_no") or "") == selected_order_no
+            and item.get("status") == "failed"
+            for item in state.get("tool_results", [])
+        )
 
     def _format_ticket_progress_answer(self, state: TicketProcessState) -> str:
         """根据工单查询或催办工具结果生成客户侧兜底回复。"""
@@ -1692,6 +1773,9 @@ class CustomerServiceAgent:
             return self._format_order_tool_text(state.get("tool_results", []))
 
         order_summary = self._format_order_summary(order)
+        if is_order_detail_query_message(message):
+            # 订单商品介绍只展示 Java 已核验的业务字段，不能凭商品名编造功能、参数或营销卖点。
+            return self._format_selected_order_product_answer(order)
         if self._is_logistics_message(message) or analysis.intent == "logistics":
             logistics_answer = self._format_logistics_answer(state, order)
             if logistics_answer:
@@ -1714,6 +1798,77 @@ class CustomerServiceAgent:
             )
 
         return self._format_order_tool_text(state.get("tool_results", []))
+
+    def _format_selected_order_product_answer(self, order: dict[str, Any]) -> str:
+        """基于订单详情中的可信字段介绍商品，信息不足时明确边界而不是返回无依据兜底。"""
+        lines = [
+            f"您当前选中的是订单 {order.get('orderNo')}，其中的商品是 {order.get('productName') or '商品名称暂未记录'}。",
+        ]
+        details: list[str] = []
+        if order.get("productCategory"):
+            details.append(f"分类：{order.get('productCategory')}")
+        if order.get("quantity") is not None:
+            details.append(f"数量：{order.get('quantity')} 件")
+        if order.get("amount") is not None:
+            details.append(f"订单实付：¥{order.get('amount')}")
+        if order.get("warrantyDays") is not None:
+            details.append(f"质保期：{order.get('warrantyDays')} 天")
+        if order.get("returnable") is not None:
+            details.append(f"支持退货：{'是' if order.get('returnable') else '否'}（最终以售后规则和审核结果为准）")
+        if details:
+            lines.append("；".join(details) + "。")
+        lines.append(f"当前订单状态：{self._order_status(order)}，售后状态：{order.get('afterSaleStatus') or 'NONE'}。")
+        lines.append("以上是业务系统中已核验的商品与订单信息；更详细的功能参数需要以商品详情页为准。")
+        return "\n".join(lines)
+
+    def _compose_delivery_contingency_answer(self, state: TicketProcessState) -> str:
+        """处理“若未送达则售后”的条件性诉求，避免把未来假设误当作立即退货申请。"""
+        message = str(state.get("message") or "")
+        if not self._is_delivery_contingency_message(message):
+            return ""
+
+        # 前端实时选中订单优先，其次仅展示本轮工具已核验的订单，不能从长期历史猜测订单。
+        order_no = str(state.get("selected_order_no") or "").strip()
+        order = self._first_success_order(state.get("tool_results", [])) or {}
+        order_no = order_no or str(order.get("orderNo") or "").strip()
+        if not order_no:
+            return (
+                "我理解您的诉求：如果到约定时间仍未收到商品，希望继续办理售后。"
+                "目前还没有关联具体订单，请先在“我的订单”中选择对应订单或提供订单号。"
+                "届时如仍未收到，直接告诉我“仍未收到”即可；系统会先核查最新物流和签收记录，"
+                "再按核查结果处理物流异常或退货申请，不能提前承诺退货一定成功。"
+            )
+
+        product_name = str(order.get("productName") or "").strip()
+        order_label = f"订单 {order_no}" + (f"（{product_name}）" if product_name else "")
+        return (
+            f"已记录您对{order_label}的处理诉求：若到约定时间仍未收到，希望办理售后。"
+            "现在不宜提前提交退货申请，以免包裹仍在配送或物流状态尚未同步造成误处理。\n\n"
+            "届时请保持该订单选中，并回复“仍未收到”或点击“查看物流”。我会先核查最新物流和签收记录："
+            "仍在运输中会继续跟进配送；若系统显示已签收但您未收到，会登记物流异常并转人工核实；"
+            "退货申请将以订单核验和售后审核结果为准。"
+        )
+
+    @staticmethod
+    def _is_delivery_contingency_message(message: str) -> bool:
+        """识别“未来未送达时再售后”的条件表达，不把普通退货或物流查询误拦截。"""
+        text = message.strip()
+        # “收不到”与“未收到”语义相同，但前者不一定命中通用未收货识别器，需在此覆盖自然表达。
+        has_delivery_absence = is_delivery_not_received_message(text) or any(
+            word in text
+            for word in ["收不到", "没收到", "未收到", "还没收到", "包裹没到", "快递没到", "货没到"]
+        )
+        if not text or not has_delivery_absence:
+            return False
+        has_after_sale_request = any(word in text for word in ["退货", "退款", "售后", "处理"]) or bool(
+            # 单独的“退了/退吧”只有处在动作语境时才视为售后请求，避免把普通“退回”误判。
+            re.search(r"(?:帮我|给我|就|要|想|申请).{0,4}退(?:了|吧)?", text)
+        )
+        has_future_condition = any(
+            word in text
+            for word in ["如果", "要是", "若", "到时候", "明天", "后天", "届时", "再"]
+        )
+        return has_after_sale_request and has_future_condition
 
     def _format_logistics_answer(self, state: TicketProcessState, order: dict[str, Any]) -> str:
         """把物流工具结果整理成客户可读回复，包含路线、转运站和轨迹节点。"""
@@ -1743,7 +1898,7 @@ class CustomerServiceAgent:
             f"运单号：{logistics.get('trackingNo') or '未记录'}",
             f"物流状态：{self._logistics_status(logistics.get('logisticsStatus'))}",
             f"最新位置：{logistics.get('latestLocation') or '暂无'}",
-            f"预计送达时间：{self._format_time(logistics.get('estimatedDeliveryTime'))}",
+            f"预计送达时间：{self._format_estimated_delivery_time(logistics.get('estimatedDeliveryTime'))}",
         ]
         route_summary = logistics.get("routeSummary")
         if route_summary:
@@ -1849,6 +2004,24 @@ class CustomerServiceAgent:
             return "暂无"
         text = str(value)
         return text.replace("T", " ")[:16]
+
+    @classmethod
+    def _format_estimated_delivery_time(cls, value: Any) -> str:
+        """保留预计送达绝对时间；如果预计时间已过，明确说明其仅为历史预估。"""
+        formatted = cls._format_time(value)
+        if not value:
+            return formatted
+        try:
+            parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone().replace(tzinfo=None)
+            # 过期的预计时间不能再被描述为“今天送达”，应提醒客户以最新节点为准。
+            if parsed < datetime.now():
+                return f"{formatted}（该预计时间已过，请以最新物流节点为准）"
+        except (TypeError, ValueError):
+            # 格式异常时保留原始可见时间，避免因展示层异常丢弃可用业务信息。
+            pass
+        return formatted
 
     @staticmethod
     def _logistics_status(status: Any) -> str:

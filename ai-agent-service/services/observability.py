@@ -48,6 +48,12 @@ DLQ_DEPTH = Gauge("agent_dead_letter_depth", "死信队列任务数")
 CACHE = Counter("agent_cache_operations_total", "缓存操作次数", ["cache", "outcome"])
 QUEUE_RETRIES = Gauge("agent_queue_retrying", "正在重试的队列任务数")
 QUEUE_RUNNING = Gauge("agent_queue_running", "正在执行的队列任务数")
+CANCELLATIONS = Counter("agent_execution_cancellations_total", "Agent 取消请求数", ["outcome"])
+CANCELLATION_DURATION = Histogram("agent_execution_cancel_duration_seconds", "Agent 从请求取消到确认终止耗时")
+CANCELLATION_PARTIAL_TOKENS = Histogram("agent_execution_cancel_partial_tokens", "取消前已输出的文本片段数")
+# 查询重写单独统计，避免与客户回复模型、DeepEval Judge 的调用量混在一起。
+RAG_QUERY_REWRITES = Counter("agent_rag_query_rewrite_total", "RAG 查询重写次数", ["outcome"])
+RAG_QUERY_REWRITE_DURATION = Histogram("agent_rag_query_rewrite_duration_seconds", "RAG 查询重写耗时")
 
 
 def set_request_context(request_id: str | None = None, trace_id: str | None = None) -> tuple[str, str]:

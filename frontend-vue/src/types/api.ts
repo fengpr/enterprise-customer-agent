@@ -301,3 +301,27 @@ export interface StaffMemberAvailabilityRequest {
   acceptingTickets: boolean
   maxActiveTickets: number
 }
+
+export interface CustomerNotification {
+  notification_id: string
+  session_id: string
+  followup_id?: string | null
+  type: string
+  title: string
+  content: string
+  is_read: boolean
+  created_at: string
+  read_at?: string | null
+}
+
+export interface CustomerFollowup {
+  followup_id: string
+  session_id: string
+  task_type: string
+  order_no: string
+  scheduled_at: string
+  status: 'PENDING' | 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED' | string
+  result?: Record<string, unknown> | null
+  created_at: string
+  updated_at: string
+}

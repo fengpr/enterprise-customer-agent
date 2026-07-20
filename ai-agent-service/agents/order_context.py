@@ -9,6 +9,7 @@ RECENT_CONTEXT_SECONDS = 5 * 60
 CONFIRM_CONTEXT_SECONDS = 30 * 60
 CONFIRMED_SOURCES = {"selected_by_user", "mentioned_by_user", "confirmed_by_user"}
 FUZZY_ORDER_KEYWORDS = [
+    "该订单",
     "这个订单",
     "那个订单",
     "这笔订单",

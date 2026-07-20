@@ -9,6 +9,8 @@
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RedisUrl = "redis://127.0.0.1:6379/0"
+# 本地一键启动时显式指定 Java 服务地址，避免继承到其他环境的 BUSINESS_SERVICE_URL。
+$BusinessServiceUrl = "http://127.0.0.1:8081"
 $agentDir = Join-Path $Root "ai-agent-service"
 $python = Join-Path $agentDir ".venv\Scripts\python.exe"
 $runtimeDir = Join-Path $Root ".runtime"
@@ -282,6 +284,17 @@ function Test-AgentWorkerAlive {
     }
 }
 
+function Test-FollowupWorkerAlive {
+    param([string]$AgentDirectory)
+    Push-Location $AgentDirectory
+    try {
+        & .\.venv\Scripts\python.exe -c "from services.scheduled_followup_service import ScheduledFollowupQueue; raise SystemExit(0 if ScheduledFollowupQueue().has_active_worker() else 1)" 2>$null
+        return $LASTEXITCODE -eq 0
+    } finally {
+        Pop-Location
+    }
+}
+
 function Start-ContainerIfNeeded {
     param([string]$Name, [string]$Image, [string[]]$Arguments)
     Write-Host "Checking container $Name..."
@@ -338,7 +351,7 @@ if (-not $SkipAgent) {
         }
         if (-not $agentReady) {
             Write-Host "Starting AI Agent API on port 8000..."
-            Start-ServiceWindow "ai-agent-service :8000" $agentDir "`$env:REDIS_URL='$RedisUrl'; `$env:AGENT_EXECUTION_QUEUE_ENABLED='$queueEnabled'; .\.venv\Scripts\python.exe -m uvicorn app:app --reload --port 8000"
+            Start-ServiceWindow "ai-agent-service :8000" $agentDir "`$env:REDIS_URL='$RedisUrl'; `$env:BUSINESS_SERVICE_URL='$BusinessServiceUrl'; `$env:AGENT_EXECUTION_QUEUE_ENABLED='$queueEnabled'; .\.venv\Scripts\python.exe -m uvicorn app:app --reload --port 8000"
             # Agent 初始化包含 RAG、Repository 和模型配置加载，必须就绪后才能让 Vite 发起首屏请求。
             $agentReady = Wait-PortOpen 8000 120 "AI Agent API"
         } else {
@@ -350,7 +363,7 @@ if (-not $SkipAgent) {
             $workerAlive = Test-AgentWorkerAlive $agentDir
             if (-not $workerAlive) {
                 Write-Host "Starting Agent Worker..."
-                Start-ServiceWindow "agent-worker" $agentDir "`$env:REDIS_URL='$RedisUrl'; `$env:AGENT_EXECUTION_QUEUE_ENABLED='true'; `$env:AGENT_WORKER_NAME='local-agent-worker'; .\.venv\Scripts\python.exe -m rag.agent_execution_worker"
+                Start-ServiceWindow "agent-worker" $agentDir "`$env:REDIS_URL='$RedisUrl'; `$env:BUSINESS_SERVICE_URL='$BusinessServiceUrl'; `$env:AGENT_EXECUTION_QUEUE_ENABLED='true'; `$env:AGENT_WORKER_NAME='local-agent-worker'; .\.venv\Scripts\python.exe -m rag.agent_execution_worker"
                 for ($attempt = 0; $attempt -lt 10 -and -not $workerAlive; $attempt++) {
                     Start-Sleep -Seconds 1
                     $workerAlive = Test-AgentWorkerAlive $agentDir
@@ -362,6 +375,21 @@ if (-not $SkipAgent) {
                 }
             } else {
                 Write-Host "Agent Worker heartbeat is already healthy."
+            }
+            # 通过版本化 Redis 心跳判断复核 Worker，避免依赖受权限限制的系统进程枚举。
+            $followupWorkerAlive = Test-FollowupWorkerAlive $agentDir
+            if (-not $followupWorkerAlive) {
+                Write-Host "Starting Scheduled Follow-up Worker..."
+                Start-ServiceWindow "followup-worker" $agentDir "`$env:REDIS_URL='$RedisUrl'; `$env:BUSINESS_SERVICE_URL='$BusinessServiceUrl'; .\.venv\Scripts\python.exe -m rag.scheduled_followup_worker"
+                for ($attempt = 0; $attempt -lt 10 -and -not $followupWorkerAlive; $attempt++) {
+                    Start-Sleep -Seconds 1
+                    $followupWorkerAlive = Test-FollowupWorkerAlive $agentDir
+                }
+                if (-not $followupWorkerAlive) {
+                    Write-Warning "Scheduled Follow-up Worker heartbeat was not detected within 10 seconds."
+                }
+            } else {
+                Write-Host "Scheduled Follow-up Worker is already running."
             }
         } else {
             Write-Warning "Skipped Agent Worker because Redis is unavailable."

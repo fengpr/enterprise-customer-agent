@@ -204,10 +204,26 @@ def is_delivery_not_received_message(message: str) -> bool:
 
 def is_order_query_message(message: str) -> bool:
     """识别泛订单查询表达。"""
-    return is_order_statistics_message(message) or contains_any(
+    return is_order_statistics_message(message) or is_order_detail_query_message(message) or contains_any(
         message,
         ["查询我的订单", "查我的订单", "我的订单", "查询订单", "查订单", "订单列表", "订单记录", "买过什么", "买了什么", "买了哪些", "购买记录"],
     )
+
+
+def is_order_detail_query_message(message: str) -> bool:
+    """识别针对某笔订单或其中商品的事实查询，不把商品故障、投诉等动作诉求误归为详情查询。"""
+    text = re.sub(r"[\s？?。！!，,；;：:]+", "", message.strip().lower())
+    if not text or contains_any(text, ["坏了", "故障", "质量问题", "投诉", "退货", "退款", "换货", "维修"]):
+        return False
+    entity_reference = contains_any(
+        text,
+        ["该订单", "这个订单", "这笔订单", "当前订单", "这单", "订单的商品", "订单商品", "这件商品", "当前商品"],
+    )
+    detail_goal = contains_any(
+        text,
+        ["介绍", "详情", "详细信息", "商品信息", "产品信息", "是什么商品", "什么商品", "商品名称", "产品名称", "多少钱", "价格", "金额", "数量", "几件", "分类", "保修", "质保", "支持退货"],
+    )
+    return entity_reference and detail_goal
 
 
 def is_order_statistics_message(message: str) -> bool:

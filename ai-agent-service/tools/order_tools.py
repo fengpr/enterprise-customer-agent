@@ -17,13 +17,20 @@ class OrderTools:
         self.client = client or ResilientClient(downstream="java_order")
         self.cache = cache or CacheService(namespace="business")
 
-    def query_order(self, order_no: str, auth_token: str | None = None) -> dict:
+    def query_order(self, order_no: str, auth_token: str | None = None, cancellation_token=None) -> dict:
         """查询订单详情；查询类请求在网络和服务端错误时可安全重试。"""
         if not order_no:
             return {"status": "failed", "error": "order_no is required"}
         try:
             key = self.cache.key("order", customer=self._customer_key(auth_token), order_no=order_no)
-            data = self.cache.get_or_load(key, int(os.getenv("ORDER_CACHE_TTL_SECONDS", "60")), lambda: self.client.request_sync("GET", f"{self.base_url}/api/orders/{order_no}", headers=self._headers(auth_token)).json(), metric="order_cache_hit")
+            if cancellation_token:
+                cancellation_token.check()
+            headers = self._headers(auth_token)
+            if cancellation_token:
+                headers["X-Agent-Request-Id"] = cancellation_token.request_id
+            data = self.cache.get_or_load(key, int(os.getenv("ORDER_CACHE_TTL_SECONDS", "60")), lambda: self.client.request_sync("GET", f"{self.base_url}/api/orders/{order_no}", headers=headers, cancellation_token=cancellation_token).json(), metric="order_cache_hit")
+            if cancellation_token:
+                cancellation_token.check()
             return {"status": "empty", "order_no": order_no} if not data else {"status": "success", "query_type": "order_detail", "order_no": order_no, "data": data}
         except ResilienceError as exc:
             return self._failure("order_detail", exc, order_no=order_no)

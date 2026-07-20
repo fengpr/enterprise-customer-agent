@@ -8,16 +8,20 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from schemas.intent_schema import AgentExecutionJob
-from services.observability import DLQ_DEPTH, QUEUE_DEPTH, QUEUE_PENDING, QUEUE_RETRIES, QUEUE_RUNNING
+from services.observability import CANCELLATIONS, DLQ_DEPTH, QUEUE_DEPTH, QUEUE_PENDING, QUEUE_RETRIES, QUEUE_RUNNING
+from services.execution_cancellation import CancellationToken
 
 
 class AgentExecutionQueue:
     """提供 Stream 入队、ACK、Pending 恢复、重试、死信与幂等状态管理。"""
 
-    stream_key = "agent:execution:stream"
-    dead_letter_key = "agent:execution:dead-letter"
-    group_name = "agent-execution-workers"
-    worker_heartbeat_prefix = "agent:execution:worker:heartbeat:"
+    # v2 隔离旧常驻 Worker；代码升级后旧进程不能再随机消费新协议任务。
+    stream_key = "agent:execution:stream:v2"
+    dead_letter_key = "agent:execution:dead-letter:v2"
+    group_name = "agent-execution-workers-v2"
+    worker_heartbeat_prefix = "agent:execution:worker:heartbeat:v2:"
+    cancel_prefix = "agent:execution:cancel:"
+    session_lock_prefix = "agent:execution:session-lock:"
 
     def __init__(self, redis_client: Any | None = None, consumer_name: str | None = None) -> None:
         """初始化 Redis 客户端和 Consumer Group；注入客户端便于集成测试。"""
@@ -33,6 +37,7 @@ class AgentExecutionQueue:
         self.redis_socket_timeout_seconds = max(configured_socket_timeout, self.claim_block_ms / 1000 + 1)
         # 心跳 TTL 要略大于空闲轮询周期，同时能尽快识别卡在下游调用中的失联 Worker。
         self.worker_heartbeat_ttl = int(os.getenv("AGENT_WORKER_HEARTBEAT_TTL_SECONDS", "20"))
+        self._supports_xautoclaim: bool | None = None
         if self._redis is None:
             redis_url = os.getenv("REDIS_URL")
             if not redis_url:
@@ -98,6 +103,33 @@ class AgentExecutionQueue:
         except Exception:
             return False
 
+    def acquire_session_lock(self, session_id: str | None, ttl_seconds: int = 120) -> str | None:
+        """为同一会话加短期分布式锁，避免连续消息被不同 Worker 并发覆盖。"""
+        if not self.enabled or not session_id:
+            return "no-session-lock"
+        token = uuid.uuid4().hex
+        key = f"{self.session_lock_prefix}{session_id}"
+        try:
+            return token if self._redis.set(key, token, nx=True, ex=ttl_seconds) else None
+        except Exception:
+            return None
+
+    def release_session_lock(self, session_id: str | None, token: str | None) -> None:
+        """仅由持锁 Worker 释放锁，避免误删其他任务刚续上的锁。"""
+        if not self.enabled or not session_id or not token or token == "no-session-lock":
+            return
+        key = f"{self.session_lock_prefix}{session_id}"
+        try:
+            self._redis.eval(
+                "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+                1,
+                key,
+                token,
+            )
+        except Exception:
+            # 锁具备 TTL，释放失败不会永久阻塞会话。
+            pass
+
     def snapshot(self) -> dict[str, Any]:
         """返回内部监控页需要的队列实时快照；Redis 异常时只标记不可用，不影响业务接口。"""
         if not self.enabled:
@@ -157,13 +189,18 @@ class AgentExecutionQueue:
     def recover_pending(self) -> tuple[str, str, AgentExecutionJob, int] | None:
         """通过 XAUTOCLAIM 领取超过可见性超时的 Pending 消息，支持 Worker 重启恢复。"""
         self._require_enabled()
-        try:
-            response = self._redis.xautoclaim(self.stream_key, self.group_name, self.consumer_name, self.visibility_timeout_ms, "0-0", count=1)
-            messages = response[1] if isinstance(response, (tuple, list)) and len(response) > 1 else []
-        except Exception as exc:
-            # Redis 5 不支持 XAUTOCLAIM，使用 XPENDING + XCLAIM 实现等价的超时恢复。
-            if "unknown command" not in str(exc).lower() and "xautoclaim" not in str(exc).lower():
-                raise
+        messages: list[Any] = []
+        if self._supports_xautoclaim is not False:
+            try:
+                response = self._redis.xautoclaim(self.stream_key, self.group_name, self.consumer_name, self.visibility_timeout_ms, "0-0", count=1)
+                self._supports_xautoclaim = True
+                messages = response[1] if isinstance(response, (tuple, list)) and len(response) > 1 else []
+            except Exception as exc:
+                # Redis 5 不支持 XAUTOCLAIM，首次探测后固定使用兼容路径，避免每轮触发服务端错误。
+                if "unknown command" not in str(exc).lower() and "xautoclaim" not in str(exc).lower():
+                    raise
+                self._supports_xautoclaim = False
+        if self._supports_xautoclaim is False:
             pending = self._redis.xpending_range(self.stream_key, self.group_name, "-", "+", 1)
             expired_ids = [item["message_id"] for item in pending if int(item.get("time_since_delivered", 0)) >= self.visibility_timeout_ms]
             messages = self._redis.xclaim(
@@ -182,8 +219,64 @@ class AgentExecutionQueue:
         self._redis.xack(self.stream_key, self.group_name, stream_id)
         self._refresh_metrics()
 
+    def cancel(self, request_id: str, owner: str) -> dict[str, Any] | None:
+        """写入短期取消标记；仅任务归属者可停止当前 request_id。"""
+        self._require_enabled()
+        state = self.get(request_id)
+        if not state or state.get("owner") != owner:
+            return None
+        status = state.get("status")
+        if status in {"SUCCESS", "DEGRADED", "FAILED", "DEAD_LETTER", "CANCELLED"}:
+            return state
+        self._redis.setex(self._cancel_key(request_id), self.ttl_seconds, "1")
+        # 排队任务尚未产生可见文本，可直接成为取消终态；运行中交由 Worker 保存部分文本。
+        next_status = "CANCELLED" if status == "PENDING" else "CANCEL_REQUESTED"
+        result = state.get("result") or {}
+        result.setdefault("request_id", request_id)
+        result.setdefault("partial_answer", "")
+        result.setdefault("customer_message", "已停止本次生成。")
+        result.setdefault("service_status", "已停止处理")
+        self._save_status(request_id, {"status": next_status, "result": result, "customer_status": "正在停止" if next_status == "CANCEL_REQUESTED" else "已停止处理"}, preserve_owner=True)
+        CANCELLATIONS.labels("requested").inc()
+        self._refresh_metrics()
+        return self.get(request_id)
+
+    def is_cancel_requested(self, request_id: str) -> bool:
+        """查询 Redis 控制面，Worker 重启后仍可恢复取消状态。"""
+        if not self.enabled:
+            return False
+        try:
+            state = self.get(request_id) or {}
+            return state.get("status") in {"CANCEL_REQUESTED", "CANCELLED"} or bool(self._redis.get(self._cancel_key(request_id)))
+        except Exception:
+            return False
+
+    def cancellation_token(self, request_id: str) -> CancellationToken:
+        """为 Worker 创建只含 request_id 的合作式取消令牌。"""
+        return CancellationToken(request_id, lambda: self.is_cancel_requested(request_id))
+
+    def ack_cancelled(self, stream_id: str, request_id: str, result: dict[str, Any] | None = None) -> dict[str, Any]:
+        """确认已取消消息并保存安全部分结果，避免任务永久停在 RUNNING。"""
+        current = self.get(request_id) or {}
+        merged = dict(current.get("result") or {})
+        merged.update(result or {})
+        merged["request_id"] = request_id
+        merged["execution_status"] = "cancelled"
+        merged["partial"] = True
+        merged.setdefault("partial_answer", merged.get("customer_message") or merged.get("answer") or "")
+        merged.setdefault("customer_message", merged.get("partial_answer") or "已停止本次生成。")
+        merged.setdefault("service_status", "已停止处理")
+        self._save_status(request_id, {"status": "CANCELLED", "result": merged, "customer_status": "已停止处理"}, preserve_owner=True)
+        CANCELLATIONS.labels("completed").inc()
+        self._redis.xack(self.stream_key, self.group_name, stream_id)
+        self._refresh_metrics()
+        return merged
+
     def retry_or_dead_letter(self, stream_id: str, request_id: str, job: AgentExecutionJob, attempt: int, error_code: str) -> None:
         """失败任务重新投递；达到最大次数后写入无敏感信息的 DLQ 并 ACK 原消息。"""
+        if self.is_cancel_requested(request_id):
+            self.ack_cancelled(stream_id, request_id)
+            return
         next_attempt = attempt + 1
         if next_attempt >= self.max_attempts:
             self._redis.xadd(self.dead_letter_key, {"request_id": request_id, "attempt": str(next_attempt), "error_code": error_code})
@@ -215,7 +308,9 @@ class AgentExecutionQueue:
             request_id = fields["request_id"]
             job = AgentExecutionJob.model_validate_json(fields["job"])
             attempt = int(fields.get("attempt", "0"))
-            self._save_status(request_id, {"status": "RUNNING", "attempt": attempt, "customer_status": "正在处理"}, preserve_owner=True)
+            # 已取消任务仍需要 Worker ACK，但绝不能重新执行或覆盖为 RUNNING。
+            if not self.is_cancel_requested(request_id):
+                self._save_status(request_id, {"status": "RUNNING", "attempt": attempt, "customer_status": "正在处理"}, preserve_owner=True)
             self._refresh_metrics()
             return stream_id, request_id, job, attempt
         except (IndexError, KeyError, ValueError):
@@ -274,6 +369,11 @@ class AgentExecutionQueue:
     def _status_key(request_id: str) -> str:
         """生成任务状态 Redis Key。"""
         return f"agent:execution:status:{request_id}"
+
+    @classmethod
+    def _cancel_key(cls, request_id: str) -> str:
+        """取消标记与状态使用相同 TTL，避免遗留长期控制指令。"""
+        return f"{cls.cancel_prefix}{request_id}"
 
     @classmethod
     def _worker_heartbeat_key(cls, consumer_name: str) -> str:

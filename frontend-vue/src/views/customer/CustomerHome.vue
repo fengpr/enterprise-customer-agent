@@ -48,6 +48,9 @@ const loadingTickets = ref(false)
 const loadingSessions = ref(false)
 const loadingMessages = ref(false)
 const submitting = ref(false)
+const activeRequestId = ref('')
+const stoppingGeneration = ref(false)
+let activeStreamController: AbortController | null = null
 const creatingSession = ref(false)
 const activatedOnce = ref(false)
 const handledRouteContext = ref('')
@@ -362,6 +365,9 @@ async function submitQuestion() {
   }
   const tempMessageId = -Date.now()
   submitting.value = true
+  activeRequestId.value = ''
+  stoppingGeneration.value = false
+  activeStreamController = new AbortController()
   messageText.value = ''
   messages.value = [
     ...messages.value,
@@ -402,7 +408,9 @@ async function submitQuestion() {
     let terminalType = ''
     const reconnectDeadline = Date.now() + 120_000
 
-    const handleStreamEvent = (event: { event_type: string; payload: Record<string, unknown>; event_id: string }) => {
+    const handleStreamEvent = (event: { request_id?: string; event_type: string; payload: Record<string, unknown>; event_id: string }) => {
+        requestId = event.request_id || requestId
+        activeRequestId.value = requestId
         const stageMessages: Record<string, string> = {
           accepted: '已收到问题，正在准备处理…',
           queued: '请求已进入处理队列…',
@@ -431,7 +439,7 @@ async function submitQuestion() {
             need_human: false
           }
         }
-        if (event.event_type === 'completed' || event.event_type === 'degraded' || event.event_type === 'error') {
+        if (event.event_type === 'completed' || event.event_type === 'degraded' || event.event_type === 'cancelled' || event.event_type === 'error') {
           const answer = String(event.payload.answer || event.payload.customer_message || streamedAnswer || '当前服务繁忙，请稍后查询处理进度。')
           lastReply.value = {
             session_id: selectedSessionId.value || 'pending',
@@ -449,7 +457,8 @@ async function submitQuestion() {
       try {
         const streamResult = await customerApi.streamReply(requestPayload, handleStreamEvent, {
           idempotencyKey,
-          lastEventId: lastEventId || undefined
+          lastEventId: lastEventId || undefined,
+          signal: activeStreamController?.signal
         })
         requestId = streamResult.requestId || requestId
         lastEventId = streamResult.lastEventId || lastEventId
@@ -462,9 +471,9 @@ async function submitQuestion() {
       if (requestId) {
         try {
           const { data: state } = await customerApi.replyResult(requestId)
-          if (['SUCCESS', 'DEGRADED', 'FAILED', 'DEAD_LETTER'].includes(state.status)) {
+          if (['SUCCESS', 'DEGRADED', 'FAILED', 'DEAD_LETTER', 'CANCELLED'].includes(state.status)) {
             finalReply = state.result || null
-            terminalType = state.status === 'SUCCESS' ? 'completed' : 'degraded'
+            terminalType = state.status === 'SUCCESS' ? 'completed' : (state.status === 'CANCELLED' ? 'cancelled' : 'degraded')
             if (finalReply) {
               lastReply.value = finalReply
             }
@@ -519,11 +528,36 @@ async function submitQuestion() {
     }
     showReplySubmitFeedback(data)
   } catch (error) {
+    // 主动 AbortController 关闭 SSE 是正常取消路径，不删除已显示的用户问题或部分回答。
+    if (stoppingGeneration.value) return
     messages.value = messages.value.filter((item) => item.id !== tempMessageId)
     messageText.value = content
     throw error
   } finally {
     submitting.value = false
+    activeRequestId.value = ''
+    stoppingGeneration.value = false
+    activeStreamController = null
+  }
+}
+
+async function cancelCurrentGeneration() {
+  // 先通知后端停止当前 request，再关闭浏览器 SSE 读取，已输出文本继续保留在界面。
+  const requestId = activeRequestId.value
+  if (!requestId) {
+    ElMessage.info('请求正在建立连接，稍后可停止生成')
+    return
+  }
+  try {
+    stoppingGeneration.value = true
+    const { data } = await customerApi.cancelReply(requestId)
+    if (lastReply.value && data.partial_answer) {
+      lastReply.value = { ...lastReply.value, answer: data.partial_answer, customer_message: data.partial_answer, service_status: data.service_status }
+    }
+    activeStreamController?.abort()
+    ElMessage.info(data.status === 'CANCELLED' ? '已停止本次生成' : '正在停止生成')
+  } catch {
+    ElMessage.warning('停止请求未完成，请稍后查看处理状态')
   }
 }
 
@@ -744,6 +778,7 @@ watch(() => route.fullPath, () => {
               @regenerate="regenerateAnswer"
               @update:route-target="routeTarget = $event"
               @submit="submitQuestion"
+              @cancel="cancelCurrentGeneration"
             />
           </div>
         </section>

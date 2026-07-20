@@ -27,6 +27,7 @@ class InMemoryVectorStore:
         business_scope: str | None = None,
         collection: str | None = None,
         top_k: int = 5,
+        rewrite_mode: str = "rule_fallback",
     ) -> list[Citation]:
         """执行带业务过滤的 BM25 基线检索，并返回可引用片段。"""
         rewritten_query = rewrite_query(query, business_scope=business_scope, intent=intent)
@@ -51,7 +52,7 @@ class InMemoryVectorStore:
 
         scored.sort(key=lambda item: item[2], reverse=True)
         return [
-            _to_citation(chunk, score=_normalize_score(score), bm25_score=bm25_score, query=rewritten_query)
+            _to_citation(chunk, score=_normalize_score(score), bm25_score=bm25_score, query=rewritten_query, rewrite_mode=rewrite_mode)
             for chunk, bm25_score, score in scored[:top_k]
         ]
 
@@ -149,7 +150,7 @@ def is_customer_visible_chunk(paragraph: str, heading_path: list[str] | tuple[st
     return bool((paragraph or "").strip())
 
 
-def _to_citation(chunk: KnowledgeChunk, *, score: float, bm25_score: float, query: str) -> Citation:
+def _to_citation(chunk: KnowledgeChunk, *, score: float, bm25_score: float, query: str, rewrite_mode: str = "rule_fallback") -> Citation:
     """把内部 chunk 转换为 Agent 使用的引用对象。"""
     return Citation(
         # 使用内容哈希生成稳定片段标识，模型和评测均只能引用本次实际召回的 ID。
@@ -168,6 +169,7 @@ def _to_citation(chunk: KnowledgeChunk, *, score: float, bm25_score: float, quer
             **chunk.metadata,
             "bm25_score": bm25_score,
             "rewritten_query": query,
+            "query_rewrite_mode": rewrite_mode,
             "source_type": chunk.source_type,
             "chunk_index": chunk.chunk_index,
             "embedding_provider": chunk.embedding_provider,

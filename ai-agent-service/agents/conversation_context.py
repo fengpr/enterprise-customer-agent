@@ -1,4 +1,5 @@
 import re
+from datetime import datetime
 from typing import Any
 
 from agents.order_context import build_order_context_record, extract_order_no
@@ -41,11 +42,13 @@ def build_conversation_context(
     context["session_memory"] = session_memory
     context["order_context"] = order_context
     if selected_order_no:
+        # 本轮前端仍明确选中该订单，属于当前显式上下文；后续仍须由 Java 接口校验订单归属。
+        selected_at = datetime.utcnow().isoformat()
         context["order_context"] = build_order_context_record(
             order_no=selected_order_no,
             source="selected_by_user",
-            confirmed_at=None,
-            last_used_at=None,
+            confirmed_at=selected_at,
+            last_used_at=selected_at,
             confidence=0.98,
         )
         _set_context_value(
@@ -252,6 +255,9 @@ def _build_session_memory(messages: list[dict[str, Any]], login_user_context: di
         elif sender_type == "ai":
             # AI 消息只保留客户侧实际可见内容，不把内部建议、工具结果或风控字段送入会话记忆。
             extra_data = message.get("extra_data") or {}
+            # 客户停止生成后的片段只用于历史展示，不能成为下一轮模型的正常回答记忆。
+            if extra_data.get("generation_cancelled"):
+                continue
             visible = _safe_message_text(extra_data.get("customer_message") or content)
             if visible:
                 item["content"] = visible

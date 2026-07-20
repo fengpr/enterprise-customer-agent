@@ -10,9 +10,10 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from services.agent_execution_queue import AgentExecutionQueue
-from services.observability import WORKER_DURATION, WORKER_JOBS, set_request_context
+from services.observability import CANCELLATION_PARTIAL_TOKENS, WORKER_DURATION, WORKER_JOBS, set_request_context
 from services.resilient_client import ResilienceError
 from services.stream_event_service import StreamEventService
+from services.execution_cancellation import AgentExecutionCancelled
 
 
 def run_once(
@@ -33,16 +34,33 @@ def run_once(
     # 队列 payload 只保存随机 Trace ID；恢复 Pending 任务仍可关联原链路。
     set_request_context(request_id, getattr(job, "trace_id", None))
     events = event_service or StreamEventService()
+    session_lock_token: str | None = None
 
     def publish(event_type: str, payload: dict[str, Any] | None = None) -> None:
         """只记录客户可见内容，禁止将凭证、Prompt 和工具原始返回写入事件流。"""
         events.publish(request_id, event_type, payload)
 
     try:
+        # Pending 恢复或重新投递前先检查取消，已停止任务只 ACK，不能再次调用模型或建单。
+        if hasattr(queue, "is_cancel_requested") and queue.is_cancel_requested(request_id):
+            cancelled = queue.ack_cancelled(stream_id, request_id)
+            publish("cancelled", {"answer": cancelled.get("partial_answer") or cancelled.get("customer_message"), "partial": True, "service_status": cancelled.get("service_status")})
+            WORKER_JOBS.labels("cancelled").inc()
+            return True
+        cancellation_token = queue.cancellation_token(request_id) if hasattr(queue, "cancellation_token") else None
+        if hasattr(queue, "acquire_session_lock"):
+            session_lock_token = queue.acquire_session_lock(getattr(job, "session_id", None))
+            if not session_lock_token:
+                _retry_or_publish_terminal(queue, events, stream_id, request_id, job, attempt, "SESSION_BUSY")
+                return True
         with WORKER_DURATION.time():
             # 兼容既有测试替身与扩展实现；真实 AgentExecutionService 接收事件发布器。
-            if "event_publisher" in inspect.signature(execution_service.execute).parameters:
-                result = execution_service.execute(job.to_request(), event_publisher=publish)
+            parameters = inspect.signature(execution_service.execute).parameters
+            if "event_publisher" in parameters:
+                kwargs = {"event_publisher": publish}
+                if "cancellation_token" in parameters:
+                    kwargs["cancellation_token"] = cancellation_token
+                result = execution_service.execute(job.to_request(), **kwargs)
             else:
                 result = execution_service.execute(job.to_request())
         result["request_id"] = request_id
@@ -53,6 +71,17 @@ def run_once(
             "service_status": result.get("service_status"),
             "degraded": bool(result.get("degraded")),
         })
+    except AgentExecutionCancelled as exc:
+        # 取消不是失败：不重试、不进入 DLQ，也不触发安全降级或转人工。
+        cancelled = queue.ack_cancelled(stream_id, request_id, exc.result)
+        CANCELLATION_PARTIAL_TOKENS.observe(len(str(cancelled.get("partial_answer") or "")))
+        publish("cancelled", {
+            "answer": cancelled.get("partial_answer") or cancelled.get("customer_message"),
+            "partial": True,
+            "ticket_no": cancelled.get("ticket_no"),
+            "service_status": cancelled.get("service_status"),
+        })
+        WORKER_JOBS.labels("cancelled").inc()
     except ResilienceError as exc:
         # 流式模型超时、429 或熔断属于可恢复下游故障，不能把一次重试误报成终态错误。
         error_code = f"{exc.downstream.upper()}_{exc.error_type.upper()}"
@@ -62,6 +91,9 @@ def run_once(
         # 客户侧只得到安全错误码，任务本身仍由 Stream 重试和死信策略接管。
         _retry_or_publish_terminal(queue, events, stream_id, request_id, job, attempt, "AGENT_UPSTREAM_UNAVAILABLE")
         WORKER_JOBS.labels("failed").inc()
+    finally:
+        if hasattr(queue, "release_session_lock"):
+            queue.release_session_lock(getattr(job, "session_id", None), session_lock_token)
     return True
 
 

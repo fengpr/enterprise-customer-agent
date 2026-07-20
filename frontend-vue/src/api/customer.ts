@@ -1,11 +1,11 @@
 import { agentHttp } from './http'
-import type { AgentReply, AgentStatus, ChatSession, ChatSessionDetail, CustomerOrder, CustomerOrderDetail, CustomerOrderLogistics, RouteTarget, Ticket } from '@/types/api'
+import type { AgentReply, AgentStatus, ChatSession, ChatSessionDetail, CustomerFollowup, CustomerNotification, CustomerOrder, CustomerOrderDetail, CustomerOrderLogistics, RouteTarget, Ticket } from '@/types/api'
 
 export const customerApi = {
   async streamReply(
     body: Record<string, unknown>,
-    onEvent: (event: { event_type: string; payload: Record<string, unknown>; event_id: string }) => void,
-    options: { lastEventId?: string; idempotencyKey: string }
+    onEvent: (event: { request_id?: string; event_type: string; payload: Record<string, unknown>; event_id: string }) => void,
+    options: { lastEventId?: string; idempotencyKey: string; signal?: AbortSignal }
   ) {
     /** 使用同一幂等键重连 POST SSE，确保断线续传不会重复执行 Agent 或重复建单。 */
     const token = localStorage.getItem('eca_token') || ''
@@ -17,7 +17,8 @@ export const customerApi = {
         'Idempotency-Key': options.idempotencyKey,
         ...(options.lastEventId ? { 'Last-Event-ID': options.lastEventId } : {})
       },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
+      signal: options.signal
     })
     if (!response.ok || !response.body) throw new Error('流式回复连接失败')
     const reader = response.body.getReader()
@@ -38,7 +39,7 @@ export const customerApi = {
           const event = JSON.parse(data) as { request_id?: string; event_type: string; payload: Record<string, unknown>; event_id: string }
           requestId = event.request_id || requestId
           lastEventId = event.event_id || lastEventId
-          if (['completed', 'degraded', 'error'].includes(event.event_type)) terminalType = event.event_type
+          if (['completed', 'degraded', 'cancelled', 'error'].includes(event.event_type)) terminalType = event.event_type
           onEvent(event)
         }
       })
@@ -96,10 +97,28 @@ export const customerApi = {
   replyResult(requestId: string) {
     return agentHttp.get<{ status: string; result?: AgentReply }>(`/agent/replies/${requestId}`)
   },
+  cancelReply(requestId: string) {
+    return agentHttp.post<{ request_id: string; status: string; partial_answer: string; ticket_no?: string; service_status: string }>(`/agent/replies/${requestId}/cancel`)
+  },
   ticket(ticketNo: string) {
     return agentHttp.get<Ticket>(`/customer/tickets/${ticketNo}`)
   },
   urgeTicket(ticketNo: string, reason: string) {
     return agentHttp.post<Ticket>(`/customer/tickets/${ticketNo}/urge`, { reason })
+  },
+  notifications(limit = 50) {
+    return agentHttp.get<CustomerNotification[]>('/customer/notifications', { params: { limit } })
+  },
+  notificationUnreadCount() {
+    return agentHttp.get<{ count: number }>('/customer/notifications/unread-count')
+  },
+  markNotificationRead(notificationId: string) {
+    return agentHttp.post<{ notification_id: string; is_read: boolean }>(`/customer/notifications/${notificationId}/read`)
+  },
+  followups(limit = 50) {
+    return agentHttp.get<CustomerFollowup[]>('/customer/follow-ups', { params: { limit } })
+  },
+  cancelFollowup(followupId: string) {
+    return agentHttp.post<{ followup_id: string; status: string }>(`/customer/follow-ups/${followupId}/cancel`)
   }
 }

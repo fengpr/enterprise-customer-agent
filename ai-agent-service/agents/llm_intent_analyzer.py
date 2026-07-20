@@ -7,6 +7,7 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from agents.intent_normalizer import infer_user_goal, is_order_query_message, is_order_statistics_message
 from schemas.intent_schema import IntentResult, LLMIntentDraft
+from services.llm_model_factory import ChatModelConfig, build_chat_model
 from services.resilient_client import ResilientInvoker
 
 load_dotenv()
@@ -44,7 +45,7 @@ class LLMIntentAnalyzer:
         draft = LLMIntentDraft.model_validate(payload)
         return self._complete_intent_result(message, draft)
 
-    def generate_customer_reply(self, payload: dict, on_delta=None) -> str:
+    def generate_customer_reply(self, payload: dict, on_delta=None, cancellation_token=None) -> str:
         """基于可信业务证据生成客户侧回复，不允许模型自行编造政策、订单或物流节点。"""
         prompt = ChatPromptTemplate.from_messages(
             [
@@ -74,6 +75,10 @@ class LLMIntentAnalyzer:
     不要自我介绍成“企业客服助手”，也不要使用“我主要负责/主要处理”这类生硬身份声明。
     不得查询或引用订单、物流、工单、知识库和历史业务上下文，
     不得自动转人工或声称已创建工单；医疗、法律、金融投资和危险操作不得在此模式下给出具体建议。
+15. reply_mode=product_overview 时，可以根据 order 中已核验的商品名称和分类，使用“从品类看”“通常适合”等审慎措辞说明稳定、低风险的常见用途；
+    不得编造具体规格、功能参数、兼容性或营销结论。性价比只能作条件式分析，不得声称全网最低、一定划算或保证使用效果。
+    只有 extra_context.review_evidence_available=true 且提供 review_summary 时才能概括用户评价；否则必须明确暂无可核验评价数据，
+    不得生成评分、好评率、销量、口碑或虚构用户观点。
 """,
                 ),
                 (
@@ -97,14 +102,14 @@ class LLMIntentAnalyzer:
         reply_chain = prompt | self._build_llm(self.response_temperature)
         # SSE 场景直接消费模型原生 stream；非流式调用仍保持既有 invoke 语义。
         if on_delta is None:
-            result = self.resilient_invoker.invoke(lambda: reply_chain.invoke(payload))
+            result = self.resilient_invoker.invoke(lambda: reply_chain.invoke(payload), cancellation_token=cancellation_token)
             content = getattr(result, "content", result)
             if isinstance(content, list):
                 content = "".join(str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in content)
             text = str(content).strip()
         else:
             pieces: list[str] = []
-            for chunk in self.resilient_invoker.stream(lambda: reply_chain.stream(payload)):
+            for chunk in self.resilient_invoker.stream(lambda: reply_chain.stream(payload), cancellation_token=cancellation_token):
                 content = getattr(chunk, "content", chunk)
                 if isinstance(content, list):
                     content = "".join(str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in content)
@@ -240,37 +245,17 @@ JSON 示例：
 
     def _build_llm(self, temperature: float):
         """根据 Provider 创建模型实例，DeepSeek 分支必须使用 ChatDeepSeek。"""
-        if self.provider == "deepseek":
-            try:
-                from langchain_deepseek import ChatDeepSeek
-            except ImportError as exc:
-                raise RuntimeError("缺少 langchain-deepseek 依赖，无法启用 ChatDeepSeek。") from exc
-
-            # ChatDeepSeek 直接调用 DeepSeek 官方接口，不再经过 ChatOpenAI 兼容层。
-            return ChatDeepSeek(
-                model=self.model_name,
-                temperature=temperature,
+        return build_chat_model(
+            ChatModelConfig(
+                provider=self.provider,
+                model_name=self.model_name,
                 api_key=self.api_key,
+                base_url=self.base_url,
                 timeout=self.timeout,
                 max_retries=1,
-            )
-
-        try:
-            from langchain_openai import ChatOpenAI
-        except ImportError as exc:
-            raise RuntimeError("缺少 langchain-openai 依赖，无法启用 OpenAI 意图识别。") from exc
-
-        model_kwargs = {
-            "model": self.model_name,
-            "temperature": temperature,
-            "api_key": self.api_key,
-            "timeout": self.timeout,
-            "max_retries": 1,
-        }
-        if self.base_url:
-            # 其它 OpenAI 兼容服务通过 base_url 接入，DeepSeek 原生分支不走这里。
-            model_kwargs["base_url"] = self.base_url
-        return ChatOpenAI(**model_kwargs)
+            ),
+            temperature=temperature,
+        )
 
     def _complete_intent_result(self, message: str, draft: LLMIntentDraft) -> IntentResult:
         """补齐 LLM 缺失的可推导字段，只有不可修复字段才交给 Pydantic 抛错。"""

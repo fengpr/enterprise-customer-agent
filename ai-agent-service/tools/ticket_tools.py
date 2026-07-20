@@ -18,11 +18,18 @@ class TicketTools:
         self.client = client or ResilientClient(downstream="java_ticket")
         self.cache = cache or CacheService(namespace="business")
 
-    def create_ticket(self, payload: dict, auth_token: str | None = None) -> dict:
+    def create_ticket(self, payload: dict, auth_token: str | None = None, cancellation_token=None) -> dict:
         """创建工单，生成并透传幂等键后才允许网络重试。"""
         key = str(payload.get("idempotency_key") or payload.get("idempotencyKey") or uuid.uuid4())
         try:
-            response = self.client.request_sync("POST", f"{self.base_url}/api/tickets", json=payload, headers=self._headers(auth_token, key), idempotency_key=key)
+            if cancellation_token:
+                cancellation_token.check()
+            headers = self._headers(auth_token, key)
+            if cancellation_token:
+                headers["X-Agent-Request-Id"] = cancellation_token.request_id
+            response = self.client.request_sync("POST", f"{self.base_url}/api/tickets", json=payload, headers=headers, idempotency_key=key, cancellation_token=cancellation_token)
+            if cancellation_token:
+                cancellation_token.check()
             data = response.json(); self._invalidate_ticket(auth_token, data.get("ticketNo")); return {"status": "success", "data": data}
         except ResilienceError as exc:
             return self._failure(exc)

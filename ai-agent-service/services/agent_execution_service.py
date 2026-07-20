@@ -1,17 +1,20 @@
 """在线 Agent 执行服务，隔离 FastAPI 接口编排与真实业务执行。"""
 
 import os
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Callable
 
 from agents.conversation_context import build_conversation_context
 from agents.customer_service_agent import CustomerServiceAgent
 from repositories.chat_repository import ChatMessageRepository, ChatSessionRepository
 from repositories.evaluation_repository import EvaluationRepository
+from repositories.conversation_state_repository import ConversationStateRepository, FollowupNotificationRepository
 from schemas.intent_schema import AgentReplyRequest
 from services.resilient_client import ResilienceError
 from services.resilient_client import ResilientClient
 from services.staff_presence_service import StaffPresenceService
+from services.execution_cancellation import AgentExecutionCancelled, CancellationToken
+from services.conversation_state_service import ConversationStateService, TurnResolution
 
 
 class AgentExecutionAccessDenied(Exception):
@@ -30,6 +33,8 @@ class AgentExecutionService:
         evaluation_repository: EvaluationRepository | None = None,
         staff_availability_loader: Callable[[], list[dict[str, Any]]] | None = None,
         staff_presence_checker: Callable[[str], bool] | None = None,
+        conversation_states: ConversationStateRepository | None = None,
+        followup_notifications: FollowupNotificationRepository | None = None,
     ) -> None:
         """注入执行依赖，方便 API 与 Worker 复用同一服务并进行单元测试。"""
         self.agent = agent or CustomerServiceAgent()
@@ -43,17 +48,36 @@ class AgentExecutionService:
         self.staff_availability_loader = staff_availability_loader or self._load_staff_members_internal
         self.staff_presence_checker = staff_presence_checker or StaffPresenceService().is_online
         self.staff_client = ResilientClient(downstream="java_staff")
+        self.conversation_states = conversation_states or ConversationStateRepository()
+        self.followup_notifications = followup_notifications or FollowupNotificationRepository()
+        self.conversation_state_service = ConversationStateService(self.conversation_states)
 
-    def execute(self, payload: AgentReplyRequest, event_publisher: Callable[[str, dict[str, Any]], None] | None = None) -> dict[str, Any]:
+    def execute(self, payload: AgentReplyRequest, event_publisher: Callable[[str, dict[str, Any]], None] | None = None, cancellation_token: CancellationToken | None = None) -> dict[str, Any]:
         """执行完整客服 Agent 链路；调用前必须已由接口层完成客户鉴权并注入身份。"""
         if payload.customer_id is None:
             raise ValueError("AgentExecutionService 执行前必须注入 customer_id")
+        streamed_parts: list[str] = []
+        visible_stages: list[str] = []
+
+        def check_cancelled() -> None:
+            """在持久化、图节点和流式回调之间阻止取消后的后续业务操作。"""
+            if cancellation_token:
+                cancellation_token.check()
+
         def emit(event_type: str, event_payload: dict[str, Any] | None = None) -> None:
             """只向 SSE 发布客户可见阶段信息，事件写入失败不影响业务执行。"""
             if event_publisher:
                 event_publisher(event_type, event_payload or {})
 
+        def emit_delta(delta: str) -> None:
+            """仅累积已向客户发送的文本，绝不记录模型隐藏推理。"""
+            check_cancelled()
+            streamed_parts.append(delta)
+            emit("delta", {"text": delta})
+
+        check_cancelled()
         emit("retrieving", {"status": "正在检索知识库"})
+        visible_stages.append("retrieving")
         session = self._get_or_create_session(payload)
         session_id = session["session_id"]
         route_target = payload.route_target or "ai"
@@ -61,13 +85,22 @@ class AgentExecutionService:
             return self._save_manual_handoff_message(session_id, payload, session)
 
         pending_action_request = self._latest_pending_action_request(session_id)
+        historical_messages = self.chat_messages.list_by_session(session_id)
         conversation_context = build_conversation_context(
-            messages=self.chat_messages.list_by_session(session_id),
+            messages=historical_messages,
             pending_action_request=pending_action_request,
             selected_order_no=payload.selected_order_no,
             selected_ticket_no=payload.selected_ticket_no,
             login_user_context=payload.login_user_context,
         )
+        self.conversation_state_service.hydrate_recent_turns(session_id, historical_messages)
+        # 结构化状态先于 LLM 解析，以便“确认/继续”等短回复恢复上一轮真实目标。
+        turn_resolution = self.conversation_state_service.resolve_turn(
+            session_no=session_id,
+            message=payload.message,
+            selected_order_no=payload.selected_order_no,
+        )
+        conversation_context["structured_memory"] = self.conversation_state_service.safe_model_context(turn_resolution.state)
         self.chat_messages.save(
             session_no=session_id,
             sender_type="customer",
@@ -82,24 +115,53 @@ class AgentExecutionService:
         if route_target == "both":
             self._ensure_handoff_exists(session_id, session, "synced_by_customer")
 
+        if turn_resolution.answer or turn_resolution.action:
+            result = self._execute_deterministic_turn(session_id, payload, turn_resolution)
+            self._persist_result(session_id, payload, result, conversation_context)
+            self.conversation_state_service.record_result(
+                session_no=session_id,
+                user_message=payload.message,
+                answer=result.get("customer_message") or result["answer"],
+                selected_order_no=turn_resolution.order_no or payload.selected_order_no,
+                pending_action=result.get("pending_action_request"),
+                result=result,
+            )
+            result.setdefault("execution_status", "success")
+            result.setdefault("customer_visible_message", result.get("customer_message") or result.get("answer"))
+            return result
+
         agent_payload = payload.model_copy(
             update={
                 "session_id": session_id,
+                "message": turn_resolution.resumed_message or payload.message,
+                "selected_order_no": turn_resolution.order_no or payload.selected_order_no,
                 "pending_action_request": pending_action_request,
                 "conversation_context": conversation_context,
                 "login_user_context": conversation_context.get("login_user_context"),
             }
         )
         try:
+            check_cancelled()
             emit("tool_calling", {"status": "正在调用业务工具"})
+            visible_stages.append("tool_calling")
             emit("generating", {"status": "正在生成回答", "streaming_supported": bool(getattr(self.agent, "llm_analyzer", None))})
+            visible_stages.append("generating")
             if event_publisher and hasattr(self.agent, "reply_with_stream"):
-                result = self.agent.reply_with_stream(
-                    agent_payload,
-                    lambda delta: emit("delta", {"text": delta}),
-                ).model_dump()
+                try:
+                    result = self.agent.reply_with_stream(agent_payload, emit_delta, cancellation_token=cancellation_token).model_dump()
+                except TypeError:
+                    # 兼容测试替身和旧扩展 Agent，真实 Agent 接收取消令牌。
+                    result = self.agent.reply_with_stream(agent_payload, emit_delta).model_dump()
             else:
-                result = self.agent.reply(agent_payload).model_dump()
+                try:
+                    result = self.agent.reply(agent_payload, cancellation_token=cancellation_token).model_dump()
+                except TypeError:
+                    result = self.agent.reply(agent_payload).model_dump()
+            check_cancelled()
+        except AgentExecutionCancelled:
+            cancelled_result = self._cancelled_result(session_id, "".join(streamed_parts), visible_stages)
+            self._persist_cancelled_result(session_id, payload, cancelled_result)
+            raise AgentExecutionCancelled(cancelled_result)
         except ResilienceError as exc:
             # 韧性层只负责归类错误，客户侧安全降级与转人工由执行服务统一决定。
             result = self._resilience_degraded_result(exc)
@@ -125,10 +187,131 @@ class AgentExecutionService:
                 }
             )
         self._persist_result(session_id, payload, result, conversation_context)
+        self.conversation_state_service.record_result(
+            session_no=session_id,
+            user_message=payload.message,
+            answer=result.get("customer_message") or result["answer"],
+            selected_order_no=turn_resolution.order_no or payload.selected_order_no,
+            pending_action=result.get("pending_action_request"),
+            result=result,
+        )
         result.setdefault("execution_status", "success")
         result.setdefault("customer_visible_message", result.get("customer_message") or result.get("answer"))
         result.setdefault("ticket_no", ((result.get("ticket_result") or {}).get("data") or {}).get("ticketNo"))
         return result
+
+    def _execute_deterministic_turn(
+        self,
+        session_id: str,
+        payload: AgentReplyRequest,
+        resolution: TurnResolution,
+    ) -> dict[str, Any]:
+        """执行无需 LLM 的确认回复，定时复核前仍校验订单归属。"""
+        if resolution.action != "schedule_delivery_recheck":
+            return self._deterministic_result(session_id, resolution.answer or "请继续补充需要处理的信息。")
+
+        order_no = resolution.order_no or ""
+        validation = self.agent.order_tools.query_order(order_no, payload.auth_token)
+        if validation.get("status") != "success":
+            message = "暂时无法核验该订单归属，因此没有创建物流复核任务。请刷新订单后重试，或联系人工客服。"
+            return self._deterministic_result(session_id, message, service_status="订单核验未通过", need_human=True)
+
+        scheduled_at = resolution.scheduled_at or datetime.now(UTC).isoformat()
+        parsed_schedule = datetime.fromisoformat(scheduled_at)
+        if parsed_schedule.tzinfo is None:
+            parsed_schedule = parsed_schedule.replace(tzinfo=UTC)
+        stored_schedule = parsed_schedule.astimezone(UTC).isoformat()
+        idempotency_key = f"delivery-recheck:{payload.customer_id}:{session_id}:{order_no}:{stored_schedule}"
+        followup = self.followup_notifications.create_followup(
+            session_no=session_id,
+            customer_id=int(payload.customer_id or 0),
+            order_no=order_no,
+            scheduled_at=stored_schedule,
+            idempotency_key=idempotency_key,
+        )
+        self.conversation_state_service.attach_followup(session_id, str(followup.get("followup_id")), resolution.state)
+        display_time = scheduled_at
+        try:
+            display_time = datetime.fromisoformat(scheduled_at).strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            pass
+        message = (
+            f"已确认订单 {order_no}，并为您设置在 {display_time} 复核最新物流。"
+            "到期后系统只会查询物流并在站内通知您；如果仍未收到，还需要您再次确认后才会进入售后流程，不会自动创建退货工单。"
+        )
+        result = self._deterministic_result(session_id, message, service_status="物流复核已登记")
+        result["scheduled_followup"] = {
+            "followup_id": followup.get("followup_id"),
+            "status": followup.get("status"),
+            "scheduled_at": followup.get("scheduled_at"),
+        }
+        return result
+
+    @staticmethod
+    def _deterministic_result(
+        session_id: str,
+        message: str,
+        *,
+        service_status: str = "已回复",
+        need_human: bool = False,
+    ) -> dict[str, Any]:
+        """构造与 AgentReply 兼容的确定性结果，避免确认类消息再次调用模型。"""
+        return {
+            "session_id": session_id,
+            "answer": message,
+            "customer_message": message,
+            "internal_suggestion": None,
+            "decision_type": "deterministic_conversation_state",
+            "service_status": service_status,
+            "auto_send": not need_human,
+            "need_human": need_human,
+            "analysis": {
+                "intent": "logistics",
+                "user_goal": "action_request",
+                "risk_reasons": [],
+                "confidence": 1.0,
+                "summary": "会话状态确定性处理",
+            },
+            "citations": [],
+            "citation_validation": {},
+            "tool_results": [],
+            "ticket_result": None,
+            "risk_reasons": [],
+            "pending_action_request": None,
+            "degraded": False,
+        }
+
+    @staticmethod
+    def _cancelled_result(session_id: str, partial_answer: str, stages: list[str]) -> dict[str, Any]:
+        """构造取消终态，只保留客户已经看见的文本及安全处理阶段。"""
+        message = partial_answer or "已停止本次生成。"
+        return {
+            "session_id": session_id,
+            "answer": message,
+            "customer_message": message,
+            "partial_answer": partial_answer,
+            "service_status": "已停止处理",
+            "execution_status": "cancelled",
+            "partial": True,
+            "visible_stages": stages,
+            "ticket_no": None,
+        }
+
+    def _persist_cancelled_result(self, session_id: str, payload: AgentReplyRequest, result: dict[str, Any]) -> None:
+        """取消回复仅作为历史可见文本保存，不更新正常记忆、pending 或 DeepEval Trace。"""
+        self.chat_messages.save(
+            session_no=session_id,
+            sender_type="ai",
+            sender_id="agent",
+            content=result["customer_message"],
+            extra_data={
+                "customer_message": result["customer_message"],
+                "generation_cancelled": True,
+                "partial_answer": result.get("partial_answer", ""),
+                "service_status": result["service_status"],
+                "visible_stages": result.get("visible_stages", []),
+            },
+        )
 
     @staticmethod
     def _resilience_degraded_result(error: ResilienceError) -> dict[str, Any]:

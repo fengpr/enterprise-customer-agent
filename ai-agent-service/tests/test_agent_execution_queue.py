@@ -113,6 +113,32 @@ def test_idempotency_does_not_enqueue_twice_or_store_authorization(monkeypatch):
     assert "customer_id" not in job_payload["login_user_context"]
 
 
+def test_pending_cancel_is_terminal_and_worker_claim_can_ack(monkeypatch):
+    """排队任务取消后不再进入执行，Consumer 仅需 ACK 原始 Stream 消息。"""
+    monkeypatch.setenv("AGENT_EXECUTION_QUEUE_ENABLED", "true")
+    queue = _queue()
+    queue.enqueue(_job(), "owner")
+
+    state = queue.cancel("request-1", "owner")
+    assert state["status"] == "CANCELLED"
+    assert queue.is_cancel_requested("request-1") is True
+
+    stream_id, request_id, _, _ = queue.claim(0)
+    result = queue.ack_cancelled(stream_id, request_id)
+    assert queue.get(request_id)["status"] == "CANCELLED"
+    assert result["execution_status"] == "cancelled"
+    assert stream_id in queue._redis.acks
+
+
+def test_cancel_requires_same_owner(monkeypatch):
+    """取消接口底层再次校验 owner，不能跨客户停止其他请求。"""
+    monkeypatch.setenv("AGENT_EXECUTION_QUEUE_ENABLED", "true")
+    queue = _queue()
+    queue.enqueue(_job(), "owner-a")
+    assert queue.cancel("request-1", "owner-b") is None
+    assert queue.get("request-1")["status"] == "PENDING"
+
+
 def test_worker_heartbeat_replaces_unreliable_process_detection(monkeypatch):
     """启动脚本应根据 Redis 心跳判断 Worker 是否真正存活。"""
     monkeypatch.setenv("AGENT_EXECUTION_QUEUE_ENABLED", "true")
