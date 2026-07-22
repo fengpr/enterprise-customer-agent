@@ -16,6 +16,7 @@ from rag.evaluate import evaluate as evaluate_rag
 from repositories.chat_repository import ChatMessageRepository, ChatSessionRepository
 from repositories.evaluation_repository import EvaluationRepository
 from repositories.conversation_state_repository import FollowupNotificationRepository
+from repositories.staff_handoff_audit_repository import StaffHandoffAuditRepository
 from schemas.intent_schema import AgentExecutionJob, AgentReplyRequest, AnalyzeRequest, ToolCallRequest
 from services.agent_execution_queue import AgentExecutionQueue
 from services.agent_execution_service import AgentExecutionAccessDenied, AgentExecutionService
@@ -26,6 +27,7 @@ from services.observability import HTTP_LATENCY, HTTP_REQUESTS, set_request_cont
 from services.observability import current_context, tracer
 from services.stream_event_service import StreamEventService
 from services.staff_presence_service import StaffPresenceService
+from services.staff_reply_draft_service import StaffReplyDraftService
 from tools.order_tools import OrderTools
 from tools.ticket_tools import TicketTools
 
@@ -37,6 +39,8 @@ chat_sessions = ChatSessionRepository()
 chat_messages = ChatMessageRepository(chat_sessions)
 evaluation_repository = EvaluationRepository()
 staff_presence = StaffPresenceService()
+staff_handoff_audit = StaffHandoffAuditRepository(chat_sessions)
+staff_reply_draft_service = StaffReplyDraftService()
 agent_execution_service = AgentExecutionService(
     agent=agent,
     chat_sessions=chat_sessions,
@@ -250,6 +254,29 @@ def reply(payload: AgentReplyRequest, request: Request, authorization: str | Non
             return JSONResponse(status_code=202, content=_overload_response() | {"request_id": request_id, "status": "degraded", "queued": False, "error_code": state.get("error_code", "AGENT_UPSTREAM_UNAVAILABLE")})
         time.sleep(0.05)
     return JSONResponse(status_code=202, content={"request_id": request_id, "status": "queued", "queued": True, "degraded": False, "retry_after": int(os.getenv("AGENT_QUEUE_RETRY_AFTER_SECONDS", "3")), "customer_message": "您的问题正在为您处理，请稍后查询处理进度。", "service_status": "排队处理中"})
+
+
+@app.post("/api/agent/handoff/messages")
+def send_handoff_message(payload: AgentReplyRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """保存客户补充给人工客服的消息，不进入 Agent 队列、LLM 或 SSE 结果轮询。
+
+    这条路径只负责鉴权、会话归属校验和人工消息持久化，不会绕过队列执行
+    Agent。人工消息不再拥有 request_id，因此也不会读取到其他异步请求的结果。
+    """
+    current_user = _current_login_user(authorization)
+    execution_payload = payload.model_copy(
+        update={
+            "customer_id": current_user["customer_id"],
+            "auth_token": _bearer_token(authorization),
+            "login_user_context": _safe_login_user_context(current_user),
+            "route_target": "human",
+        }
+    )
+    try:
+        return agent_execution_service.execute(execution_payload)
+    except AgentExecutionAccessDenied as exc:
+        # 不能通过人工通道跨会话写入客户消息。
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
 @app.post("/api/agent/reply/stream/legacy", include_in_schema=False)
@@ -734,15 +761,25 @@ def draft_staff_ticket_reply(
     authorization: str | None = Header(default=None),
 ) -> dict:
     """根据坐席填写的处理结果生成客户安全话术草稿，但不自动发送给客户。"""
-    _require_staff_user(authorization)
+    staff_user = _require_staff_user(authorization)
     ticket = _get_staff_ticket(ticket_no, authorization)
+    # 草稿同样属于客户可见沟通，必须由当前工单处理人操作，不能只依赖“工单可见”。
+    _require_staff_ticket_owner(ticket, staff_user)
     context = _find_ticket_chat_context(ticket_no, ticket)
     close_reason = str(payload.get("close_reason") or payload.get("processing_result") or "").strip()
-    draft_message = _build_staff_reply_draft(ticket, close_reason)
+    # 仅传入关联会话中客户可见的最近消息；草稿服务会继续脱敏并过滤内部字段。
+    messages = chat_messages.list_by_session(context["session"]["session_id"])
+    draft_message, generation_mode = staff_reply_draft_service.generate(
+        ticket=ticket,
+        processing_result=close_reason,
+        messages=messages,
+    )
     return {
         "ticket_no": ticket_no,
         "session_id": context["session"]["session_id"],
         "draft_message": draft_message,
+        # 仅向坐席展示生成来源，方便判断是否需要重点润色；不向客户侧透出。
+        "generation_mode": generation_mode,
     }
 
 
@@ -755,6 +792,8 @@ def send_staff_ticket_reply(
     """保存坐席确认后的客户可见回复，客户侧会话历史刷新后即可看到。"""
     staff_user = _require_staff_user(authorization)
     ticket = _get_staff_ticket(ticket_no, authorization)
+    # 发送客户消息前再次校验归属，避免未领取或他人名下工单被越权回复。
+    _require_staff_ticket_owner(ticket, staff_user)
     context = _find_ticket_chat_context(ticket_no, ticket)
     message = str(payload.get("message") or "").strip()
     if not message:
@@ -817,11 +856,59 @@ def get_staff_handoff_session(
     """坐席查看人工会话详情和完整消息历史。"""
     staff_user = _require_staff_user(authorization)
     session = _get_staff_visible_handoff_session(session_id, staff_user)
-    messages = chat_messages.list_by_session(session_id, after_message_id=max(0, after_message_id))
+    is_owner = (
+        session.get("handoff_status") == "ACTIVE"
+        and str(session.get("human_assigned_staff_id")) == str(staff_user.get("user_id"))
+    )
+    recent_limit = max(1, int(os.getenv("STAFF_HANDOFF_RECENT_MESSAGE_LIMIT", "12")))
+    # 先多取少量原始记录再过滤内部事件，保证座席实际看到的是最近的客户可见对话窗口。
+    recent_messages = _staff_safe_handoff_messages(
+        chat_messages.list_recent_by_session(session_id, limit=recent_limit * 4)
+    )[-recent_limit:]
+    earliest_window_id = min((int(message["id"]) for message in recent_messages), default=0)
+    if not is_owner:
+        # 待领取会话只提供摘要，领取前不展示客户与 AI 的具体对话。
+        messages: list[dict[str, Any]] = []
+    elif after_message_id > 0 and earliest_window_id and after_message_id >= earliest_window_id:
+        # 增量接口只允许轮询最近窗口之后的新消息，不能借 after_message_id 绕过历史展开审计。
+        messages = _staff_safe_handoff_messages(chat_messages.list_by_session(session_id, after_message_id=max(0, after_message_id)))
+    else:
+        messages = recent_messages
+    oldest_message_id = min((int(message["id"]) for message in messages), default=0)
     return {
         "session": _handoff_session_payload(session),
         "messages": messages,
         "latest_message_id": max((int(message["id"]) for message in messages), default=after_message_id),
+        "handoff_summary": _staff_handoff_summary(session),
+        "history_available": bool(is_owner and oldest_message_id and chat_messages.has_message_before(session_id, oldest_message_id)),
+        "history_access_allowed": is_owner,
+    }
+
+
+@app.get("/api/staff/handoff/sessions/{session_id}/history")
+def get_staff_handoff_history(
+    session_id: str,
+    before_message_id: int,
+    limit: int = 30,
+    authorization: str | None = Header(default=None),
+) -> dict:
+    """按需展开更早历史；仅当前接入座席可访问且每次读取都会持久化审计。"""
+    staff_user = _require_staff_user(authorization)
+    _get_staff_owned_handoff_session(session_id, staff_user)
+    messages = _staff_safe_handoff_messages(
+        chat_messages.list_before_message_id(session_id, before_message_id, limit=min(max(limit, 1), 50))
+    )
+    staff_handoff_audit.record_history_access(
+        session_no=session_id,
+        staff_id=str(staff_user.get("user_id")),
+        before_message_id=before_message_id,
+        returned_count=len(messages),
+    )
+    oldest_message_id = min((int(message["id"]) for message in messages), default=before_message_id)
+    return {
+        "messages": messages,
+        "history_available": bool(oldest_message_id and chat_messages.has_message_before(session_id, oldest_message_id)),
+        "next_before_message_id": oldest_message_id or None,
     }
 
 
@@ -998,6 +1085,39 @@ def _handoff_session_payload(session: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _staff_safe_handoff_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """过滤人工会话消息的内部扩展字段，座席仅获取客户可见正文与必要路由标记。"""
+    safe_messages: list[dict[str, Any]] = []
+    for message in messages:
+        extra = dict(message.get("extra_data") or {})
+        # 非客户可见系统事件可能包含流程控制信息，不能作为人工对话历史返回。
+        if message.get("sender_type") == "system" and not extra.get("customer_visible"):
+            continue
+        safe_messages.append(
+            {
+                **message,
+                "extra_data": {
+                    key: extra[key]
+                    for key in ("route_target", "message_source", "customer_visible")
+                    if key in extra
+                },
+            }
+        )
+    return safe_messages
+
+
+def _staff_handoff_summary(session: dict[str, Any]) -> dict[str, Any]:
+    """构造座席交接摘要，优先提供处理所需事实而非暴露完整 AI 对话。"""
+    return {
+        "title": str(session.get("title") or "待处理人工会话")[:160],
+        "intent": session.get("intent"),
+        "priority": session.get("priority") or "medium",
+        "handoff_reason": session.get("handoff_reason"),
+        "ai_summary": str(session.get("ai_summary") or "暂无自动摘要，请通过最近对话了解当前诉求。")[:600],
+        "linked_ticket_no": chat_sessions.get_handoff_ticket(session["session_id"]),
+    }
+
+
 def _get_staff_visible_handoff_session(session_id: str, staff_user: dict[str, Any]) -> dict[str, Any]:
     """校验坐席只能查看待接入或自己已接入的人工会话。"""
     session = chat_sessions.get_by_session_no(session_id)
@@ -1070,6 +1190,20 @@ def _get_staff_ticket(ticket_no: str, authorization: str | None) -> dict:
         return response.json()
     except ResilienceError as exc:
         raise HTTPException(status_code=exc.status_code or 503, detail=exc.safe_message) from exc
+
+
+def _require_staff_ticket_owner(ticket: dict, staff_user: dict) -> None:
+    """校验坐席是工单当前处理人，防止“可查看”权限被误用于客户沟通和处理动作。
+
+    Java 工单详情允许坐席查看未分派工单以便领取；但草稿生成、客户回复等写操作
+    必须由实际处理人完成。这里使用 Java 返回的 handlerId 作为唯一归属依据。
+    """
+    handler_id = ticket.get("handlerId")
+    staff_id = staff_user.get("user_id")
+    if handler_id is None:
+        raise HTTPException(status_code=403, detail="请先领取工单后再生成或发送客户回复")
+    if str(handler_id) != str(staff_id):
+        raise HTTPException(status_code=403, detail="只能处理自己名下的工单")
 
 
 def _find_ticket_chat_context(ticket_no: str, ticket: dict | None = None) -> dict:

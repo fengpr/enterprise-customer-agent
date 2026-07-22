@@ -6,7 +6,7 @@ import { useRouter } from 'vue-router'
 
 import { staffHandoffApi, staffReplyApi, staffTicketApi } from '@/api/staff'
 import { useAuthStore } from '@/stores/auth'
-import type { ChatMessage, StaffHandoffSession, Ticket } from '@/types/api'
+import type { ChatMessage, StaffHandoffDetail, StaffHandoffSession, Ticket } from '@/types/api'
 import { statusType } from '@/utils/ticket'
 
 const router = useRouter()
@@ -14,11 +14,17 @@ const auth = useAuthStore()
 const tickets = ref<Ticket[]>([])
 const handoffSessions = ref<StaffHandoffSession[]>([])
 const handoffMessages = ref<ChatMessage[]>([])
+// 座席默认只读取交接摘要与最近相关窗口，更早历史必须由座席主动展开。
+const handoffSummary = ref<StaffHandoffDetail['handoff_summary'] | null>(null)
+const handoffHistoryAvailable = ref(false)
+const handoffHistoryAccessAllowed = ref(false)
+const handoffHistoryLoading = ref(false)
 const selectedTicketNo = ref<string | null>(null)
 const selectedHandoffSessionId = ref<string | null>(null)
 const loading = ref(false)
 const handoffLoading = ref(false)
 const acting = ref(false)
+const generatingDraft = ref(false)
 const closeReason = ref('问题已处理完成')
 const draftMessage = ref('')
 const handoffReply = ref('')
@@ -33,6 +39,7 @@ let heartbeatTimer: number | null = null
 let handoffPolling = false
 let queuePollFailures = 0
 let detailPollFailures = 0
+let handoffDetailRequestVersion = 0
 const queueScope = ref<'mine' | 'claimable'>('mine')
 const selectedStatuses = ref(['PENDING_ASSIGN', 'PENDING_PROCESS', 'PROCESSING', 'REOPENED'])
 
@@ -78,8 +85,13 @@ async function loadHandoffSessions(keepSelection = true) {
     }
     if (selectedHandoffSessionId.value && (previousSelection !== selectedHandoffSessionId.value || !handoffMessages.value.length)) {
       await loadHandoffDetail(selectedHandoffSessionId.value)
-    } else {
+    } else if (!selectedHandoffSessionId.value) {
+      // 只有当前会话被移出队列或不再可见时才清理历史，刷新同一会话不能覆盖本地消息。
       handoffMessages.value = []
+      handoffSummary.value = null
+      handoffHistoryAvailable.value = false
+      handoffHistoryAccessAllowed.value = false
+      latestHandoffMessageId.value = 0
     }
   } finally {
     handoffLoading.value = false
@@ -94,10 +106,39 @@ watch(handoffScope, () => {
 })
 
 async function loadHandoffDetail(sessionId: string) {
+  const requestVersion = ++handoffDetailRequestVersion
   const { data } = await staffHandoffApi.detail(sessionId)
+  // 用户在网络请求期间切换了会话时，旧响应不能覆盖新会话的消息历史。
+  if (selectedHandoffSessionId.value !== sessionId || requestVersion !== handoffDetailRequestVersion) return
   handoffMessages.value = data.messages
+  handoffSummary.value = data.handoff_summary ?? null
+  handoffHistoryAvailable.value = Boolean(data.history_available)
+  handoffHistoryAccessAllowed.value = Boolean(data.history_access_allowed)
   latestHandoffMessageId.value = data.latest_message_id || Math.max(0, ...data.messages.map((item) => item.id))
   seenHandoffMessageIds.value[sessionId] = latestHandoffMessageId.value
+}
+
+/**
+ * 座席按需加载更早历史。该操作由后端再次校验会话归属并写入审计日志，
+ * 避免默认暴露整段 AI 对话。
+ */
+async function loadEarlierHandoffHistory() {
+  const session = selectedHandoff.value
+  const earliestMessageId = Math.min(...handoffMessages.value.map((item) => item.id))
+  if (!session || !canOperateHandoff.value || !Number.isFinite(earliestMessageId) || handoffHistoryLoading.value) return
+
+  handoffHistoryLoading.value = true
+  try {
+    const { data } = await staffHandoffApi.history(session.session_id, earliestMessageId)
+    // 防止切换会话后旧请求把历史拼接到新会话。
+    if (selectedHandoffSessionId.value !== session.session_id) return
+    const known = new Set(handoffMessages.value.map((item) => item.id))
+    handoffMessages.value = [...data.messages.filter((item) => !known.has(item.id)), ...handoffMessages.value]
+    handoffHistoryAvailable.value = data.history_available
+    ElMessage.success('已加载更早历史，本次查看已记录审计日志')
+  } finally {
+    handoffHistoryLoading.value = false
+  }
 }
 
 async function pollHandoffDetail() {
@@ -181,7 +222,7 @@ async function claimTicket() {
   if (!selectedTicket.value || !auth.user) return
   acting.value = true
   try {
-    const { data } = await staffTicketApi.assign(selectedTicket.value.ticketNo, auth.user.user_id, selectedTicket.value.assignedGroup || '客服组')
+    const { data } = await staffTicketApi.assign(selectedTicket.value.ticketNo, selectedTicket.value.assignedGroup || '客服组')
     ElMessage.success(`已领取工单，当前状态：${data.status}`)
     queueScope.value = 'mine'
     await loadTickets()
@@ -194,7 +235,7 @@ async function startTicket() {
   if (!selectedTicket.value || !auth.user) return
   acting.value = true
   try {
-    const { data } = await staffTicketApi.start(selectedTicket.value.ticketNo, auth.user.user_id)
+    const { data } = await staffTicketApi.start(selectedTicket.value.ticketNo)
     ElMessage.success(`已开始处理，当前状态：${data.status}`)
     await loadTickets()
   } finally {
@@ -206,7 +247,7 @@ async function closeTicket() {
   if (!selectedTicket.value || !auth.user) return
   acting.value = true
   try {
-    const { data } = await staffTicketApi.close(selectedTicket.value.ticketNo, auth.user.user_id, closeReason.value)
+    const { data } = await staffTicketApi.close(selectedTicket.value.ticketNo, closeReason.value)
     ElMessage.success(`已关闭工单，当前状态：${data.status}`)
     await loadTickets()
   } finally {
@@ -215,10 +256,16 @@ async function closeTicket() {
 }
 
 async function generateDraft() {
-  if (!selectedTicket.value) return
-  const { data } = await staffReplyApi.draft(selectedTicket.value.ticketNo, closeReason.value)
-  draftMessage.value = data.draft_message
-  ElMessage.success('已生成客户话术草稿')
+  if (!selectedTicket.value || generatingDraft.value) return
+  generatingDraft.value = true
+  try {
+    const { data } = await staffReplyApi.draft(selectedTicket.value.ticketNo, closeReason.value)
+    draftMessage.value = data.draft_message
+    // 模型暂不可用时后端会安全回退，明确提示坐席仍需按真实处理结果审核后发送。
+    ElMessage.success(data.generation_mode === 'llm' ? '已根据工单与会话生成 AI 话术草稿' : '已生成安全话术草稿，请结合处理结果确认')
+  } finally {
+    generatingDraft.value = false
+  }
 }
 
 async function sendReply() {
@@ -413,13 +460,42 @@ onBeforeUnmount(() => {
             </template>
             <el-descriptions :column="2" border>
               <el-descriptions-item label="会话编号">{{ selectedHandoff.session_id }}</el-descriptions-item>
-              <el-descriptions-item label="客户ID">{{ selectedHandoff.customer_id }}</el-descriptions-item>
+              <el-descriptions-item label="交接原因">{{ handoffSummary?.handoff_reason || selectedHandoff.handoff_reason || '-' }}</el-descriptions-item>
               <el-descriptions-item label="请求时间">{{ selectedHandoff.human_requested_at || '-' }}</el-descriptions-item>
               <el-descriptions-item label="接入坐席">{{ selectedHandoff.human_assigned_staff_name || '-' }}</el-descriptions-item>
-              <el-descriptions-item label="意图">{{ selectedHandoff.intent || '-' }}</el-descriptions-item>
-              <el-descriptions-item label="摘要">{{ selectedHandoff.ai_summary || selectedHandoff.title || '-' }}</el-descriptions-item>
+              <el-descriptions-item label="当前意图">{{ handoffSummary?.intent || selectedHandoff.intent || '-' }}</el-descriptions-item>
+              <el-descriptions-item label="关联工单">{{ handoffSummary?.linked_ticket_no || selectedHandoff.linked_ticket_no || '-' }}</el-descriptions-item>
             </el-descriptions>
 
+            <section class="handoff-summary-card">
+              <div class="handoff-summary-header">
+                <strong>交接摘要</strong>
+                <el-tag size="small" type="info">最小必要信息</el-tag>
+              </div>
+              <p>{{ handoffSummary?.ai_summary || selectedHandoff.ai_summary || selectedHandoff.title || '暂无可展示的交接摘要。' }}</p>
+            </section>
+
+            <div class="handoff-history-toolbar">
+              <span>默认仅展示最近相关对话</span>
+              <el-button
+                v-if="handoffHistoryAvailable && handoffHistoryAccessAllowed"
+                :loading="handoffHistoryLoading"
+                link
+                type="primary"
+                @click="loadEarlierHandoffHistory"
+              >
+                展开更早历史
+              </el-button>
+              <span v-else-if="selectedHandoff.handoff_status === 'PENDING'" class="handoff-history-hint">
+                接入会话后可查看最近相关对话
+              </span>
+            </div>
+
+            <el-empty
+              v-if="!handoffMessages.length"
+              :description="selectedHandoff.handoff_status === 'PENDING' ? '请先接入会话，系统将提供最近相关对话。' : '暂无可展示的会话消息。'"
+              :image-size="72"
+            />
             <div class="handoff-messages">
               <div
                 v-for="message in handoffMessages"
@@ -546,17 +622,20 @@ onBeforeUnmount(() => {
               <el-form-item label="处理结果">
                 <el-input v-model="closeReason" :disabled="!canOperate" :rows="3" type="textarea" />
               </el-form-item>
-              <el-button :disabled="!canOperate" @click="generateDraft">生成客户话术草稿</el-button>
+              <el-button :disabled="!canOperate || generatingDraft" :loading="generatingDraft" @click="generateDraft">
+                {{ generatingDraft ? '正在基于工单事实生成…' : '生成客户话术草稿' }}
+              </el-button>
+              <p v-if="generatingDraft" class="draft-generating-hint">正在结合工单处理结果、客户诉求和最近会话生成草稿，通常几秒内完成。</p>
               <el-form-item class="reply-editor" label="客户可见内容">
                 <el-input
                   v-model="draftMessage"
-                  :disabled="!canOperate"
+                  :disabled="!canOperate || generatingDraft"
                   :rows="8"
                   placeholder="请先生成草稿，或直接填写要发送给客户的处理说明。"
                   type="textarea"
                 />
               </el-form-item>
-              <el-button :disabled="!canOperate" type="primary" @click="sendReply">确认发送给客户</el-button>
+              <el-button :disabled="!canOperate || generatingDraft" type="primary" @click="sendReply">确认发送给客户</el-button>
             </el-form>
           </el-card>
         </section>

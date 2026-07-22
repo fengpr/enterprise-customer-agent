@@ -112,6 +112,8 @@ def test_due_followup_writes_session_and_notification_without_creating_ticket() 
         stored = repository.get_followup(followup["followup_id"])
         assert stored["status"] == "COMPLETED"
         assert repository.unread_count(7) == 1
-        assert "不会自动创建退货工单" in messages.list_by_session(session["session_id"])[-1]["content"]
+        message = messages.list_by_session(session["session_id"])[-1]["content"]
+        assert "3 天内回复“确认”" in message
+        assert "不会自动创建退货工单" in message
         state = state_repository.get(session["session_id"])
         assert state["pending_interaction"]["parent_goal"] == "delivery_not_received_check"

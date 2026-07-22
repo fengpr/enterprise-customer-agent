@@ -90,6 +90,32 @@ def test_result_query_rejects_other_owner(monkeypatch):
     assert exc_info.value.status_code == 403
 
 
+def test_handoff_message_is_persisted_without_creating_agent_queue_job(monkeypatch):
+    """人工页签消息应走专用落库接口，不能创建 SSE/Agent 队列任务。"""
+    called = {}
+
+    class FakeExecutionService:
+        def execute(self, payload):
+            called["payload"] = payload
+            return {"session_id": "session-human", "answer": "已记录", "customer_message": "已记录"}
+
+    monkeypatch.setattr(app, "agent_execution_service", FakeExecutionService())
+    monkeypatch.setattr(
+        app,
+        "_current_login_user",
+        lambda _: {"customer_id": 8, "display_name": "测试客户", "role": "customer"},
+    )
+
+    result = app.send_handoff_message(
+        AgentReplyRequest(message="请优先跟进", session_id="session-human", route_target="ai"),
+        "Bearer token",
+    )
+
+    assert result["session_id"] == "session-human"
+    assert called["payload"].route_target == "human"
+    assert called["payload"].customer_id == 8
+
+
 def test_sse_wait_window_returns_reconnectable_queued_event(monkeypatch):
     """单次 SSE 等待到期时应返回非终态 queued，前端可用同一幂等键继续订阅。"""
     queue = FakeQueue({"status": "PENDING"})

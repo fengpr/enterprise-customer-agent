@@ -15,6 +15,7 @@ from services.resilient_client import ResilientClient
 from services.staff_presence_service import StaffPresenceService
 from services.execution_cancellation import AgentExecutionCancelled, CancellationToken
 from services.conversation_state_service import ConversationStateService, TurnResolution
+from services.conversation_summary_service import ConversationSummaryJob, ConversationSummaryQueue
 
 
 class AgentExecutionAccessDenied(Exception):
@@ -35,6 +36,7 @@ class AgentExecutionService:
         staff_presence_checker: Callable[[str], bool] | None = None,
         conversation_states: ConversationStateRepository | None = None,
         followup_notifications: FollowupNotificationRepository | None = None,
+        conversation_summary_queue: ConversationSummaryQueue | None = None,
     ) -> None:
         """注入执行依赖，方便 API 与 Worker 复用同一服务并进行单元测试。"""
         self.agent = agent or CustomerServiceAgent()
@@ -51,6 +53,7 @@ class AgentExecutionService:
         self.conversation_states = conversation_states or ConversationStateRepository()
         self.followup_notifications = followup_notifications or FollowupNotificationRepository()
         self.conversation_state_service = ConversationStateService(self.conversation_states)
+        self.conversation_summary_queue = conversation_summary_queue or ConversationSummaryQueue()
 
     def execute(self, payload: AgentReplyRequest, event_publisher: Callable[[str, dict[str, Any]], None] | None = None, cancellation_token: CancellationToken | None = None) -> dict[str, Any]:
         """执行完整客服 Agent 链路；调用前必须已由接口层完成客户鉴权并注入身份。"""
@@ -118,7 +121,7 @@ class AgentExecutionService:
         if turn_resolution.answer or turn_resolution.action:
             result = self._execute_deterministic_turn(session_id, payload, turn_resolution)
             self._persist_result(session_id, payload, result, conversation_context)
-            self.conversation_state_service.record_result(
+            memory_state = self.conversation_state_service.record_result(
                 session_no=session_id,
                 user_message=payload.message,
                 answer=result.get("customer_message") or result["answer"],
@@ -126,6 +129,7 @@ class AgentExecutionService:
                 pending_action=result.get("pending_action_request"),
                 result=result,
             )
+            self._enqueue_conversation_summary(session_id, memory_state)
             result.setdefault("execution_status", "success")
             result.setdefault("customer_visible_message", result.get("customer_message") or result.get("answer"))
             return result
@@ -187,7 +191,7 @@ class AgentExecutionService:
                 }
             )
         self._persist_result(session_id, payload, result, conversation_context)
-        self.conversation_state_service.record_result(
+        memory_state = self.conversation_state_service.record_result(
             session_no=session_id,
             user_message=payload.message,
             answer=result.get("customer_message") or result["answer"],
@@ -195,10 +199,30 @@ class AgentExecutionService:
             pending_action=result.get("pending_action_request"),
             result=result,
         )
+        self._enqueue_conversation_summary(session_id, memory_state)
         result.setdefault("execution_status", "success")
         result.setdefault("customer_visible_message", result.get("customer_message") or result.get("answer"))
         result.setdefault("ticket_no", ((result.get("ticket_result") or {}).get("data") or {}).get("ticketNo"))
         return result
+
+    def _enqueue_conversation_summary(self, session_id: str, state: dict[str, Any]) -> None:
+        """只投递会话标识和版本游标；Redis 故障不能影响客户当前回复。"""
+        summary = state.get("summary") or {}
+        cursor = int(summary.get("summary_cursor") or 0)
+        applied = int(summary.get("summary_applied_cursor") or 0)
+        if cursor <= applied:
+            return
+        try:
+            self.conversation_summary_queue.enqueue(
+                ConversationSummaryJob(
+                    session_no=session_id,
+                    source_version=int(state.get("version") or 0),
+                    summary_cursor=cursor,
+                )
+            )
+        except Exception:
+            # 摘要是增强能力；任务投递失败时确定性记忆仍然有效，不能让在线回复降级。
+            return
 
     def _execute_deterministic_turn(
         self,
@@ -433,6 +457,19 @@ class AgentExecutionService:
         self._ensure_handoff_exists(session_id, session, "manual_message")
         self.chat_messages.save(session_no=session_id, sender_type="customer", sender_id=str(payload.customer_id), content=payload.message, extra_data={"route_target": "human", "message_source": "manual_handoff_customer_message"})
         message = "您的补充内容已发送给当前人工客服。" if active else "您的补充内容已记录到人工服务请求中，客服接入后会一并查看。"
+        # 人工通道确认必须单独持久化并标记为 customer_visible，确保其只展示在人工客服页签，
+        # 也让刷新页面后的客户仍能明确知道消息已经进入人工处理链路。
+        self.chat_messages.save(
+            session_no=session_id,
+            sender_type="system",
+            sender_id="handoff-system",
+            content=message,
+            extra_data={
+                "route_target": "human",
+                "message_source": "handoff_manual_ack",
+                "customer_visible": True,
+            },
+        )
         return self._manual_session_ack(session_id, session, message)
 
     def _ensure_handoff_exists(self, session_id: str, session: dict[str, Any], reason: str) -> None:

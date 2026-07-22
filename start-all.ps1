@@ -20,6 +20,7 @@ $javaErrorLogFile = Join-Path $runtimeDir "business-service-error.log"
 $agentLogFile = Join-Path $runtimeDir "agent-api.log"
 $agentWorkerLogFile = Join-Path $runtimeDir "agent-worker-v2.log"
 $followupWorkerLogFile = Join-Path $runtimeDir "followup-worker-v2.log"
+$summaryWorkerLogFile = Join-Path $runtimeDir "conversation-summary-worker-v1.log"
 $frontendLogFile = Join-Path $runtimeDir "frontend-vue.log"
 
 function Test-PortOpen {
@@ -325,6 +326,17 @@ function Test-FollowupWorkerAlive {
     }
 }
 
+function Test-ConversationSummaryWorkerAlive {
+    param([string]$AgentDirectory)
+    Push-Location $AgentDirectory
+    try {
+        & .\.venv\Scripts\python.exe -c "from services.conversation_summary_service import ConversationSummaryQueue; raise SystemExit(0 if ConversationSummaryQueue().has_active_worker() else 1)" 2>$null
+        return $LASTEXITCODE -eq 0
+    } finally {
+        Pop-Location
+    }
+}
+
 function Start-ContainerIfNeeded {
     param([string]$Name, [string]$Image, [string[]]$Arguments)
     Write-Host "Checking container $Name..."
@@ -443,6 +455,22 @@ if (-not $SkipAgent) {
                 }
             } else {
                 Write-Host "Scheduled Follow-up Worker is already running."
+            }
+            # 会话摘要使用独立 Stream 和模型舱壁，不能占用在线 Agent Worker。
+            $summaryWorkerAlive = Test-ConversationSummaryWorkerAlive $agentDir
+            if (-not $summaryWorkerAlive) {
+                Write-Host "Starting Conversation Summary Worker..."
+                Remove-Item -Path $summaryWorkerLogFile -Force -ErrorAction SilentlyContinue
+                Start-ServiceWindow "conversation-summary-worker" $agentDir "`$env:REDIS_URL='$RedisUrl'; `$env:DB_PROVIDER='$databaseProvider'; `$env:CONVERSATION_SUMMARY_ENABLED='true'; .\.venv\Scripts\python.exe -m rag.conversation_summary_worker" $summaryWorkerLogFile
+                for ($attempt = 0; $attempt -lt 10 -and -not $summaryWorkerAlive; $attempt++) {
+                    Start-Sleep -Seconds 1
+                    $summaryWorkerAlive = Test-ConversationSummaryWorkerAlive $agentDir
+                }
+                if (-not $summaryWorkerAlive) {
+                    Write-Warning "Conversation Summary Worker heartbeat was not detected within 10 seconds. See $summaryWorkerLogFile"
+                }
+            } else {
+                Write-Host "Conversation Summary Worker is already running."
             }
         } else {
             Write-Warning "Skipped Agent Worker because Redis is unavailable."

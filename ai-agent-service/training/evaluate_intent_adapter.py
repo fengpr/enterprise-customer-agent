@@ -13,15 +13,19 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 
 SERVICE_ROOT = Path(__file__).resolve().parents[1]
-if str(SERVICE_ROOT) not in sys.path:
-    sys.path.insert(0, str(SERVICE_ROOT))
-
-from schemas.intent_schema import LLMIntentDraft
-from scripts.evaluate_intent_sft_baseline import build_report, load_cases
-
-
 DEFAULT_ADAPTER_DIR = SERVICE_ROOT / "artifacts" / "intent_sft" / "customer-intent-lora"
 DEFAULT_TEST_FILE = SERVICE_ROOT / "datasets" / "intent_sft" / "test.jsonl"
+METRIC_FIELDS = (
+    "intent",
+    "user_goal",
+    "need_order_query",
+    "need_ticket",
+    "need_human",
+    "next_action",
+)
+VALID_INTENTS = {"consult", "logistics", "refund", "exchange", "repair", "complaint", "invoice", "member", "other"}
+VALID_USER_GOALS = {"policy_consult", "how_to", "status_query", "action_request", "human_request", "out_of_scope", "complaint", "dispute", "info_query", "other"}
+VALID_NEXT_ACTIONS = {"collect_slots", "validate_order", "call_business_tool", "create_ticket", "ask_clarification", "transfer_human", "cancel_pending", "unsupported", None}
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -34,15 +38,65 @@ def parse_arguments() -> argparse.Namespace:
 
 
 def extract_json(text: str) -> dict[str, Any] | None:
-    """从模型回答中提取 JSON，并验证其能否通过当前意图草稿 Schema。"""
+    """从模型回答中提取 JSON，并验证关键意图字段是否符合训练契约。"""
     cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.IGNORECASE)
     match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
     if not match:
         return None
     try:
-        return LLMIntentDraft.model_validate(json.loads(match.group(0))).model_dump()
-    except (json.JSONDecodeError, ValueError):
+        payload = json.loads(match.group(0))
+    except json.JSONDecodeError:
         return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("intent") not in VALID_INTENTS or payload.get("user_goal") not in VALID_USER_GOALS:
+        return None
+    if payload.get("next_action") not in VALID_NEXT_ACTIONS:
+        return None
+    if not all(isinstance(payload.get(field), bool) for field in ("need_order_query", "need_ticket", "need_human")):
+        return None
+    return payload
+
+
+def load_cases(dataset_path: Path) -> list[dict[str, Any]]:
+    """读取独立测试集，提取用户问题及其人工标注的结构化结果。"""
+    cases: list[dict[str, Any]] = []
+    for line_number, line in enumerate(dataset_path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        messages = record.get("messages", [])
+        if len(messages) != 3 or messages[1].get("role") != "user" or messages[2].get("role") != "assistant":
+            raise ValueError(f"{dataset_path}:{line_number} 不是标准三段式 SFT 样本")
+        cases.append({"message": messages[1]["content"], "expected": json.loads(messages[2]["content"])})
+    return cases
+
+
+def build_report(cases: list[dict[str, Any]], predictions: list[dict[str, Any]]) -> dict[str, Any]:
+    """统计关键字段准确率与高风险样本的受控路由召回率。"""
+    if len(cases) != len(predictions):
+        raise ValueError("预测数量必须与测试样本数量一致")
+    field_correct = {field: 0 for field in METRIC_FIELDS}
+    high_risk_total = 0
+    high_risk_routed = 0
+    rows: list[dict[str, Any]] = []
+    for case, prediction in zip(cases, predictions, strict=True):
+        expected = case["expected"]
+        matches = {field: prediction.get(field) == expected.get(field) for field in METRIC_FIELDS}
+        for field, matched in matches.items():
+            field_correct[field] += int(matched)
+        if expected["need_human"] or expected["need_ticket"]:
+            high_risk_total += 1
+            high_risk_routed += int(bool(prediction.get("need_human") and prediction.get("need_ticket")))
+        rows.append({"message": case["message"], "expected": {field: expected[field] for field in METRIC_FIELDS}, "prediction": {field: prediction.get(field) for field in METRIC_FIELDS}, "matches": matches})
+    total = len(cases)
+    return {
+        "sample_count": total,
+        "field_accuracy": {field: round(correct / total, 4) if total else 0 for field, correct in field_correct.items()},
+        "high_risk_route_recall": round(high_risk_routed / high_risk_total, 4) if high_risk_total else None,
+        "high_risk_sample_count": high_risk_total,
+        "rows": rows,
+    }
 
 
 def load_adapter(adapter_dir: Path):

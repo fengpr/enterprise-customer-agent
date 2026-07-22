@@ -114,8 +114,15 @@ def build_ticket_process_graph(
             result = _call_tool(state, query_order, order_no, state.get("auth_token"))
             tool_results.append(result)
             log_tool_call("query_order", {"order_no": order_no}, result)
-            if should_query_logistics:
-                # 物流意图需要继续查询完整轨迹，订单归属由 Java 物流接口再次校验。
+            order_data = result.get("data") or {}
+            shipping_status = str(order_data.get("orderStatus") or "").upper() if isinstance(order_data, dict) else ""
+            should_enrich_shipping_status = (
+                analysis.user_goal == "status_query"
+                and result.get("status") == "success"
+                and shipping_status in {"SHIPPED", "IN_TRANSIT", "OUT_FOR_DELIVERY", "DELIVERING"}
+            )
+            if should_query_logistics or should_enrich_shipping_status:
+                # 物流意图或已发货订单状态查询需要补齐权威轨迹；不能把“未调用工具”误写成“物流未返回”。
                 logistics_result = _call_tool(state, query_order_logistics, order_no, state.get("auth_token"))
                 tool_results.append(logistics_result)
                 log_tool_call("query_order_logistics", {"order_no": order_no}, logistics_result)
@@ -378,11 +385,11 @@ def build_ticket_process_graph(
             ticket_data = result.get("data") or {}
             ticket_no = ticket_data.get("ticketNo")
             if ticket_no and should_auto_assign_ticket(state):
-                # 只有低风险且配置允许的工单才由 Agent 触发自动派单；默认进入调度队列。
+                # 只有低风险且配置允许的工单才由 Agent 触发系统自动派单；默认进入公共待领取队列。
                 try:
                     assign_result = _call_tool(state, auto_assign_ticket, ticket_no)
                 except Exception as exc:
-                    # 自动派单失败不能回滚已创建工单，保持 PENDING_ASSIGN 交由调度员处理。
+                    # 自动派单失败不能回滚已创建工单，保持 PENDING_ASSIGN 供在线坐席领取。
                     assign_result = {"status": "failed", "error": str(exc)}
                 log_tool_call("auto_assign_ticket", {"ticket_no": ticket_no}, assign_result)
                 tool_results.append({"tool_name": "auto_assign_ticket", **assign_result})
@@ -724,7 +731,7 @@ def _has_signed_logistics_evidence(state: TicketProcessState) -> bool:
 
 
 def should_auto_assign_ticket(state: TicketProcessState) -> bool:
-    """判断 Agent 建单后是否允许自动派单，默认关闭并保留给调度员确认。"""
+    """判断 Agent 建单后是否允许系统自动派单，默认关闭并进入公共待领取队列。"""
     if os.getenv("AGENT_AUTO_ASSIGN_TICKET", "false").strip().lower() not in {"1", "true", "yes", "on"}:
         return False
 

@@ -43,6 +43,10 @@ public class EmployeeService {
         // PostgreSQL profile 禁止服务层 DDL，统一由 Flyway migration 建表。
         if (!driverClassName.toLowerCase().contains("postgresql")) {
             initTables();
+        }
+        // Dispatcher 产品角色已下线；保留历史记录但禁用旧账号，避免旧 Token 或账号继续进入系统。
+        disableDeprecatedDispatcherAccounts();
+        if (!driverClassName.toLowerCase().contains("postgresql")) {
             seedEmployees();
         }
     }
@@ -84,7 +88,7 @@ public class EmployeeService {
     }
 
     /**
-     * 查询全部启用坐席，调度和其他角色不会进入派单候选池。
+     * 查询全部启用坐席，只有 staff 角色可以进入系统自动派单候选池。
      *
      * @return 启用坐席列表
      */
@@ -195,7 +199,19 @@ public class EmployeeService {
         insertSeed(10001L, "staff", "123456", "Demo Staff", "staff", "客服组", "other,logistics,exchange", true, true, 5, now);
         insertSeed(10002L, "staff2", "123456", "售后坐席", "staff", "售后组", "refund,exchange,repair", true, true, 3, now);
         insertSeed(10003L, "staff3", "123456", "投诉专员", "staff", "投诉处理组", "complaint,refund,exchange", true, true, 2, now);
-        insertSeed(20001L, "dispatcher", "123456", "调度主管", "dispatcher", "客服调度组", "", true, false, 1, now);
+    }
+
+    /**
+     * 禁用遗留 Dispatcher 账号。
+     *
+     * <p>本次只下线产品角色而不删除历史员工数据，避免生产迁移时破坏审计记录；
+     * 已禁用账号无法再签发登录 Token，也不会进入自动派单候选池。</p>
+     */
+    private void disableDeprecatedDispatcherAccounts() {
+        jdbcTemplate.update(
+                "UPDATE employee SET enabled = 0, updated_at = ? WHERE role = 'dispatcher' AND enabled = 1",
+                Timestamp.valueOf(LocalDateTime.now())
+        );
     }
 
     private void insertSeed(

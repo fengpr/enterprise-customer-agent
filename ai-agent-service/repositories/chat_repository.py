@@ -552,6 +552,78 @@ class ChatMessageRepository:
             for row in rows
         ]
 
+    def list_recent_by_session(self, session_no: str, limit: int = 12) -> list[dict[str, Any]]:
+        """读取会话最近消息窗口，供人工接管默认交接使用，避免默认暴露完整历史。"""
+        session = self.session_repository.get_by_session_no(session_no)
+        if not session:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, sender_type, sender_id, content, message_type, extra_data, created_at
+                FROM chat_message
+                WHERE session_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (session["id"], max(1, limit)),
+            ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "session_id": session_no,
+                "sender_type": row["sender_type"],
+                "sender_id": row["sender_id"],
+                "content": row["content"],
+                "message_type": row["message_type"],
+                "extra_data": self._load_extra(row["extra_data"]),
+                "created_at": row["created_at"],
+            }
+            for row in reversed(rows)
+        ]
+
+    def list_before_message_id(self, session_no: str, before_message_id: int, limit: int = 30) -> list[dict[str, Any]]:
+        """按游标读取更早历史；仅由已授权的人工历史展开接口调用。"""
+        session = self.session_repository.get_by_session_no(session_no)
+        if not session or before_message_id <= 0:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, sender_type, sender_id, content, message_type, extra_data, created_at
+                FROM chat_message
+                WHERE session_id = ? AND id < ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (session["id"], before_message_id, max(1, limit)),
+            ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "session_id": session_no,
+                "sender_type": row["sender_type"],
+                "sender_id": row["sender_id"],
+                "content": row["content"],
+                "message_type": row["message_type"],
+                "extra_data": self._load_extra(row["extra_data"]),
+                "created_at": row["created_at"],
+            }
+            for row in reversed(rows)
+        ]
+
+    def has_message_before(self, session_no: str, message_id: int) -> bool:
+        """判断当前消息窗口之前是否仍有历史，用于控制座席端“展开历史”入口。"""
+        session = self.session_repository.get_by_session_no(session_no)
+        if not session or message_id <= 0:
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM chat_message WHERE session_id = ? AND id < ? LIMIT 1",
+                (session["id"], message_id),
+            ).fetchone()
+        return row is not None
+
     def latest_message_id(self, session_no: str) -> int:
         """返回会话最新消息主键，用于坐席判断是否存在未同步的新消息。"""
         session = self.session_repository.get_by_session_no(session_no)

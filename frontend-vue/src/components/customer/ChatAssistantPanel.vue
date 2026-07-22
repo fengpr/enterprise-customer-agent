@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Connection, DocumentCopy, Headset, Link, Message, Position, Refresh, Service, Tickets, VideoPause } from '@element-plus/icons-vue'
+import { ArrowDown, ArrowUp, Connection, DocumentCopy, Headset, Link, Message, Position, Refresh, Service, Tickets, VideoPause } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import DOMPurify from 'dompurify'
 import MarkdownIt from 'markdown-it'
@@ -24,7 +24,8 @@ const emit = defineEmits<{
   'update:routeTarget': [value: RouteTarget]
   'continue-ai': []
   'cancel-handoff': []
-  submit: []
+  // 提交时携带当前页签快照，避免依赖异步 watch 导致消息被投递到旧通道。
+  submit: [target: RouteTarget]
   cancel: []
   quick: [action: string]
   regenerate: [message: string]
@@ -33,6 +34,8 @@ const emit = defineEmits<{
 const chatWindowRef = ref<HTMLElement | null>(null)
 const isComposing = ref(false)
 const activeTab = ref<RouteTarget>('ai')
+// 人工接入信息默认展开；客户可收起大面积上下文卡片，避免遮挡会话内容。
+const handoffDetailsCollapsed = ref(false)
 const inputPlaceholder = computed(() =>
   activeTab.value === 'human'
     ? '请输入要补充给人工客服的信息...'
@@ -65,6 +68,24 @@ const visibleMessageEntries = computed(() =>
     timeDivider: shouldShowTimeDivider(message, list[index - 1]) ? formatTimeDivider(message) : ''
   }))
 )
+
+/**
+ * 统一切换展示页签和真实投递目标。
+ * 人工页签不可用时不允许切换，防止尚未建立人工会话的消息被错误标成人工消息。
+ */
+function switchConversationChannel(target: RouteTarget | string) {
+  if (target !== 'ai' && target !== 'human') return
+  if (target === 'human' && !hasHumanSession.value) return
+  activeTab.value = target
+  // 同步通知父组件，不能仅依赖 watch 在下一个渲染周期更新。
+  emit('update:routeTarget', target)
+}
+
+/** 短客户消息按内容宽度展示，避免中文按单字换行或产生固定宽度空白。 */
+function isShortCustomerMessage(message: ChatMessage) {
+  const content = String(message.content || '').trim()
+  return message.sender_type === 'customer' && !/[\r\n]/.test(content) && Array.from(content).length <= 10
+}
 
 const markdown = new MarkdownIt({
   breaks: true,
@@ -239,7 +260,7 @@ function handleInputKeydown(event: KeyboardEvent) {
   if (event.key !== 'Enter' || event.shiftKey || event.isComposing || isComposing.value) return
   event.preventDefault()
   if (props.submitting || !props.modelValue.trim()) return
-  emit('submit')
+  emit('submit', activeTab.value)
 }
 
 async function scrollToBottom() {
@@ -251,8 +272,11 @@ async function scrollToBottom() {
   }
 }
 
-// KeepAlive 页面恢复时在浏览器绘制前校准位置，不播放历史内容滚动过程。
-onActivated(() => { void scrollToBottom() })
+// KeepAlive 页面恢复时默认回到智能助手，并在浏览器绘制前校准历史消息位置。
+onActivated(() => {
+  switchConversationChannel('ai')
+  void scrollToBottom()
+})
 
 watch(
   () => [visibleMessages.value.length, props.lastReply?.answer, activeTab.value],
@@ -263,24 +287,39 @@ watch(
 )
 
 watch(
-  activeTab,
-  (value) => {
-    emit('update:routeTarget', value)
+  () => props.routeTarget,
+  (target) => {
+    // 父组件从快捷操作、取消人工排队等入口改写目标时，同步修正当前展示页签。
+    if (target === 'ai' || hasHumanSession.value) activeTab.value = target
   },
   { immediate: true }
 )
 
 watch(
-  () => props.session?.handoff_status,
-  (status, previousStatus) => {
-    if (status === 'CLOSED' && status !== previousStatus) {
-      activeTab.value = 'ai'
+  () => ({
+    sessionId: props.session?.session_id || '',
+    handoffStatus: props.session?.handoff_status || ''
+  }),
+  (current, previous) => {
+    // 首次加载或切换历史会话时始终进入智能助手，人工记录只决定页签是否可选。
+    if (!previous || current.sessionId !== previous.sessionId) {
+      switchConversationChannel('ai')
+      // 切换会话后恢复展开，避免把上一会话的界面偏好误带入当前人工记录。
+      handoffDetailsCollapsed.value = false
       return
     }
-    if (status && status !== previousStatus && hasHumanSession.value && previousStatus !== undefined) {
-      activeTab.value = 'human'
+    if (current.handoffStatus === 'CLOSED' && current.handoffStatus !== previous.handoffStatus) {
+      switchConversationChannel('ai')
+      return
     }
-  }
+    // 只有同一会话在本轮中新进入人工接管状态时才自动展示人工页签。
+    if (current.handoffStatus && current.handoffStatus !== previous.handoffStatus) {
+      // 接管状态变化只更新状态卡，不强制切换页签。
+      // 否则 AI 触发转人工后，客户下一条普通提问会被错误投递到人工通道。
+      handoffDetailsCollapsed.value = false
+    }
+  },
+  { immediate: true }
 )
 </script>
 
@@ -291,17 +330,19 @@ watch(
         <h2>在线客服 / 智能助手</h2>
         <p><span class="online-dot"></span>智能助手 · 7x24小时为您服务</p>
       </div>
-      <el-button :icon="Headset" plain @click="emit('quick', '转人工客服')">转人工客服</el-button>
+      <div class="chat-header-actions">
+        <el-segmented
+          :model-value="activeTab"
+          :options="[
+            { label: `智能助手 ${aiMessages.length}`, value: 'ai' },
+            { label: `人工客服 ${humanMessages.length}`, value: 'human', disabled: !hasHumanSession }
+          ]"
+          class="chat-channel-tabs"
+          @update:model-value="switchConversationChannel($event)"
+        />
+        <el-button :icon="Headset" plain @click="emit('quick', '转人工客服')">转人工客服</el-button>
+      </div>
     </div>
-
-    <el-segmented
-      v-model="activeTab"
-      :options="[
-        { label: `智能助手 ${aiMessages.length}`, value: 'ai' },
-        { label: `人工客服 ${humanMessages.length}`, value: 'human', disabled: !hasHumanSession }
-      ]"
-      class="chat-channel-tabs"
-    />
 
     <div class="chat-context-strip">
       <span v-if="selectedOrder">
@@ -315,41 +356,61 @@ watch(
       <span v-if="!selectedOrder && !selectedTicket">当前为无订单咨询，可直接提问规则、发票、会员或人工服务问题</span>
     </div>
 
-    <div v-if="activeTab === 'human' && handoffStatusText" class="human-status-card">
+    <div
+      v-if="activeTab === 'human' && handoffStatusText"
+      :class="['human-status-card', { 'is-collapsed': handoffDetailsCollapsed }]"
+    >
       <div class="human-status-main">
-        <div>
+        <div class="human-status-title">
           <span>当前状态</span>
           <strong>{{ handoffStatusText }}</strong>
         </div>
         <div class="human-status-actions">
           <el-button v-if="session?.handoff_status === 'PENDING'" size="small" @click="emit('cancel-handoff')">取消排队</el-button>
           <el-tag :type="handoffStatusType">{{ session?.handoff_status }}</el-tag>
+          <el-button
+            class="handoff-collapse-button"
+            text
+            size="small"
+            :icon="handoffDetailsCollapsed ? ArrowDown : ArrowUp"
+            :aria-expanded="String(!handoffDetailsCollapsed)"
+            @click="handoffDetailsCollapsed = !handoffDetailsCollapsed"
+          >
+            {{ handoffDetailsCollapsed ? '展开详情' : '收起详情' }}
+          </el-button>
         </div>
       </div>
-      <dl>
-        <div>
-          <dt>请求时间</dt>
-          <dd>{{ session?.human_requested_at || '-' }}</dd>
+      <p v-if="handoffDetailsCollapsed" class="handoff-collapsed-summary">
+        {{ selectedTicket ? `已关联工单 ${selectedTicket.ticketNo}` : '人工客服正在查看当前会话' }}，您可在下方继续补充信息。
+      </p>
+      <el-collapse-transition>
+        <div v-show="!handoffDetailsCollapsed" class="handoff-detail-content">
+          <dl>
+            <div>
+              <dt>请求时间</dt>
+              <dd>{{ session?.human_requested_at || '-' }}</dd>
+            </div>
+            <div>
+              <dt>最近更新</dt>
+              <dd>{{ session?.updated_at || '-' }}</dd>
+            </div>
+            <div>
+              <dt>关联工单</dt>
+              <dd>{{ selectedTicket?.ticketNo || '-' }}</dd>
+            </div>
+            <div>
+              <dt>预计等待</dt>
+              <dd>{{ session?.handoff_status === 'PENDING' ? '排队中' : '-' }}</dd>
+            </div>
+          </dl>
+          <div class="handoff-summary-card">
+            <strong>上下文摘要</strong>
+            <p>当前订单：{{ selectedOrder?.orderNo || '未选择订单' }}</p>
+            <p>当前工单：{{ selectedTicket?.ticketNo || '暂无关联工单' }}</p>
+            <p>{{ session?.ai_summary || '人工客服可查看当前会话上下文，您也可以在下方继续补充关键信息。' }}</p>
+          </div>
         </div>
-        <div>
-          <dt>最近更新</dt>
-          <dd>{{ session?.updated_at || '-' }}</dd>
-        </div>
-        <div>
-          <dt>关联工单</dt>
-          <dd>{{ selectedTicket?.ticketNo || '-' }}</dd>
-        </div>
-        <div>
-          <dt>预计等待</dt>
-          <dd>{{ session?.handoff_status === 'PENDING' ? '排队中' : '-' }}</dd>
-        </div>
-      </dl>
-      <div class="handoff-summary-card">
-        <strong>上下文摘要</strong>
-        <p>当前订单：{{ selectedOrder?.orderNo || '未选择订单' }}</p>
-        <p>当前工单：{{ selectedTicket?.ticketNo || '暂无关联工单' }}</p>
-        <p>{{ session?.ai_summary || '人工客服可查看当前会话上下文，您也可以在下方继续补充关键信息。' }}</p>
-      </div>
+      </el-collapse-transition>
     </div>
 
     <div ref="chatWindowRef" class="chat-window">
@@ -359,23 +420,30 @@ watch(
           :key="entry.message.id"
         >
           <time v-if="entry.timeDivider" class="chat-time-divider">{{ entry.timeDivider }}</time>
+          <div v-if="entry.message.sender_type === 'system'" class="handoff-system-notice" role="status">
+            <el-icon><Service /></el-icon>
+            <span>{{ entry.message.content }}</span>
+          </div>
           <div
+            v-else
             :class="['chat-message', messageClass(entry.message)]"
           >
             <div class="bubble-avatar">{{ senderAvatar(entry.message) }}</div>
             <div class="message-stack">
-              <span class="message-sender">{{ senderLabel(entry.message) }}</span>
-              <div class="chat-bubble">
-                <p v-if="entry.message.sender_type === 'customer'">{{ entry.message.content }}</p>
-                <div v-else class="message-markdown" v-html="renderMessageMarkdown(entry.message.content)" />
-              </div>
-              <div class="message-bubble-actions">
-                <el-tooltip content="复制" placement="bottom">
-                  <el-button class="message-copy-action" text circle size="small" :icon="DocumentCopy" aria-label="复制消息" @click="copyMessage(entry.message.content)" />
-                </el-tooltip>
-                <el-tooltip v-if="entry.message.sender_type === 'ai'" content="重新生成" placement="bottom">
-                  <el-button class="message-regenerate-action" text circle size="small" :icon="Refresh" aria-label="重新生成回复" :disabled="submitting || !regeneratePrompt(entry.message)" @click="emit('regenerate', regeneratePrompt(entry.message))" />
-                </el-tooltip>
+              <span v-if="entry.message.sender_type !== 'customer'" class="message-sender">{{ senderLabel(entry.message) }}</span>
+              <div class="message-bubble-shell">
+                <div :class="['chat-bubble', { 'is-short-customer': isShortCustomerMessage(entry.message) }]">
+                  <p v-if="entry.message.sender_type === 'customer'">{{ entry.message.content }}</p>
+                  <div v-else class="message-markdown" v-html="renderMessageMarkdown(entry.message.content)" />
+                </div>
+                <div class="message-bubble-actions">
+                  <el-tooltip content="复制" placement="bottom">
+                    <el-button class="message-copy-action" text circle size="small" :icon="DocumentCopy" aria-label="复制消息" @click="copyMessage(entry.message.content)" />
+                  </el-tooltip>
+                  <el-tooltip v-if="entry.message.sender_type === 'ai'" content="重新生成" placement="bottom">
+                    <el-button class="message-regenerate-action" text circle size="small" :icon="Refresh" aria-label="重新生成回复" :disabled="submitting || !regeneratePrompt(entry.message)" @click="emit('regenerate', regeneratePrompt(entry.message))" />
+                  </el-tooltip>
+                </div>
               </div>
             </div>
           </div>
@@ -384,31 +452,37 @@ watch(
       <div v-else-if="activeTab === 'ai'" class="chat-message from-agent">
         <div class="bubble-avatar">AI</div>
         <div class="message-stack">
-          <div class="chat-bubble">
-            <p>
-              您好，我可以帮您咨询售后规则、发票、会员权益或转人工服务；如需查询物流或申请退货退款，请先选择对应订单。
-            </p>
+          <div class="message-bubble-shell">
+            <div class="chat-bubble">
+              <p>
+                您好，我可以帮您咨询售后规则、发票、会员权益或转人工服务；如需查询物流或申请退货退款，请先选择对应订单。
+              </p>
+            </div>
+            <div class="message-bubble-actions"><el-tooltip content="复制" placement="bottom"><el-button class="message-copy-action" text circle size="small" :icon="DocumentCopy" aria-label="复制消息" @click="copyMessage('您好，我可以帮您咨询售后规则、发票、会员权益或转人工服务；如需查询物流或申请退货退款，请先选择对应订单。')" /></el-tooltip></div>
           </div>
-          <div class="message-bubble-actions"><el-tooltip content="复制" placement="bottom"><el-button class="message-copy-action" text circle size="small" :icon="DocumentCopy" aria-label="复制消息" @click="copyMessage('您好，我可以帮您咨询售后规则、发票、会员权益或转人工服务；如需查询物流或申请退货退款，请先选择对应订单。')" /></el-tooltip></div>
         </div>
       </div>
       <div v-else class="chat-message from-staff">
         <div class="bubble-avatar">人</div>
         <div class="message-stack">
-          <div class="chat-bubble">
-            <p>人工客服会话已单独展示。您可以在下方补充信息，客服接入后会在这里回复。</p>
+          <div class="message-bubble-shell">
+            <div class="chat-bubble">
+              <p>人工客服会话已单独展示。您可以在下方补充信息，客服接入后会在这里回复。</p>
+            </div>
+            <div class="message-bubble-actions"><el-tooltip content="复制" placement="bottom"><el-button class="message-copy-action" text circle size="small" :icon="DocumentCopy" aria-label="复制消息" @click="copyMessage('人工客服会话已单独展示。您可以在下方补充信息，客服接入后会在这里回复。')" /></el-tooltip></div>
           </div>
-          <div class="message-bubble-actions"><el-tooltip content="复制" placement="bottom"><el-button class="message-copy-action" text circle size="small" :icon="DocumentCopy" aria-label="复制消息" @click="copyMessage('人工客服会话已单独展示。您可以在下方补充信息，客服接入后会在这里回复。')" /></el-tooltip></div>
         </div>
       </div>
       <div v-if="lastReply && activeTab === 'ai'" class="chat-message from-agent">
         <div class="bubble-avatar">AI</div>
         <div class="message-stack">
-          <div class="chat-bubble">
-            <div class="message-markdown" v-html="renderMessageMarkdown(lastReply.customer_message || lastReply.answer)" />
+          <div class="message-bubble-shell">
+            <div class="chat-bubble">
+              <div class="message-markdown" v-html="renderMessageMarkdown(lastReply.customer_message || lastReply.answer)" />
+            </div>
+            <!-- 流式回复仅用于展示生成进度；在请求完成并落库前不提供复制，避免复制临时状态文案。 -->
+            <div v-if="!submitting" class="message-bubble-actions"><el-tooltip content="复制" placement="bottom"><el-button class="message-copy-action" text circle size="small" :icon="DocumentCopy" aria-label="复制消息" @click="copyMessage(lastReply.customer_message || lastReply.answer)" /></el-tooltip></div>
           </div>
-          <!-- 流式回复仅用于展示生成进度；在请求完成并落库前不提供复制，避免复制临时状态文案。 -->
-          <div v-if="!submitting" class="message-bubble-actions"><el-tooltip content="复制" placement="bottom"><el-button class="message-copy-action" text circle size="small" :icon="DocumentCopy" aria-label="复制消息" @click="copyMessage(lastReply.customer_message || lastReply.answer)" /></el-tooltip></div>
         </div>
       </div>
     </div>
@@ -423,8 +497,8 @@ watch(
 
     <div class="chat-input-box">
       <div class="route-target-row">
-        <span>当前发送给</span>
-        <strong>{{ activeTab === 'human' ? '人工客服' : '智能助手' }}</strong>
+        <span>当前发送给 <strong>{{ activeTab === 'human' ? '人工客服' : '智能助手' }}</strong></span>
+        <small>内容由 AI 生成，仅供参考</small>
       </div>
       <div v-if="composerHint && activeTab === 'ai'" class="composer-context-hint">
         <el-icon><Refresh /></el-icon>
@@ -432,7 +506,7 @@ watch(
       </div>
       <el-input
         :model-value="modelValue"
-        :rows="2"
+        :rows="1"
         :placeholder="inputPlaceholder"
         type="textarea"
         @compositionend="isComposing = false"
@@ -450,9 +524,8 @@ watch(
             停止生成
           </el-button>
         </el-tooltip>
-        <el-button v-else :icon="Position" circle type="primary" @click="emit('submit')" />
+        <el-button v-else :icon="Position" circle type="primary" @click="emit('submit', activeTab)" />
       </div>
-      <p>内容由 AI 生成，仅供参考</p>
     </div>
   </section>
 </template>

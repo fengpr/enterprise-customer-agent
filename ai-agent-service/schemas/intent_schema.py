@@ -16,6 +16,7 @@ UserGoal = Literal[
     "info_query",
     "other",
 ]
+QuerySubject = Literal["product", "order", "logistics", "ticket", "policy", "identity", "general"]
 Emotion = Literal["normal", "anxious", "dissatisfied", "strong_complaint"]
 Priority = Literal["low", "medium", "high", "urgent"]
 ActionType = Literal[
@@ -85,6 +86,7 @@ class IntentResult(BaseModel):
 
     intent: Intent
     user_goal: UserGoal = "other"
+    query_subject: QuerySubject = "general"
     emotion: Emotion
     order_related: bool
     order_no: list[str] = Field(default_factory=list)
@@ -107,6 +109,7 @@ class LLMIntentDraft(BaseModel):
 
     intent: Intent = "other"
     user_goal: UserGoal = "other"
+    query_subject: QuerySubject = "general"
     emotion: Emotion = "normal"
     order_related: bool = False
     order_no: list[str] | None = None

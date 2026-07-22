@@ -133,6 +133,7 @@ class ConversationContextTest(unittest.TestCase):
         out_of_scope = IntentResult(
             intent="other",
             user_goal="out_of_scope",
+            query_subject="product",
             emotion="normal",
             order_related=False,
             order_no=[],
@@ -155,6 +156,53 @@ class ConversationContextTest(unittest.TestCase):
         self.assertEqual(result.order_no, ["EC202607160010"])
         self.assertFalse(result.need_human)
 
+    def test_product_intro_ignores_stale_human_request_from_model_context(self):
+        """历史人工排队信息不得让模型把本轮商品介绍误判为再次转人工。"""
+        agent = object.__new__(CustomerServiceAgent)
+        stale_handoff = IntentResult(
+            intent="consult",
+            user_goal="human_request",
+            query_subject="product",
+            emotion="normal",
+            order_related=False,
+            order_no=[],
+            product_name=None,
+            need_order_query=False,
+            need_ticket=True,
+            need_human=True,
+            priority="medium",
+            confidence=0.88,
+            summary="模型受历史人工接管上下文影响",
+            risk_reasons=["human_request"],
+        )
+        context = build_conversation_context(
+            messages=[],
+            pending_action_request=None,
+            selected_order_no="EC202607160010",
+            selected_ticket_no=None,
+        )
+
+        guarded = agent._apply_business_guardrails("介绍一下这个商品", stale_handoff)
+        guarded = agent._apply_context_guardrails("介绍一下这个商品", guarded, context)
+
+        self.assertEqual(guarded.user_goal, "info_query")
+        self.assertEqual(guarded.order_no, ["EC202607160010"])
+        self.assertTrue(guarded.need_order_query)
+        self.assertFalse(guarded.need_human)
+        self.assertFalse(guarded.need_ticket)
+        self.assertNotIn("human_request", guarded.risk_reasons)
+
+    def test_explicit_human_request_still_enters_handoff(self):
+        """当前消息明确要求人工时仍应保留人工接管能力。"""
+        agent = object.__new__(CustomerServiceAgent)
+        draft = _status_analysis(intent="consult", user_goal="info_query")
+
+        guarded = agent._apply_business_guardrails("请帮我转人工客服", draft)
+
+        self.assertEqual(guarded.user_goal, "human_request")
+        self.assertTrue(guarded.need_human)
+        self.assertIn("human_request", guarded.risk_reasons)
+
     def test_selected_order_product_inquiry_builds_product_answer(self):
         """同一语义路由应进入可信商品事实与自然补充回复，而不是无证据兜底。"""
         agent = object.__new__(CustomerServiceAgent)
@@ -165,7 +213,7 @@ class ConversationContextTest(unittest.TestCase):
             selected_order_no="EC202607160010",
             selected_ticket_no=None,
         )
-        analysis = _status_analysis(intent="consult", user_goal="info_query", order_no=["EC202607160010"])
+        analysis = _status_analysis(intent="consult", user_goal="info_query", query_subject="product", order_no=["EC202607160010"])
         answer = agent._compose_answer(
             {
                 "message": "这款商品怎么样",
@@ -217,13 +265,22 @@ class ConversationContextTest(unittest.TestCase):
         self.assertTrue(guarded.order_related)
         self.assertTrue(guarded.need_order_query)
 
+    def test_product_reply_mode_uses_structured_subject_not_surface_phrase(self):
+        """商品回复路由只依赖结构化语义对象，不再维护自然表达词表。"""
+        agent = object.__new__(CustomerServiceAgent)
+        for message in ["介绍一下这个商品", "聊聊我买的东西", "它适合日常使用吗"]:
+            state = {"message": message, "analysis": _status_analysis(query_subject="product")}
+            self.assertTrue(agent._is_current_order_product_inquiry(state))
+        state = {"message": "介绍一下这个商品", "analysis": _status_analysis(query_subject="order")}
+        self.assertFalse(agent._is_current_order_product_inquiry(state))
+
     def test_selected_order_product_answer_uses_verified_fields(self):
         """商品介绍应展示订单工具返回的可信字段，不再索要已选订单号或编造产品能力。"""
         agent = object.__new__(CustomerServiceAgent)
         answer = agent._compose_answer(
             {
                 "message": "介绍一下该订单的商品",
-                "analysis": _status_analysis(intent="other", user_goal="info_query"),
+                "analysis": _status_analysis(intent="other", user_goal="info_query", query_subject="product"),
                 "selected_order_no": "EC202607160009",
                 "tool_results": [
                     {
@@ -270,7 +327,7 @@ class ConversationContextTest(unittest.TestCase):
         answer = agent._compose_answer(
             {
                 "message": "介绍一下该订单的商品",
-                "analysis": _status_analysis(intent="other", user_goal="info_query"),
+                "analysis": _status_analysis(intent="other", user_goal="info_query", query_subject="product"),
                 "selected_order_no": "EC202607160009",
                 "tool_results": [
                     {
@@ -334,9 +391,123 @@ class ConversationContextTest(unittest.TestCase):
             }
         )
 
-        self.assertIn("2000-01-01 09:00", answer)
-        self.assertIn("该预计时间已过", answer)
+        self.assertIn("原预计送达时间为 2000 年 1 月 1 日 09:00", answer)
+        self.assertIn("目前物流存在延迟", answer)
         self.assertNotIn("今天", answer)
+
+    def test_logistics_answer_uses_conclusion_and_current_snapshot(self):
+        """常规物流查询应突出当前节点，只有明确要求完整轨迹时才展开历史路线。"""
+        agent = object.__new__(CustomerServiceAgent)
+        answer = agent._compose_answer(
+            {
+                "message": "查询订单状态",
+                "analysis": _status_analysis(intent="logistics"),
+                "selected_order_no": "EC202607160010",
+                "tool_results": [
+                    {
+                        "status": "success",
+                        "query_type": "order_detail",
+                        "data": {
+                            "orderNo": "EC202607160010",
+                            "productName": "Noise Cancelling Headset",
+                            "orderStatus": "SHIPPED",
+                        },
+                    },
+                    {
+                        "status": "success",
+                        "query_type": "order_logistics",
+                        "order_no": "EC202607160010",
+                        "data": {
+                            "orderNo": "EC202607160010",
+                            "carrierName": "顺丰速运",
+                            "trackingNo": "SF202607160010",
+                            "logisticsStatus": "IN_TRANSIT",
+                            "latestLocation": "上海转运中心",
+                            "estimatedDeliveryTime": "2000-07-16T16:50:00",
+                            "routeSummary": "杭州仓库 -> 杭州集散中心 -> 上海转运中心",
+                            "traces": [
+                                {
+                                    "status": "SHIPPED",
+                                    "stationName": "杭州仓库",
+                                    "description": "商家已发货。",
+                                    "occurredAt": "2000-07-15T08:00:00",
+                                },
+                                {
+                                    "status": "IN_TRANSIT",
+                                    "stationName": "上海转运中心",
+                                    "description": "包裹已到达上海转运中心，等待下一站分拨。",
+                                    "occurredAt": "2000-07-15T16:54:00",
+                                },
+                            ],
+                        },
+                    },
+                ],
+                "citations": [],
+            }
+        )
+
+        self.assertIn("您的订单已经发货，目前正在上海转运中心处理中", answer)
+        self.assertIn("订单信息\n订单号：EC202607160010", answer)
+        self.assertIn("商品：降噪耳机", answer)
+        self.assertIn("当前物流\n状态：运输中", answer)
+        self.assertIn("最新动态：包裹已到达上海转运中心，等待下一站分拨。", answer)
+        self.assertIn("目前物流存在延迟", answer)
+        self.assertNotIn("经过路线", answer)
+        self.assertNotIn("完整物流轨迹", answer)
+
+    def test_logistics_trace_query_expands_complete_timeline(self):
+        """明确查询物流轨迹时应展开时间线，不能与普通订单状态摘要完全相同。"""
+        agent = object.__new__(CustomerServiceAgent)
+        common_state = {
+            "analysis": _status_analysis(intent="logistics"),
+            "selected_order_no": "EC202607160009",
+            "tool_results": [
+                {
+                    "status": "success",
+                    "query_type": "order_detail",
+                    "data": {
+                        "orderNo": "EC202607160009",
+                        "productName": "Smart Router AX3000",
+                        "orderStatus": "SIGNED",
+                    },
+                },
+                {
+                    "status": "success",
+                    "query_type": "order_logistics",
+                    "data": {
+                        "orderNo": "EC202607160009",
+                        "carrierName": "顺丰速运",
+                        "trackingNo": "SF202607160009",
+                        "logisticsStatus": "SIGNED",
+                        "latestLocation": "上海浦东签收点",
+                        "estimatedDeliveryTime": "2000-07-15T12:50:00",
+                        "traces": [
+                            {
+                                "status": "SHIPPED",
+                                "stationName": "杭州仓库",
+                                "description": "商家已发货，快件已完成揽收。",
+                                "occurredAt": "2000-07-14T08:00:00",
+                            },
+                            {
+                                "status": "SIGNED",
+                                "stationName": "上海浦东签收点",
+                                "description": "快件已由本人签收。",
+                                "occurredAt": "2000-07-15T12:40:00",
+                            },
+                        ],
+                    },
+                },
+            ],
+            "citations": [],
+        }
+
+        status_answer = agent._compose_answer({**common_state, "message": "查询订单状态"})
+        trace_answer = agent._compose_answer({**common_state, "message": "查询物流轨迹"})
+
+        self.assertNotIn("完整物流轨迹", status_answer)
+        self.assertIn("完整物流轨迹", trace_answer)
+        self.assertIn("杭州仓库", trace_answer)
+        self.assertIn("上海浦东签收点", trace_answer)
 
     def test_delivery_contingency_without_order_gives_actionable_order_guidance(self):
         """未来未收到再售后的表达应说明核查路径，而不是退化成泛化安慰话术。"""
@@ -1228,6 +1399,43 @@ class ConversationContextTest(unittest.TestCase):
         self.assertEqual(calls["query_ticket_status"], [])
         self.assertFalse(result["analysis"].need_ticket)
         self.assertIn("您可以这样查询物流状态", result["answer"])
+
+    def test_shipped_order_status_query_also_fetches_logistics(self):
+        """已发货订单的状态查询应补查物流，不能把未调用工具误写成物流未返回。"""
+        calls: list[str] = []
+        analysis = _status_analysis(intent="consult", order_related=True, need_order_query=True)
+        analysis.user_goal = "status_query"
+        analysis.order_no = ["EC202607160010"]
+
+        graph = build_ticket_process_graph(
+            analyzer_chain=RunnableLambda(lambda _: analysis),
+            retrieve_knowledge=lambda _: [],
+            query_order=lambda order_no, auth_token: {
+                "status": "success",
+                "query_type": "order_detail",
+                "order_no": order_no,
+                "data": {"orderNo": order_no, "orderStatus": "SHIPPED"},
+            },
+            query_customer_orders=lambda customer_id, auth_token: {"status": "empty", "data": []},
+            query_order_logistics=lambda order_no, auth_token: calls.append(order_no) or {
+                "status": "success",
+                "query_type": "order_logistics",
+                "order_no": order_no,
+                "data": {"orderNo": order_no, "logisticsStatus": "IN_TRANSIT", "traces": []},
+            },
+            create_ticket=lambda payload, auth_token: {"status": "failed"},
+            auto_assign_ticket=lambda ticket_no: {"status": "failed"},
+            list_customer_tickets=lambda auth_token: {"status": "success", "data": []},
+            query_ticket_status=lambda ticket_no, auth_token: {"status": "empty"},
+            urge_ticket=lambda ticket_no, reason, auth_token: {"status": "empty"},
+            prepare_action=lambda state: {"analysis": state["analysis"], "pending_action_request": None},
+            compose_answer=lambda state: "ok",
+            log_tool_call=lambda tool_name, input_data, output_data: None,
+        )
+
+        graph.invoke({"message": "查询当前订单状态", "tool_results": [], "citations": []})
+
+        self.assertEqual(calls, ["EC202607160010"])
 
     def test_user_goal_matrix_is_goal_first(self):
         """核心话术先判定用户目标，再决定业务域和工具链。"""

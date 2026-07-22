@@ -360,10 +360,12 @@ async function handleSessionsChanged(payload: { sessionId: string; deleted: bool
   await loadSessions(true)
 }
 
-async function submitQuestion() {
+async function submitQuestion(target: RouteTarget = routeTarget.value) {
   if (submitting.value) {
     return
   }
+  // 提交瞬间冻结投递目标，避免页签切换的响应式更新与网络请求竞争导致跨通道显示。
+  const submittedRouteTarget: RouteTarget = target === 'human' ? 'human' : 'ai'
   // 售后模式下空白发送也代表“开始退货申请”，后端会基于已选订单继续追问真正缺失的槽位。
   const rawContent = messageText.value.trim()
   const submittedComposerMode = composerMode.value
@@ -390,18 +392,23 @@ async function submitQuestion() {
       sender_id: null,
       content,
       message_type: 'text',
-      extra_data: { route_target: routeTarget.value },
+      extra_data: { route_target: submittedRouteTarget },
       created_at: new Date().toISOString()
     }
   ]
   // SSE 建连和首个 token 之间立即显示可见状态，避免客户误以为页面卡死。
-  lastReply.value = {
-    session_id: selectedSessionId.value || 'pending',
-    answer: '正在接收您的问题…',
-    customer_message: '正在接收您的问题…',
-    service_status: '请求已发送',
-    auto_send: false,
-    need_human: false
+  if (submittedRouteTarget === 'ai') {
+    // 仅 AI 通道显示 SSE 阶段状态，避免人工确认信息串入智能助手页签。
+    lastReply.value = {
+      session_id: selectedSessionId.value || 'pending',
+      answer: '正在接收您的问题…',
+      customer_message: '正在接收您的问题…',
+      service_status: '请求已发送',
+      auto_send: false,
+      need_human: false
+    }
+  } else {
+    lastReply.value = null
   }
   try {
     // 同一次提交在所有 SSE 重连中复用幂等键，避免重复执行模型或重复创建工单。
@@ -411,7 +418,16 @@ async function submitQuestion() {
       session_id: selectedSessionId.value || null,
       selected_order_no: selectedOrderNo.value || null,
       selected_ticket_no: selectedTicketNo.value || null,
-      route_target: routeTarget.value
+      route_target: submittedRouteTarget
+    }
+    if (submittedRouteTarget === 'human') {
+      // 人工通道只执行消息落库，不入 Agent 队列，也不读取异步 request_id 的结果。
+      const { data } = await customerApi.sendHandoffMessage(requestPayload)
+      selectedSessionId.value = data.session_id || selectedSessionId.value
+      await pollCurrentSession()
+      await loadSessions(true)
+      showReplySubmitFeedback(data)
+      return
     }
     let streamedAnswer = ''
     let finalReply: AgentReply | null = null
@@ -665,6 +681,10 @@ async function applyRouteContext() {
         nextQuery.sessionId = createdSession.session_id
         await router.replace({ path: route.path, query: nextQuery })
       }
+    } else if (!orderNo && !ticketNo && typeof route.query.message !== 'string') {
+      // 直接进入客服页时始终打开仓库排序后的首个会话，不能沿用空白的新会话。
+      const primarySessionId = sessions.value[0]?.session_id
+      if (primarySessionId) await selectSession(primarySessionId)
     }
     // 关联标识必须先经过当前客户已加载列表校验，不能直接信任 URL 参数。
     if (orderNo && orders.value.some((item) => item.orderNo === orderNo)) selectedOrderNo.value = orderNo

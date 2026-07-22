@@ -24,7 +24,7 @@ public class StaffDirectoryService {
     }
 
     /**
-     * 查询所有启用坐席，调度角色不会进入派单候选池。
+     * 查询所有启用坐席，作为系统自动派单的候选池。
      *
      * @return 坐席资源列表
      */

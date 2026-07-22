@@ -160,12 +160,13 @@ class LLMIntentAnalyzer:
 必须输出一个 JSON object，不要输出 Markdown、解释文字或代码块。
 
 必须包含字段：
-intent, user_goal, emotion, order_related, order_no, product_name, need_order_query, need_ticket,
+intent, user_goal, query_subject, emotion, order_related, order_no, product_name, need_order_query, need_ticket,
 need_human, priority, confidence, summary, risk_reasons, action_type, action_slots, missing_slots, next_action。
 
 枚举约束：
 - intent: consult, logistics, refund, exchange, repair, complaint, invoice, member, other
 - user_goal: policy_consult, how_to, status_query, action_request, human_request, out_of_scope, complaint, dispute, info_query, other
+- query_subject: product, order, logistics, ticket, policy, identity, general
 - emotion: normal, anxious, dissatisfied, strong_complaint
 - priority: low, medium, high, urgent
 - action_type: return_goods, refund_request, exchange_goods, repair_request, invoice_issue, cancel_order, complaint_submit, other
@@ -196,13 +197,15 @@ need_human, priority, confidence, summary, risk_reasons, action_type, action_slo
 22. “最近买了什么、一共几件、总计花费多少、统计本月消费”等购买汇总问题用 user_goal=info_query、order_related=true、need_order_query=true，不要归为 how_to，也不要让客户自行统计。
 22. 信息不全时 next_action=collect_slots；信息齐全时可以建议 create_ticket，但最终是否查单或建单只能由后端确定性规则决定。
 23. 如果输入上下文明确说明“当前前端已选中一笔订单”，且用户使用“这款商品怎么样、适合什么场景、值不值、有什么用途、评价如何”等自然表达，
-   应识别为 intent=consult、user_goal=info_query、order_related=true、need_order_query=true 的只读商品咨询；
+   应识别为 intent=consult、user_goal=info_query、query_subject=product、order_related=true、need_order_query=true 的只读商品咨询；
    不要误判为 out_of_scope。仅当用户问题确实指向该商品或订单时才可关联，普通常识问题不能因存在选中订单而被强行绑定。
+24. query_subject 表示当前真正询问的对象，与具体说法无关：商品介绍、用途、评价和适用性为 product；订单事实为 order；物流为 logistics；工单为 ticket；规则为 policy；身份为 identity；无法确定才用 general。
 
 JSON 示例：
 {{
   "intent": "logistics",
   "user_goal": "status_query",
+  "query_subject": "logistics",
   "emotion": "normal",
   "order_related": true,
   "order_no": ["EC202606220001"],
@@ -328,6 +331,7 @@ JSON 示例：
         return IntentResult(
             intent=draft.intent,
             user_goal=user_goal,
+            query_subject=draft.query_subject,
             emotion=draft.emotion,
             order_related=order_related,
             order_no=order_no,

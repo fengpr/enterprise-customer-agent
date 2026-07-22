@@ -15,6 +15,9 @@ from services.cache_service import CacheService
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 CONFIRM_WORDS = {"是", "是的", "确认", "没错", "对", "对的", "继续", "可以"}
 CANCEL_WORDS = {"取消", "算了", "不用了", "不需要了"}
+RECENT_TURN_MESSAGE_LIMIT = 30
+REPEAT_WORDS = {"重新查询", "再查一下", "再查询一下", "重新查一下", "刷新一下", "再看看", "重新执行查询"}
+CONTINUE_WORDS = {"继续", "接着处理", "继续处理", "接着查"}
 
 
 @dataclass(slots=True)
@@ -41,7 +44,22 @@ class ConversationStateService:
         """创建不包含客户敏感信息的初始状态。"""
         return {
             "recent_turns": [],
-            "summary": {"topics": [], "confirmed_facts": [], "unfinished_goal": None},
+            "summary": {
+                "topics": [],
+                "active_topic": None,
+                "last_intent": None,
+                "last_user_goal": None,
+                "last_query": None,
+                "last_tool_action": None,
+                "last_result_status": None,
+                "unfinished_goal": None,
+                "unresolved_goal": None,
+                "confirmed_facts": [],
+                "rolling_summary": "",
+                "summary_cursor": 0,
+                "summary_applied_cursor": 0,
+                "summary_version": 0,
+            },
             "entity_context": {"order": None, "ticket": None, "product": None},
             "pending_interaction": None,
             "pending_action": None,
@@ -82,6 +100,12 @@ class ConversationStateService:
                 state["pending_interaction"] = None
                 if normalized in CONFIRM_WORDS:
                     self.save(session_no, state)
+                    # 物流复核是异步通知，客户可能隔天才打开会话；过期后应给出与通知场景匹配的下一步，不能让客户重新描述全部诉求。
+                    if pending.get("parent_goal") == "delivery_not_received_check":
+                        return TurnResolution(
+                            state=state,
+                            answer="这条物流复核结果已超过可确认时效。请重新查询该订单物流；如果仍未收到，可选择该订单后说明“仍未收到”，我会重新核验并继续协助您处理。",
+                        )
                     return TurnResolution(state=state, answer="刚才的确认问题已失效，请重新说明您要处理的订单和诉求。")
             elif normalized in CANCEL_WORDS:
                 state["pending_interaction"] = None
@@ -95,6 +119,17 @@ class ConversationStateService:
                 # 显式新业务目标优先于旧确认，避免用户查询物流时仍被拉回退货确认。
                 state["pending_interaction"] = None
                 self.save(session_no, state)
+
+        operation = self._resolve_operation(normalized)
+        if operation in {"repeat", "continue"} and not pending:
+            repeated = self._restore_read_only_query(state, selected_order_no)
+            if repeated:
+                return repeated
+            if operation == "repeat" and self._last_operation_was_write(state):
+                return TurnResolution(
+                    state=state,
+                    answer="刚才涉及退货、退款或工单等业务操作，不能直接重复执行。请明确是否继续当前流程，我会先核对状态并避免重复提交。",
+                )
 
         if self._is_delivery_contingency(message):
             scheduled_at = self._resolve_followup_time(message, current)
@@ -130,12 +165,12 @@ class ConversationStateService:
         return TurnResolution(state=state)
 
     def hydrate_recent_turns(self, session_no: str, messages: list[dict[str, Any]]) -> dict[str, Any]:
-        """为历史会话首次构建最近六轮，之后只做增量压缩。"""
+        """为历史会话首次构建最近十五轮，之后只做增量压缩。"""
         state = self.load(session_no)
         if state.get("recent_turns"):
             return state
         turns: list[dict[str, Any]] = []
-        for item in messages[-24:]:
+        for item in messages[-60:]:
             role = "user" if item.get("sender_type") == "customer" else "assistant" if item.get("sender_type") == "ai" else None
             if not role:
                 continue
@@ -149,8 +184,8 @@ class ConversationStateService:
                     "at": str(item.get("created_at") or ""),
                 }
             )
-        state["recent_turns"] = turns[-12:]
-        self._rebuild_pending_from_history(state, turns[-12:])
+        state["recent_turns"] = turns[-RECENT_TURN_MESSAGE_LIMIT:]
+        self._rebuild_pending_from_history(state, turns[-RECENT_TURN_MESSAGE_LIMIT:])
         return self.save(session_no, state) if turns else state
 
     def record_result(
@@ -164,7 +199,7 @@ class ConversationStateService:
         result: dict[str, Any],
         now: datetime | None = None,
     ) -> dict[str, Any]:
-        """压缩本轮结果为最近六轮、确定性摘要和带有效期实体。"""
+        """压缩本轮结果为最近十五轮、确定性摘要和带有效期实体。"""
         current = now or datetime.now(SHANGHAI)
         state = self.load(session_no)
         turns = list(state.get("recent_turns") or [])
@@ -174,15 +209,26 @@ class ConversationStateService:
                 {"role": "assistant", "content": self._safe_text(answer), "at": current.isoformat()},
             ]
         )
-        state["recent_turns"] = turns[-12:]
+        overflow_count = max(0, len(turns) - RECENT_TURN_MESSAGE_LIMIT)
+        state["recent_turns"] = turns[-RECENT_TURN_MESSAGE_LIMIT:]
         state["pending_action"] = pending_action
         analysis = result.get("analysis") or {}
         topic = str(analysis.get("intent") or "other")
         topics = [item for item in state["summary"].get("topics", []) if item != topic]
         state["summary"]["topics"] = (topics + [topic])[-5:]
+        state["summary"]["active_topic"] = topic
+        state["summary"]["last_intent"] = topic
+        state["summary"]["last_user_goal"] = str(analysis.get("user_goal") or "other")
         state["summary"]["unfinished_goal"] = (
             (pending_action or {}).get("action_type") if pending_action else None
         )
+        state["summary"]["unresolved_goal"] = (
+            (pending_action or {}).get("action_type") if pending_action else None
+        )
+        self._update_last_query_summary(state["summary"], result, selected_order_no)
+        if overflow_count:
+            # 摘要游标只表示已有更早消息需要异步压缩，不在在线链路调用摘要模型。
+            state["summary"]["summary_cursor"] = int(state["summary"].get("summary_cursor") or 0) + overflow_count
         if selected_order_no:
             self._set_order_context(state, selected_order_no, "selected_by_user", current, confirmed=True)
 
@@ -228,6 +274,8 @@ class ConversationStateService:
                 "followup_id": followup_id,
             },
             current,
+            # 定时复核属于站内通知，不应复用普通当轮确认的五分钟时限；保留三天供客户查看后确认。
+            ttl_minutes=3 * 24 * 60,
         )
         return self.save(session_no, state)
 
@@ -245,11 +293,157 @@ class ConversationStateService:
         return saved
 
     def safe_model_context(self, state: dict[str, Any]) -> dict[str, Any]:
-        """仅向模型暴露脱敏摘要，不暴露内部交互状态和实体完整标识。"""
+        """仅向模型暴露脱敏摘要和十五轮短期记忆，不暴露内部交互状态。"""
         return {
-            "recent_turns": list(state.get("recent_turns") or [])[-12:],
-            "summary": dict(state.get("summary") or {}),
+            "recent_turns": self._fit_model_turns(list(state.get("recent_turns") or [])[-RECENT_TURN_MESSAGE_LIMIT:]),
+            "summary": self._safe_summary_for_model(state.get("summary") or {}),
         }
+
+    def apply_rolling_summary(
+        self,
+        session_no: str,
+        *,
+        rolling_summary: str,
+        confirmed_facts: list[str],
+        summary_cursor: int,
+        source_version: int,
+    ) -> bool:
+        """合并异步摘要；旧任务不得覆盖更新版本或更靠后的摘要游标。"""
+        state = self.load(session_no)
+        summary = state.get("summary") or {}
+        if source_version > int(state.get("version") or 0):
+            return False
+        if summary_cursor < int(summary.get("summary_applied_cursor") or 0):
+            return False
+        summary["rolling_summary"] = self._safe_text(rolling_summary, limit=1600)
+        summary["confirmed_facts"] = [self._safe_text(item, limit=160) for item in confirmed_facts[:12]]
+        summary["summary_cursor"] = int(summary_cursor)
+        summary["summary_applied_cursor"] = int(summary_cursor)
+        summary["summary_version"] = int(summary.get("summary_version") or 0) + 1
+        state["summary"] = summary
+        self.save(session_no, state)
+        return True
+
+    @staticmethod
+    def _resolve_operation(normalized: str) -> str | None:
+        """把常见短回复归一为操作类型，避免把任务控制语义交给模型猜测。"""
+        if normalized in REPEAT_WORDS:
+            return "repeat"
+        if normalized in CONTINUE_WORDS:
+            return "continue"
+        if normalized in CANCEL_WORDS:
+            return "cancel"
+        if normalized in CONFIRM_WORDS:
+            return "confirm"
+        return None
+
+    def _restore_read_only_query(self, state: dict[str, Any], selected_order_no: str | None) -> TurnResolution | None:
+        """恢复上一轮只读查询；业务写操作永远不能通过短句被重复执行。"""
+        summary = state.get("summary") or {}
+        last_query = summary.get("last_query") or {}
+        if not last_query or not last_query.get("read_only"):
+            return None
+        query_type = str(last_query.get("query_type") or "")
+        candidate = selected_order_no or self._usable_order_from_state(state)
+        if query_type in {"order_status", "order_detail", "logistics"}:
+            if not candidate:
+                return TurnResolution(state=state, answer="请先选择要重新查询的订单，或提供订单号。")
+            message = (
+                f"查询订单 {candidate} 的最新物流状态"
+                if query_type == "logistics"
+                else f"查询订单 {candidate} 的当前订单状态"
+            )
+            return TurnResolution(state=state, resumed_message=message, order_no=candidate)
+        if query_type == "ticket_status":
+            ticket_no = str(last_query.get("ticket_no") or "").strip()
+            if ticket_no:
+                return TurnResolution(state=state, resumed_message=f"重新查询工单 {ticket_no} 的最新状态")
+        return None
+
+    @staticmethod
+    def _last_operation_was_write(state: dict[str, Any]) -> bool:
+        """判断上一轮是否为不可自动重放的业务写操作。"""
+        summary = state.get("summary") or {}
+        action = str(summary.get("last_tool_action") or "")
+        return action in {"create_ticket", "urge_ticket", "refund_request", "return_goods", "exchange_goods"} or bool(
+            summary.get("unfinished_goal")
+        )
+
+    def _usable_order_from_state(self, state: dict[str, Any]) -> str | None:
+        """只读取未过期且已确认的会话订单，摘要中的自然语言不能提升为执行实体。"""
+        order = ((state.get("entity_context") or {}).get("order") or {})
+        if not order.get("order_no") or not order.get("confirmed_at"):
+            return None
+        expires_at = self._parse_time(order.get("expires_at"))
+        if expires_at and datetime.now(SHANGHAI) > expires_at:
+            return None
+        return str(order.get("order_no"))
+
+    @staticmethod
+    def _update_last_query_summary(summary: dict[str, Any], result: dict[str, Any], selected_order_no: str | None) -> None:
+        """从真实工具结果记录可恢复查询，禁止根据回答文本猜测工具动作。"""
+        tool_results = list(result.get("tool_results") or [])
+        query_type_map = {
+            "order_detail": "order_status",
+            "customer_orders": "order_detail",
+            "order_logistics": "logistics",
+            "ticket_status": "ticket_status",
+            "ticket_list": "ticket_status",
+        }
+        query_result = next(
+            (item for item in reversed(tool_results) if str(item.get("query_type") or "") in query_type_map),
+            None,
+        )
+        if query_result:
+            raw_type = str(query_result.get("query_type") or "")
+            data = query_result.get("data") or {}
+            summary["last_query"] = {
+                "query_type": query_type_map[raw_type],
+                "order_no": selected_order_no or query_result.get("order_no") or (data.get("orderNo") if isinstance(data, dict) else None),
+                "ticket_no": query_result.get("ticket_no") or (data.get("ticketNo") if isinstance(data, dict) else None),
+                "read_only": True,
+            }
+            summary["last_tool_action"] = raw_type
+            summary["last_result_status"] = str(query_result.get("status") or "unknown")
+            return
+        ticket_result = result.get("ticket_result") or {}
+        if ticket_result:
+            summary["last_tool_action"] = "create_ticket"
+            summary["last_result_status"] = str(ticket_result.get("status") or "unknown")
+
+    @staticmethod
+    def _safe_summary_for_model(summary: dict[str, Any]) -> dict[str, Any]:
+        """白名单输出语义摘要，避免未来新增内部字段时意外进入模型。"""
+        allowed = {
+            "topics",
+            "active_topic",
+            "last_intent",
+            "last_user_goal",
+            "last_query",
+            "last_tool_action",
+            "last_result_status",
+            "unfinished_goal",
+            "unresolved_goal",
+            "confirmed_facts",
+            "rolling_summary",
+            "summary_version",
+        }
+        return {key: summary.get(key) for key in allowed if key in summary}
+
+    @staticmethod
+    def _fit_model_turns(turns: list[dict[str, Any]], total_limit: int = 9000) -> list[dict[str, Any]]:
+        """在十五轮范围内按总字符预算保留最新消息，防止异常长对话撑爆 Prompt。"""
+        selected: list[dict[str, Any]] = []
+        used = 0
+        for item in reversed(turns):
+            content = str(item.get("content") or "")[:600]
+            if not content:
+                continue
+            if selected and used + len(content) > total_limit:
+                break
+            selected.append({"role": item.get("role"), "content": content, "at": item.get("at")})
+            used += len(content)
+        return list(reversed(selected))
 
     def _confirm_pending(
         self,
@@ -305,7 +499,9 @@ class ConversationStateService:
         parent_goal: str,
         resume_payload: dict[str, Any],
         current: datetime,
+        ttl_minutes: int = 5,
     ) -> dict[str, Any]:
+        """创建待确认交互；普通对话短确认默认五分钟，异步通知可显式延长时效。"""
         return {
             "interaction_type": interaction_type,
             "candidate_entity": {"order_no": order_no} if order_no else {},
@@ -313,7 +509,7 @@ class ConversationStateService:
             "resume_payload": resume_payload,
             "expected_reply_types": ["confirm", "cancel", "select_order"],
             "created_at": current.isoformat(),
-            "expires_at": (current + timedelta(minutes=5)).isoformat(),
+            "expires_at": (current + timedelta(minutes=ttl_minutes)).isoformat(),
             "status": "WAITING",
         }
 

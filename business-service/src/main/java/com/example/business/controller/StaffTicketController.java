@@ -3,12 +3,10 @@ package com.example.business.controller;
 import com.example.business.dto.TicketAssignRequest;
 import com.example.business.dto.TicketCloseRequest;
 import com.example.business.dto.TicketStatusUpdateRequest;
-import com.example.business.dto.TicketTransferRequest;
 import com.example.business.dto.CurrentUser;
 import com.example.business.entity.SupportTicket;
 import com.example.business.entity.TicketStatus;
 import com.example.business.service.AuthService;
-import com.example.business.service.TicketAssignmentService;
 import com.example.business.service.TicketService;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -36,21 +34,18 @@ import java.util.stream.Collectors;
 @RequestMapping("/api/staff/tickets")
 public class StaffTicketController {
     private final TicketService ticketService;
-    private final TicketAssignmentService ticketAssignmentService;
     private final AuthService authService;
 
     public StaffTicketController(
             TicketService ticketService,
-            TicketAssignmentService ticketAssignmentService,
             AuthService authService
     ) {
         this.ticketService = ticketService;
-        this.ticketAssignmentService = ticketAssignmentService;
         this.authService = authService;
     }
 
     /**
-     * 查询坐席可处理的工单列表，默认返回全部工单，可通过 status 逗号分隔筛选。
+     * 查询当前坐席可领取或本人正在处理的工单，可通过 status 逗号分隔筛选。
      *
      * @param status 工单状态筛选，示例：PENDING_ASSIGN,PENDING_PROCESS
      * @param authorization Authorization 请求头
@@ -61,11 +56,8 @@ public class StaffTicketController {
             @RequestParam(value = "status", required = false) String status,
             @RequestHeader("Authorization") String authorization
     ) {
-        CurrentUser user = authService.requireStaffOrDispatcher(authorization);
+        CurrentUser user = authService.requireStaff(authorization);
         Set<String> statuses = parseStatuses(status);
-        if ("dispatcher".equals(user.role())) {
-            return ticketService.listByStatuses(statuses);
-        }
         return ticketService.listVisibleForStaff(user.userId(), statuses);
     }
 
@@ -81,14 +73,14 @@ public class StaffTicketController {
             @PathVariable("ticketNo") String ticketNo,
             @RequestHeader("Authorization") String authorization
     ) {
-        CurrentUser user = authService.requireStaffOrDispatcher(authorization);
+        CurrentUser user = authService.requireStaff(authorization);
         SupportTicket ticket = ticketService.detail(ticketNo);
         assertTicketVisibleToUser(ticket, user);
         return ticket;
     }
 
     /**
-     * 坐席领取或分派工单，状态会进入待处理。
+     * 坐席只能领取公共待分派工单，状态会进入待处理。
      *
      * @param ticketNo 工单编号
      * @param request 分派请求
@@ -101,35 +93,16 @@ public class StaffTicketController {
             @RequestBody TicketAssignRequest request,
             @RequestHeader("Authorization") String authorization
     ) {
-        CurrentUser user = authService.requireStaffOrDispatcher(authorization);
-        if ("staff".equals(user.role())) {
-            SupportTicket ticket = ticketService.detail(ticketNo);
-            if (ticket.handlerId() != null || !TicketStatus.PENDING_ASSIGN.name().equals(ticket.status())) {
-                throw new ResponseStatusException(HttpStatus.FORBIDDEN, "坐席只能领取未分配工单");
-            }
-            Long targetHandlerId = request.handlerId() == null ? user.userId() : request.handlerId();
-            if (!user.userId().equals(targetHandlerId)) {
-                throw new ResponseStatusException(HttpStatus.FORBIDDEN, "坐席不能把工单分派给其他人");
-            }
-            return ticketService.assign(ticketNo, user.userId(), request.assignedGroup());
+        CurrentUser user = authService.requireStaff(authorization);
+        SupportTicket ticket = ticketService.detail(ticketNo);
+        if (ticket.handlerId() != null || !TicketStatus.PENDING_ASSIGN.name().equals(ticket.status())) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "坐席只能领取未分配工单");
         }
-        return ticketService.assign(ticketNo, request.handlerId(), request.assignedGroup());
-    }
-
-    /**
-     * 坐席触发智能派单，由 Java 规则服务完成最终处理人选择和落库。
-     *
-     * @param ticketNo 工单编号
-     * @param authorization Authorization 请求头
-     * @return 自动派单后的工单
-     */
-    @PostMapping("/{ticketNo}/auto-assign")
-    public SupportTicket autoAssign(
-            @PathVariable("ticketNo") String ticketNo,
-            @RequestHeader("Authorization") String authorization
-    ) {
-        authService.requireDispatcher(authorization);
-        return ticketAssignmentService.autoAssign(ticketNo);
+        Long targetHandlerId = request.handlerId() == null ? user.userId() : request.handlerId();
+        if (!user.userId().equals(targetHandlerId)) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "坐席不能把工单分派给其他人");
+        }
+        return ticketService.assign(ticketNo, user.userId(), request.assignedGroup());
     }
 
     /**
@@ -149,24 +122,6 @@ public class StaffTicketController {
         CurrentUser user = authService.requireStaff(authorization);
         assertTicketOwnedByStaff(ticketService.detail(ticketNo), user);
         return ticketService.updateStatus(ticketNo, request.status());
-    }
-
-    /**
-     * 坐席转派工单给其他处理组或处理人。
-     *
-     * @param ticketNo 工单编号
-     * @param request 转派请求
-     * @param authorization Authorization 请求头
-     * @return 转派后的工单
-     */
-    @PostMapping("/{ticketNo}/transfer")
-    public SupportTicket transfer(
-            @PathVariable("ticketNo") String ticketNo,
-            @RequestBody TicketTransferRequest request,
-            @RequestHeader("Authorization") String authorization
-    ) {
-        authService.requireDispatcher(authorization);
-        return ticketService.transfer(ticketNo, request.assignedGroup(), request.handlerId());
     }
 
     /**
@@ -215,9 +170,6 @@ public class StaffTicketController {
     }
 
     private void assertTicketVisibleToUser(SupportTicket ticket, CurrentUser user) {
-        if ("dispatcher".equals(user.role())) {
-            return;
-        }
         if (user.userId().equals(ticket.handlerId())
                 || ticket.handlerId() == null
                 || TicketStatus.PENDING_ASSIGN.name().equals(ticket.status())) {

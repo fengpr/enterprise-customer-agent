@@ -94,6 +94,10 @@ export const customerApi = {
       route_target: routeTarget
     })
   },
+  /** 人工消息直接落库，不创建需要 SSE 轮询的 Agent 执行任务。 */
+  sendHandoffMessage(body: Record<string, unknown>) {
+    return agentHttp.post<AgentReply>('/agent/handoff/messages', body)
+  },
   replyResult(requestId: string) {
     return agentHttp.get<{ status: string; result?: AgentReply }>(`/agent/replies/${requestId}`)
   },

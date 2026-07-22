@@ -1,9 +1,8 @@
 import { agentHttp, businessHttp } from './http'
 import type {
   StaffHandoffDetail,
+  StaffHandoffHistoryPage,
   StaffHandoffSession,
-  StaffMemberAvailabilityRequest,
-  StaffMemberStatus,
   StaffReplyDraft,
   RagEvaluationReport,
   RagEvaluationJob,
@@ -37,36 +36,21 @@ export const staffTicketApi = {
   list(status: string) {
     return businessHttp.get<Ticket[]>('/staff/tickets', { params: { status } })
   },
-  assign(ticketNo: string, handlerId: number, assignedGroup: string) {
+  assign(ticketNo: string, assignedGroup: string) {
     return businessHttp.post<Ticket>(`/staff/tickets/${ticketNo}/assign`, {
-      handlerId,
       assignedGroup
     })
   },
-  autoAssign(ticketNo: string) {
-    return businessHttp.post<Ticket>(`/staff/tickets/${ticketNo}/auto-assign`)
-  },
-  start(ticketNo: string, operatorId: number) {
+  start(ticketNo: string) {
     return businessHttp.post<Ticket>(`/staff/tickets/${ticketNo}/status`, {
       status: 'PROCESSING',
-      operatorId,
       reason: '坐席开始处理'
     })
   },
-  close(ticketNo: string, operatorId: number, closeReason: string) {
+  close(ticketNo: string, closeReason: string) {
     return businessHttp.post<Ticket>(`/staff/tickets/${ticketNo}/close`, {
-      operatorId,
       closeReason
     })
-  }
-}
-
-export const staffMemberApi = {
-  list() {
-    return businessHttp.get<StaffMemberStatus[]>('/staff/members')
-  },
-  updateAvailability(userId: number, payload: StaffMemberAvailabilityRequest) {
-    return businessHttp.patch<StaffMemberStatus>(`/staff/members/${userId}/availability`, payload)
   }
 }
 
@@ -89,6 +73,11 @@ export const staffHandoffApi = {
   },
   detail(sessionId: string, afterMessageId = 0) {
     return agentHttp.get<StaffHandoffDetail>(`/staff/handoff/sessions/${sessionId}`, { params: { after_message_id: afterMessageId } })
+  },
+  history(sessionId: string, beforeMessageId: number, limit = 30) {
+    return agentHttp.get<StaffHandoffHistoryPage>(`/staff/handoff/sessions/${sessionId}/history`, {
+      params: { before_message_id: beforeMessageId, limit }
+    })
   },
   accept(sessionId: string) {
     return agentHttp.post<{ status: string; session: StaffHandoffSession }>(`/staff/handoff/sessions/${sessionId}/accept`)

@@ -258,6 +258,42 @@ textarea {
   overflow-y: auto;
 }
 
+/* 交接摘要与对话窗口分层展示，避免座席默认面对整段历史记录。 */
+.handoff-summary-card {
+  margin-top: 16px;
+  padding: 14px 16px;
+  border: 1px solid #dbeafe;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #f8fbff 0%, #eff6ff 100%);
+}
+
+.handoff-summary-header,
+.handoff-history-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.handoff-summary-card p {
+  margin: 8px 0 0;
+  color: #334155;
+  line-height: 1.65;
+  white-space: pre-wrap;
+}
+
+.handoff-history-toolbar {
+  min-height: 34px;
+  margin-top: 12px;
+  padding: 0 2px;
+  color: #64748b;
+  font-size: 13px;
+}
+
+.handoff-history-hint {
+  color: #94a3b8;
+}
+
 .handoff-message {
   max-width: 78%;
   padding: 10px 12px;
@@ -297,47 +333,6 @@ textarea {
   margin: 0;
 }
 
-.dispatcher-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1.2fr) minmax(360px, 0.8fr);
-  gap: 18px;
-}
-
-.staff-member-list {
-  display: grid;
-  gap: 12px;
-}
-
-.staff-member-item {
-  width: 100%;
-  display: grid;
-  gap: 10px;
-  padding: 12px;
-  border: 1px solid #dce3ed;
-  border-radius: 8px;
-  background: #fff;
-  color: inherit;
-  text-align: left;
-  cursor: pointer;
-}
-
-.staff-member-item.active {
-  border-color: #409eff;
-  background: #ecf5ff;
-}
-
-.staff-member-item > div:first-child {
-  display: flex;
-  justify-content: space-between;
-  gap: 10px;
-}
-
-.tag-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
 .section-gap {
   margin-top: 12px;
 }
@@ -368,8 +363,7 @@ textarea {
     border-bottom: 1px solid #dbe2ea;
   }
 
-  .staff-grid,
-  .dispatcher-grid {
+  .staff-grid {
     grid-template-columns: 1fr;
   }
 }
@@ -1039,8 +1033,16 @@ textarea {
   height: 100%;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  /* 聊天区使用紧凑但不拥挤的密度，把更多空间留给实际对话内容。 */
+  gap: 6px;
+  padding: 14px 16px;
   overflow: hidden;
+}
+
+/* 标题区不使用浏览器默认段落外边距，避免非业务留白挤占消息列表。 */
+.chat-header p {
+  margin: 4px 0 0;
+  font-size: 13px;
 }
 
 .online-dot {
@@ -1056,7 +1058,7 @@ textarea {
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
-  padding: 6px 10px;
+  padding: 5px 10px;
   border: 1px solid #dce9fb;
   border-radius: 10px;
   background: #f6faff;
@@ -1074,6 +1076,12 @@ textarea {
   width: fit-content;
 }
 
+.chat-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
 .human-status-card {
   display: grid;
   gap: 10px;
@@ -1081,6 +1089,14 @@ textarea {
   border: 1px solid #fed7aa;
   border-radius: 10px;
   background: #fffaf3;
+  transition: padding 0.2s ease, background-color 0.2s ease;
+}
+
+/* 收起后仅保留人工接入状态和必要操作，减少会话区域被浅黄色信息卡占用。 */
+.human-status-card.is-collapsed {
+  gap: 6px;
+  padding-block: 9px;
+  background: #fffdf8;
 }
 
 .human-status-main {
@@ -1094,6 +1110,28 @@ textarea {
 .human-status-main > div {
   display: grid;
   gap: 2px;
+}
+
+.human-status-title {
+  min-width: 0;
+}
+
+.human-status-actions {
+  display: flex !important;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.handoff-collapse-button {
+  margin-left: 2px;
+  color: #9a3412;
+}
+
+.handoff-collapse-button:hover {
+  color: #c2410c;
+  background: #ffedd5;
 }
 
 .human-status-main span,
@@ -1116,6 +1154,18 @@ textarea {
   overflow-wrap: break-word;
 }
 
+.handoff-collapsed-summary {
+  margin: 0;
+  color: #64748b;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.handoff-detail-content {
+  display: grid;
+  gap: 10px;
+}
+
 .handoff-summary-card {
   padding: 10px;
   border: 1px solid #fde68a;
@@ -1134,8 +1184,8 @@ textarea {
   flex: 1 1 auto;
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  padding: 14px 16px;
+  gap: 6px;
+  padding: 8px 12px;
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -1158,7 +1208,7 @@ textarea {
 
 .chat-message {
   display: flex;
-  gap: 10px;
+  gap: 8px;
   align-items: flex-start;
   max-width: min(86%, 820px);
 }
@@ -1167,21 +1217,52 @@ textarea {
   align-self: flex-end;
   flex-direction: row-reverse;
   justify-content: flex-start;
+  width: fit-content;
   max-width: min(72%, 620px);
   padding-right: 8px;
 }
 
 .chat-message.from-agent {
   align-self: flex-start;
+  width: min(86%, 900px);
 }
 
 .chat-message.from-staff {
   align-self: flex-start;
+  width: min(86%, 900px);
 }
 
 .chat-message.from-system {
   align-self: center;
   max-width: min(88%, 760px);
+}
+
+/* 人工会话的系统确认是状态提示，不应伪装成一条完整的聊天气泡。 */
+.handoff-system-notice {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: min(82%, 680px);
+  margin: 3px auto;
+  padding: 6px 11px;
+  border: 1px solid rgba(148, 163, 184, .22);
+  border-radius: 999px;
+  color: #64748b;
+  background: rgba(248, 250, 252, .9);
+  box-shadow: 0 2px 8px rgba(15, 23, 42, .035);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.handoff-system-notice .el-icon {
+  flex: 0 0 auto;
+  color: #3b82f6;
+  font-size: 14px;
+}
+
+.handoff-system-notice span {
+  overflow-wrap: anywhere;
 }
 
 .chat-time-divider {
@@ -1200,15 +1281,15 @@ textarea {
 }
 
 .bubble-avatar {
-  width: 38px;
-  height: 38px;
+  width: 32px;
+  height: 32px;
   flex: 0 0 auto;
   display: grid;
   place-items: center;
   border-radius: 50%;
   background: #eff6ff;
   color: #2563eb;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 700;
 }
 
@@ -1217,18 +1298,58 @@ textarea {
   max-width: calc(100% - 48px);
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 2px;
+  position: relative;
+}
+
+.from-user .message-stack {
+  width: fit-content;
+  max-width: min(520px, calc(100% - 40px));
+  align-items: flex-end;
+}
+
+/* 客服回复充分利用横向空间，内容能够一行容纳时不提前换行。 */
+.from-agent .message-stack,
+.from-staff .message-stack {
+  width: calc(100% - 40px);
+  max-width: calc(100% - 40px);
+}
+
+/* 操作按钮必须相对真实气泡宽度定位，不能相对占满整行的消息栈定位。 */
+.message-bubble-shell {
+  position: relative;
+  width: fit-content;
+  min-width: 0;
+  max-width: 100%;
+}
+
+/*
+ * 气泡右侧保留无视觉的悬停桥接区：按钮默认隐藏，鼠标从气泡移向按钮时
+ * 不会因短暂离开气泡而立刻消失。实际按钮位于该区域上方。
+ */
+.message-bubble-shell::after {
+  position: absolute;
+  z-index: 0;
+  right: -42px;
+  bottom: -6px;
+  width: 48px;
+  height: 42px;
+  content: '';
+}
+
+.from-user .message-bubble-shell {
+  align-self: flex-end;
 }
 
 .chat-bubble {
   width: fit-content;
   min-width: 48px;
   max-width: 100%;
-  padding: 13px 15px;
+  padding: 9px 12px;
   border: 1px solid #dce6f3;
   border-radius: 14px;
   background: #fff;
-  line-height: 1.65;
+  line-height: 1.55;
   box-shadow: 0 8px 18px rgba(15, 23, 42, 0.04);
   word-break: normal;
   overflow-wrap: break-word;
@@ -1236,29 +1357,63 @@ textarea {
 
 .from-user .chat-bubble {
   align-self: flex-end;
-  min-width: 48px;
+  min-width: 0;
   max-width: min(520px, 100%);
   color: #0f2a4a;
   background: #d8eaff;
   border-color: #bfdbfe;
 }
 
-/* 聊天气泡下方保留低干扰的复制入口，用户消息与客服消息分别贴齐各自气泡。 */
+/* 十个字以内的客户消息严格按内容宽度展示，既不拆字，也不保留无效尾部空白。 */
+.from-user .chat-bubble.is-short-customer {
+  width: max-content;
+  min-width: 0;
+  max-width: none;
+}
+
+.from-user .chat-bubble.is-short-customer p {
+  white-space: nowrap;
+  word-break: keep-all;
+  overflow-wrap: normal;
+}
+
+/* 默认隐藏操作入口；鼠标靠近气泡或键盘聚焦时才平滑显现。 */
 .message-bubble-actions {
-  align-self: flex-start;
+  position: absolute;
+  z-index: 1;
+  left: calc(100% + 4px);
+  bottom: 1px;
   display: flex;
   align-items: center;
-  gap: 2px;
-  margin-top: 1px;
+  gap: 4px;
+  margin: 0;
+  padding: 2px;
+  border: 1px solid #dbe7f8;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, .9);
+  box-shadow: 0 2px 8px rgba(15, 52, 96, .08);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(-4px) scale(.96);
+  transition: opacity .16s ease, transform .16s ease, box-shadow .16s ease, background-color .16s ease;
+}
+
+.message-bubble-shell:hover .message-bubble-actions,
+.message-bubble-shell:focus-within .message-bubble-actions {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(0) scale(1);
+  box-shadow: 0 4px 12px rgba(15, 52, 96, .13);
 }
 
 .message-copy-action,
 .message-regenerate-action {
-  width: 24px;
-  height: 24px;
+  /* 28px 点击热区比原先 20px 更适合鼠标与触控板操作。 */
+  width: 28px;
+  height: 28px;
   padding: 0;
   color: #718096;
-  font-size: 12px;
+  font-size: 14px;
 }
 
 .message-copy-action:hover,
@@ -1269,7 +1424,19 @@ textarea {
 }
 
 .from-user .message-bubble-actions {
-  align-self: flex-end;
+  right: calc(100% + 4px);
+  left: auto;
+  transform: translateX(4px) scale(.96);
+}
+
+.from-user .message-bubble-shell::after {
+  right: auto;
+  left: -42px;
+}
+
+.from-user .message-bubble-shell:hover .message-bubble-actions,
+.from-user .message-bubble-shell:focus-within .message-bubble-actions {
+  transform: translateX(0) scale(1);
 }
 
 .from-staff .chat-bubble {
@@ -1365,23 +1532,23 @@ textarea {
 
 .message-sender {
   display: block;
-  margin-bottom: 4px;
+  margin-bottom: 2px;
   color: #94a3b8;
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .quick-actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
-  padding-top: 6px;
+  gap: 5px;
+  padding-top: 5px;
   border-top: 1px solid #edf2f7;
   background: #fff;
 }
 
 .quick-actions .el-button {
-  height: 28px;
-  padding: 0 9px;
+  height: 26px;
+  padding: 0 8px;
 }
 
 .chat-input-box {
@@ -1400,6 +1567,17 @@ textarea {
   padding: 2px 0 4px;
   color: #64748b;
   font-size: 13px;
+}
+
+.route-target-row span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.route-target-row small {
+  color: #94a3b8;
+  font-size: 12px;
 }
 
 /* 售后快捷入口使用独立提示条表达订单语境，避免将“需要补充”等系统占位语写进客户输入框。 */
@@ -1423,6 +1601,7 @@ textarea {
 
 .chat-input-box .el-textarea__inner {
   min-height: 36px !important;
+  max-height: 72px;
   line-height: 1.5;
   border: 0;
   box-shadow: none;
@@ -1476,12 +1655,7 @@ textarea {
   margin-right: 4px;
 }
 
-.chat-input-box > p {
-  margin: 2px 0 0;
-  text-align: center;
-  color: #94a3b8;
-  font-size: 13px;
-}
+.chat-input-box > p { display: none; }
 
 .progress-panel {
   align-self: stretch;
@@ -1630,6 +1804,20 @@ textarea {
     display: block;
   }
 
+  .chat-header {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .chat-header-actions {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .route-target-row small {
+    display: none;
+  }
+
   .customer-sidebar {
     min-height: auto;
   }
@@ -1701,8 +1889,12 @@ textarea {
 /* 固定侧栏网格：历史会话始终在自己的剩余区域内滚动，不再推动顶部内容或遮盖联系按钮。 */
 .prototype-sidebar { display: grid; grid-template-rows: 88px auto auto minmax(0, 1fr) 80px; position: relative; box-sizing: border-box; height: 100vh; min-height: 0; padding: 0; overflow: hidden; }
 .prototype-sessions { min-height: 0; display: flex; flex-direction: column; margin-bottom: 0; }
-.prototype-session-list { min-height: 0; }
-.prototype-session-list.expanded { position: static; flex: 1; max-height: none; padding-bottom: 0; overflow-y: auto; background: transparent; }
+.prototype-sessions > :first-child { flex: 0 0 auto; }
+/* 会话区域只能在自身可用高度内滚动，始终为底部联系按钮预留网格行，避免最后一条会话被遮挡。 */
+.prototype-session-list { flex: 1 1 auto; min-height: 0; padding-bottom: 8px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; }
+.prototype-session-list.expanded { position: static; flex: 1; max-height: none; padding-bottom: 8px; overflow-x: hidden; overflow-y: auto; background: transparent; }
+.prototype-session-list::-webkit-scrollbar { width: 5px; }
+.prototype-session-list::-webkit-scrollbar-thumb { border-radius: 999px; background: #cbd8e8; }
 .prototype-contact { position: static; align-self: stretch; margin: 0 17px 32px; }
 @media (max-width: 900px) { .prototype-sidebar { display: flex; height: auto; min-height: auto; } }
 

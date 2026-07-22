@@ -4,7 +4,7 @@ import java.time.LocalDateTime;
 import java.util.Set;
 
 /**
- * 内部员工实体，统一承载坐席和调度等员工角色及派单相关配置。
+ * 内部员工实体，承载客服坐席账号及系统自动派单所需配置。
  */
 public record Employee(
         Long userId,

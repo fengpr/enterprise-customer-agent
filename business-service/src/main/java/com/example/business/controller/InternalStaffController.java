@@ -31,7 +31,7 @@ public class InternalStaffController {
     }
 
     /**
-     * 查询当前坐席可用性，供 Agent 判断转人工是立即等待接入还是进入排队。
+     * 查询当前坐席可用性，供 Agent 判断转人工是立即接入还是进入排队。
      *
      * @param secret Agent 内部共享密钥
      * @return 坐席状态摘要

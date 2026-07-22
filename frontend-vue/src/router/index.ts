@@ -7,15 +7,14 @@ import CustomerOrders from '@/views/customer/CustomerOrders.vue'
 import CustomerTickets from '@/views/customer/CustomerTickets.vue'
 import CustomerHelp from '@/views/customer/CustomerHelp.vue'
 import CustomerNotifications from '@/views/customer/CustomerNotifications.vue'
+import CustomerProfile from '@/views/customer/CustomerProfile.vue'
 import CustomerLogin from '@/views/customer/CustomerLogin.vue'
-import DispatcherHome from '@/views/dispatcher/DispatcherHome.vue'
-import DispatcherLogin from '@/views/dispatcher/DispatcherLogin.vue'
 import StaffHome from '@/views/staff/StaffHome.vue'
 import StaffLogin from '@/views/staff/StaffLogin.vue'
 import RagEvaluation from '@/views/staff/RagEvaluation.vue'
 import SystemMonitor from '@/views/staff/SystemMonitor.vue'
 
-type UserRole = 'customer' | 'staff' | 'dispatcher'
+type UserRole = 'customer' | 'staff'
 
 const router = createRouter({
   history: createWebHistory(),
@@ -27,14 +26,13 @@ const router = createRouter({
     { path: '/customer/tickets', component: CustomerTickets, meta: { role: 'customer' } },
     { path: '/customer/help', component: CustomerHelp, meta: { role: 'customer' } },
     { path: '/customer/notifications', component: CustomerNotifications, meta: { role: 'customer' } },
+    { path: '/customer/profile', component: CustomerProfile, meta: { role: 'customer' } },
     // 在线客服保留原有工作台，首页仅负责提供客户自助入口和信息概览。
     { path: '/customer/service', component: CustomerHome, meta: { role: 'customer' } },
     { path: '/staff/login', component: StaffLogin, meta: { guest: true } },
     { path: '/staff', component: StaffHome, meta: { role: 'staff' } },
     { path: '/staff/rag-evaluation', component: RagEvaluation, meta: { role: 'staff' } },
-    { path: '/staff/system-monitor', component: SystemMonitor, meta: { role: 'staff' } },
-    { path: '/dispatcher/login', component: DispatcherLogin, meta: { guest: true } },
-    { path: '/dispatcher', component: DispatcherHome, meta: { role: 'dispatcher' } }
+    { path: '/staff/system-monitor', component: SystemMonitor, meta: { role: 'staff' } }
   ]
 })
 
@@ -59,13 +57,11 @@ router.beforeEach((to) => {
 
 function loginPath(role: UserRole) {
   if (role === 'staff') return '/staff/login'
-  if (role === 'dispatcher') return '/dispatcher/login'
   return '/customer/login'
 }
 
 function homePath(role: UserRole) {
   if (role === 'staff') return '/staff'
-  if (role === 'dispatcher') return '/dispatcher'
   return '/customer'
 }
 

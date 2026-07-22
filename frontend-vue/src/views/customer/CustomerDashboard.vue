@@ -95,9 +95,21 @@ const activities = computed(() => recentTickets.value.slice(0, 3).map((ticket, i
 function handleEntry(key: string) {
   if (key === 'orders') { void router.push('/customer/orders'); return }
   if (key === 'tickets') { void router.push('/customer/tickets'); return }
-  if (key === 'service') { void router.push('/customer/service?new=1'); return }
+  if (key === 'service') { openPrimaryServiceSession(); return }
   if (key === 'help') { void router.push('/customer/service?message=我需要帮助，请给我常用操作指引'); return }
   ElMessage.info('该功能页面暂未开放')
+}
+
+/**
+ * 进入客服工作区时优先恢复置顶会话或排序后的首个会话。
+ * 只有用户明确点击“新建咨询”时才创建空白会话，避免普通导航产生无效会话。
+ */
+function openPrimaryServiceSession() {
+  const primarySession = sessions.value[0]
+  void router.push({
+    path: '/customer/service',
+    query: primarySession ? { sessionId: primarySession.session_id } : {}
+  })
 }
 function contactService() { void router.push('/customer/service?new=1') }
 function openSession(sessionId: string) { void router.push({ path: '/customer/service', query: { sessionId } }) }

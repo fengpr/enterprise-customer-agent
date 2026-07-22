@@ -1,56 +1,25 @@
 <script setup lang="ts">
-import { Lock, User } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
-import { reactive, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import ServiceLoginShell from '@/components/auth/ServiceLoginShell.vue'
 
-import { useAuthStore } from '@/stores/auth'
-
-const router = useRouter()
-const auth = useAuthStore()
-const loading = ref(false)
-const form = reactive({
-  username: 'staff',
-  password: '123456'
-})
-
-async function handleLogin() {
-  loading.value = true
-  try {
-    const user = await auth.login(form.username, form.password)
-    if (user.role !== 'staff') {
-      auth.logout()
-      ElMessage.error('该账号没有坐席权限')
-      return
-    }
-    await router.push('/staff')
-  } finally {
-    loading.value = false
-  }
-}
+/** 坐席登录页使用实际初始化的坐席账号，避免原型账号与 Java 演示数据不一致。 */
+const accounts = [
+  { username: 'staff', password: '123456', label: '演示坐席' },
+  { username: 'staff2', password: '123456', label: '售后坐席' }
+]
 </script>
 
 <template>
-  <main class="login-page">
-    <section class="login-panel">
-      <h1>客服坐席工作台</h1>
-      <p>Demo 坐席账号：staff / 123456</p>
-
-      <el-form label-position="top" @submit.prevent>
-        <el-form-item label="用户名">
-          <el-input v-model="form.username" :prefix-icon="User" autocomplete="username" />
-        </el-form-item>
-        <el-form-item label="密码">
-          <el-input
-            v-model="form.password"
-            :prefix-icon="Lock"
-            autocomplete="current-password"
-            show-password
-            type="password"
-          />
-        </el-form-item>
-        <el-button :loading="loading" type="primary" @click="handleLogin">登录</el-button>
-      </el-form>
-    </section>
-  </main>
+  <ServiceLoginShell
+    role="staff"
+    title="座席端登录"
+    workspace-name="智能座席工作台"
+    subtitle="7×24 小时智能协同，提升客服效率与服务质量"
+    capability-text="支持工单处理、会话接待、人工接管、知识辅助与服务监控"
+    :accounts="accounts"
+    :features="[
+      { title: '会话接待', description: '接收人工会话，实时响应客户咨询', icon: 'chat' },
+      { title: '工单处理', description: '处理与跟踪工单状态', icon: 'ticket' },
+      { title: '知识辅助', description: '检索业务知识并生成建议', icon: 'knowledge' }
+    ]"
+  />
 </template>

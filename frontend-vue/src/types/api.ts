@@ -2,7 +2,7 @@ export interface CurrentUser {
   user_id: number
   customer_id: number
   display_name: string
-  role: 'customer' | 'staff' | 'dispatcher' | string
+  role: 'customer' | 'staff' | string
 }
 
 export interface LoginResponse {
@@ -171,6 +171,8 @@ export interface StaffReplyDraft {
   ticket_no: string
   session_id: string
   draft_message: string
+  /** 草稿生成来源，仅供坐席判断是否需要重点润色。 */
+  generation_mode?: 'llm' | 'fallback'
 }
 
 export interface RagCitationValidation {
@@ -280,12 +282,28 @@ export interface StaffHandoffDetail {
   session: StaffHandoffSession
   messages: ChatMessage[]
   latest_message_id: number
+  handoff_summary?: {
+    title: string
+    intent?: string | null
+    priority?: string | null
+    handoff_reason?: string | null
+    ai_summary: string
+    linked_ticket_no?: string | null
+  }
+  history_available?: boolean
+  history_access_allowed?: boolean
+}
+
+export interface StaffHandoffHistoryPage {
+  messages: ChatMessage[]
+  history_available: boolean
+  next_before_message_id?: number | null
 }
 
 export interface StaffMemberStatus {
   userId: number
   displayName: string
-  role: 'staff' | 'dispatcher' | string
+  role: 'staff' | string
   groupName: string
   skills: string[]
   online: boolean
@@ -294,12 +312,6 @@ export interface StaffMemberStatus {
   activeTickets: number
   currentWork: string[]
   recentFeedback: string[]
-}
-
-export interface StaffMemberAvailabilityRequest {
-  online: boolean
-  acceptingTickets: boolean
-  maxActiveTickets: number
 }
 
 export interface CustomerNotification {

@@ -31,7 +31,7 @@ for (const client of [agentHttp, businessHttp]) {
       if (error.response?.status === 401 && !requestUrl.includes('/auth/login')) {
         const auth = useAuthStore()
         const role = auth.user?.role
-        const loginPath = role === 'staff' ? '/staff/login' : role === 'dispatcher' ? '/dispatcher/login' : '/customer/login'
+        const loginPath = role === 'staff' ? '/staff/login' : '/customer/login'
 
         // 登录态失效时清理本地缓存，避免页面继续用旧 token 批量请求受保护接口。
         auth.logout()

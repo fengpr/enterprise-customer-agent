@@ -52,11 +52,52 @@ def test_expired_confirmation_cannot_resume_old_goal() -> None:
         assert "已失效" in (result.answer or "")
 
 
-def test_recent_turns_are_limited_to_six_rounds() -> None:
-    """原始上下文只保留最近六轮，更早信息进入确定性摘要。"""
+def test_delivery_recheck_confirmation_is_valid_for_three_days() -> None:
+    """异步物流复核通知允许客户隔天确认，不能误用普通五分钟确认时效。"""
     with TemporaryDirectory() as tmp:
         service = _service(tmp)
-        for index in range(8):
+        now = datetime(2026, 7, 20, 20, 0, tzinfo=SHANGHAI)
+        service.await_delivery_receipt_confirmation(
+            session_no="S-delivery", order_no="EC100", followup_id="F100", now=now
+        )
+
+        result = service.resolve_turn(
+            session_no="S-delivery",
+            message="确认",
+            selected_order_no="EC100",
+            now=now + timedelta(days=2),
+        )
+
+        assert result.answer is None
+        assert result.order_no == "EC100"
+        assert "仍未收到订单 EC100" in (result.resumed_message or "")
+
+
+def test_expired_delivery_recheck_confirmation_gives_specific_recovery_guidance() -> None:
+    """复核通知超过三天后不恢复旧动作，但要指导客户重新核验而非泛化报错。"""
+    with TemporaryDirectory() as tmp:
+        service = _service(tmp)
+        now = datetime(2026, 7, 20, 20, 0, tzinfo=SHANGHAI)
+        service.await_delivery_receipt_confirmation(
+            session_no="S-delivery-expired", order_no="EC100", followup_id="F100", now=now
+        )
+
+        result = service.resolve_turn(
+            session_no="S-delivery-expired",
+            message="确认",
+            selected_order_no="EC100",
+            now=now + timedelta(days=3, minutes=1),
+        )
+
+        assert result.action is None
+        assert "重新查询该订单物流" in (result.answer or "")
+
+
+def test_recent_turns_are_limited_to_fifteen_rounds() -> None:
+    """原始上下文保留最近十五轮，超出窗口的信息进入异步摘要游标。"""
+    with TemporaryDirectory() as tmp:
+        service = _service(tmp)
+        for index in range(16):
             service.record_result(
                 session_no="S3",
                 user_message=f"问题{index}",
@@ -67,9 +108,69 @@ def test_recent_turns_are_limited_to_six_rounds() -> None:
             )
 
         state = service.load("S3")
-        assert len(state["recent_turns"]) == 12
-        assert state["recent_turns"][0]["content"] == "问题2"
+        assert len(state["recent_turns"]) == 30
+        assert state["recent_turns"][0]["content"] == "问题1"
         assert state["summary"]["topics"] == ["consult"]
+        assert state["summary"]["summary_cursor"] == 2
+
+
+def test_repeat_restores_last_read_only_order_query() -> None:
+    """“重新查询”应恢复上一轮订单状态查询，而不是作为新的模糊问题交给模型。"""
+    with TemporaryDirectory() as tmp:
+        service = _service(tmp)
+        service.record_result(
+            session_no="S-repeat",
+            user_message="查询当前订单状态",
+            answer="订单已发货",
+            selected_order_no="EC202607160010",
+            pending_action=None,
+            result={
+                "analysis": {"intent": "consult", "user_goal": "status_query"},
+                "tool_results": [
+                    {
+                        "query_type": "order_detail",
+                        "status": "success",
+                        "order_no": "EC202607160010",
+                        "data": {"orderNo": "EC202607160010"},
+                    }
+                ],
+            },
+        )
+
+        result = service.resolve_turn(
+            session_no="S-repeat",
+            message="重新查询",
+            selected_order_no="EC202607160010",
+        )
+
+        assert result.order_no == "EC202607160010"
+        assert result.resumed_message == "查询订单 EC202607160010 的当前订单状态"
+
+
+def test_repeat_never_replays_write_operation() -> None:
+    """创建工单等写操作不能因为“重新查询”被重复执行。"""
+    with TemporaryDirectory() as tmp:
+        service = _service(tmp)
+        service.record_result(
+            session_no="S-write",
+            user_message="提交退货申请",
+            answer="已提交售后工单",
+            selected_order_no="EC202607160010",
+            pending_action=None,
+            result={
+                "analysis": {"intent": "refund", "user_goal": "action_request"},
+                "ticket_result": {"status": "success", "data": {"ticketNo": "T100"}},
+            },
+        )
+
+        result = service.resolve_turn(
+            session_no="S-write",
+            message="重新查询",
+            selected_order_no="EC202607160010",
+        )
+
+        assert result.resumed_message is None
+        assert "不能直接重复执行" in (result.answer or "")
 
 
 def test_legacy_confirmation_text_rebuilds_pending_interaction() -> None:

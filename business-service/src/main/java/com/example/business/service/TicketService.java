@@ -117,7 +117,7 @@ public class TicketService {
     }
 
     /**
-     * 查询坐席当前活跃工单，供调度台展示坐席工作内容。
+     * 查询坐席当前活跃工单，供系统自动派单计算实时负载。
      *
      * @param handlerId 坐席 ID
      * @return 坐席当前未完成工单

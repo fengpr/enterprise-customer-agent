@@ -1,4 +1,4 @@
-"""验证 Agent 建单后的派单策略，防止高风险工单绕过调度队列。"""
+"""验证 Agent 建单后的派单策略，防止高风险工单绕过公共待领取队列。"""
 
 import os
 import sys
@@ -40,7 +40,7 @@ def _analysis(**overrides):
 
 
 class AutoAssignPolicyTest(unittest.TestCase):
-    """覆盖配置开关、低风险放行和高风险强制调度员确认。"""
+    """覆盖配置开关、低风险放行和高风险强制人工领取。"""
 
     def test_unconfigured_auto_assign_is_disabled(self):
         """未配置开关时，Agent 默认不自动派单。"""

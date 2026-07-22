@@ -92,34 +92,6 @@ public class AuthService {
         return user;
     }
 
-    /**
-     * 校验当前用户是否为调度角色。
-     *
-     * @param authorization Authorization 请求头
-     * @return 当前调度用户
-     */
-    public CurrentUser requireDispatcher(String authorization) {
-        CurrentUser user = currentUser(authorization);
-        if (!"dispatcher".equals(user.role())) {
-            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "仅调度角色可操作");
-        }
-        return user;
-    }
-
-    /**
-     * 校验当前用户是否为坐席或调度。
-     *
-     * @param authorization Authorization 请求头
-     * @return 当前内部用户
-     */
-    public CurrentUser requireStaffOrDispatcher(String authorization) {
-        CurrentUser user = currentUser(authorization);
-        if (!"staff".equals(user.role()) && !"dispatcher".equals(user.role())) {
-            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "仅内部客服角色可访问");
-        }
-        return user;
-    }
-
     private CurrentUser loginEmployee(String username, String password) {
         Employee employee = employeeService.findEnabledByCredentials(username, password)
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.UNAUTHORIZED, "用户名或密码错误"));

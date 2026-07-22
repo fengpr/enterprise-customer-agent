@@ -92,10 +92,11 @@ function ticketStatus(status?: string) {
 }
 /** 普通客服入口复用最近会话；只有明确点击“新建咨询”时才允许创建会话。 */
 function openService(message?: string, createNew = false) {
-  const latestSession = [...sessions.value].sort((left, right) => right.updated_at.localeCompare(left.updated_at))[0]
+  // 会话仓库已经按“置顶优先、最近更新优先”排序，普通入口直接复用首个会话。
+  const primarySession = sessions.value[0]
   const query: Record<string, string> = message ? { message } : {}
   if (createNew) query.new = '1'
-  else if (latestSession) query.sessionId = latestSession.session_id
+  else if (primarySession) query.sessionId = primarySession.session_id
   void router.push({ path: '/customer/service', query })
 }
 function openSession(sessionId: string) { void router.push({ path: '/customer/service', query: { sessionId } }) }

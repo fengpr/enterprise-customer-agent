@@ -1,56 +1,25 @@
 <script setup lang="ts">
-import { Lock, User } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
-import { reactive, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import ServiceLoginShell from '@/components/auth/ServiceLoginShell.vue'
 
-import { useAuthStore } from '@/stores/auth'
-
-const router = useRouter()
-const auth = useAuthStore()
-const loading = ref(false)
-const form = reactive({
-  username: 'demo',
-  password: '123456'
-})
-
-async function handleLogin() {
-  loading.value = true
-  try {
-    const user = await auth.login(form.username, form.password)
-    if (user.role !== 'customer') {
-      auth.logout()
-      ElMessage.error('该账号不是客户账号')
-      return
-    }
-    await router.push('/customer')
-  } finally {
-    loading.value = false
-  }
-}
+/** 客户登录页只配置客户角色和客户自助服务文案，通用登录交互由共享外壳统一实现。 */
+const accounts = [
+  { username: 'demo', password: '123456', label: '演示客户' },
+  { username: 'buyer', password: '123456', label: '测试买家' }
+]
 </script>
 
 <template>
-  <main class="login-page">
-    <section class="login-panel">
-      <h1>客户自助服务</h1>
-      <p>Demo 账号：demo / 123456，buyer / 123456</p>
-
-      <el-form label-position="top" @submit.prevent>
-        <el-form-item label="用户名">
-          <el-input v-model="form.username" :prefix-icon="User" autocomplete="username" />
-        </el-form-item>
-        <el-form-item label="密码">
-          <el-input
-            v-model="form.password"
-            :prefix-icon="Lock"
-            autocomplete="current-password"
-            show-password
-            type="password"
-          />
-        </el-form-item>
-        <el-button :loading="loading" type="primary" @click="handleLogin">登录</el-button>
-      </el-form>
-    </section>
-  </main>
+  <ServiceLoginShell
+    role="customer"
+    title="客户自助服务"
+    workspace-name="一站式客户自助服务平台"
+    subtitle="7×24 小时智能服务，提升客户自助效率与体验"
+    capability-text="支持订单查询、工单跟踪、在线咨询与帮助中心"
+    :accounts="accounts"
+    :features="[
+      { title: '智能咨询', description: 'AI 智能客服 7×24 小时解答问题', icon: 'chat' },
+      { title: '工单闭环', description: '工单全流程跟踪，高效解决问题', icon: 'ticket' },
+      { title: '自助服务', description: '订单、物流、售后随时可查', icon: 'service' }
+    ]"
+  />
 </template>

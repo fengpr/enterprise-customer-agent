@@ -4,7 +4,7 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * 坐席资源状态响应，供调度台查看坐席技能、负载、当前工作内容和客户反馈摘要。
+ * 坐席资源状态响应，仅供系统内部判断人工接管和自动派单可用性。
  */
 public record StaffMemberStatus(
         Long userId,

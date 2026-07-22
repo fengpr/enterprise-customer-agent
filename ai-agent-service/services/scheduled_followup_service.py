@@ -243,7 +243,7 @@ class ScheduledFollowupProcessor:
         status = str(data.get("statusLabel") or data.get("status") or data.get("logisticsStatus") or "状态已更新")
         message = (
             f"您设置的订单 {order_no} 物流复核已完成，当前物流状态为“{status}”。"
-            "如果您仍未收到，请回复“确认”，我会继续为您处理物流异常或售后；系统不会自动创建退货工单。"
+            "如果您仍未收到，请在 3 天内回复“确认”，我会继续为您处理物流异常或售后；系统不会自动创建退货工单。"
         )
         self.messages.save(
             session_no=str(task["session_no"]),
