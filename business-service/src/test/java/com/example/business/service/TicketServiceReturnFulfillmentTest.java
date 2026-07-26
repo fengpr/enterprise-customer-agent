@@ -124,6 +124,109 @@ class TicketServiceReturnFulfillmentTest {
         );
     }
 
+    /**
+     * 已关闭工单的取件改约必须创建独立变更申请，不能覆盖原取件时间或重新打开工单。
+     */
+    @Test
+    void shouldCreateAuditableChangeRequestForClosedTicketPickupChange() {
+        SQLiteDataSource dataSource = new SQLiteDataSource();
+        dataSource.setUrl("jdbc:sqlite:" + tempDir.resolve("ticket-change-request-closed.db"));
+        JdbcTemplate jdbcTemplate = new JdbcTemplate(dataSource);
+        TicketService service = new TicketService(jdbcTemplate, "org.sqlite.JDBC");
+        SupportTicket created = service.createForCustomer(returnTicketRequest(), 1L);
+        service.assign(created.ticketNo(), 101L, "售后组");
+        service.close(created.ticketNo());
+
+        TicketSupplementResult result = service.appendSupplementForCustomer(
+                created.ticketNo(),
+                1L,
+                new TicketSupplementRequest(null, null, "pickup", "明天下午三点"),
+                "closed-pickup-change-1"
+        );
+        TicketSupplementResult repeated = service.appendSupplementForCustomer(
+                created.ticketNo(),
+                1L,
+                new TicketSupplementRequest(null, null, "pickup", "明天下午三点"),
+                "closed-pickup-change-1"
+        );
+
+        assertEquals("REVIEW_REQUIRED", result.updateMode());
+        assertEquals(false, result.fulfillmentUpdated());
+        assertEquals("CLOSED", result.ticket().status());
+        assertEquals("明天上午九点", result.ticket().pickupTimeWindow());
+        assertNotNull(result.changeRequest());
+        assertEquals("PENDING_REVIEW", result.changeRequest().status());
+        assertEquals("明天下午三点", result.changeRequest().requestedPickupTimeWindow());
+        assertTrue(repeated.deduplicated());
+        assertEquals(result.changeRequest().requestNo(), repeated.changeRequest().requestNo());
+        assertEquals(1, jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM ticket_change_request WHERE parent_ticket_no = ?",
+                Integer.class,
+                created.ticketNo()
+        ));
+    }
+
+    /** 审核同意后才恢复已关闭工单并写入新取件偏好，客户补充本身不能直接改写原单。 */
+    @Test
+    void shouldApproveChangeRequestAndReopenClosedTicket() {
+        SQLiteDataSource dataSource = new SQLiteDataSource();
+        dataSource.setUrl("jdbc:sqlite:" + tempDir.resolve("ticket-change-request-approve.db"));
+        TicketService service = new TicketService(new JdbcTemplate(dataSource), "org.sqlite.JDBC");
+        SupportTicket created = service.createForCustomer(returnTicketRequest(), 1L);
+        service.assign(created.ticketNo(), 101L, "售后组");
+        service.close(created.ticketNo());
+        TicketSupplementResult submitted = service.appendSupplementForCustomer(
+                created.ticketNo(),
+                1L,
+                new TicketSupplementRequest(null, null, "pickup", "后天上午十点"),
+                "closed-pickup-change-approve-1"
+        );
+
+        var approved = service.decideChangeRequest(
+                created.ticketNo(),
+                submitted.changeRequest().requestNo(),
+                101L,
+                "APPROVE",
+                "已为您登记新的上门取件时间偏好，后续请以承运方确认结果为准。"
+        );
+        SupportTicket updated = service.detail(created.ticketNo());
+
+        assertEquals("APPROVED", approved.status());
+        assertEquals(101L, approved.reviewedBy());
+        assertEquals("后天上午十点", updated.pickupTimeWindow());
+        assertEquals("REOPENED", updated.status());
+    }
+
+    /** 拒绝申请不能暗中改变原工单的取件时间或状态。 */
+    @Test
+    void shouldRejectChangeRequestWithoutMutatingParentTicket() {
+        SQLiteDataSource dataSource = new SQLiteDataSource();
+        dataSource.setUrl("jdbc:sqlite:" + tempDir.resolve("ticket-change-request-reject.db"));
+        TicketService service = new TicketService(new JdbcTemplate(dataSource), "org.sqlite.JDBC");
+        SupportTicket created = service.createForCustomer(returnTicketRequest(), 1L);
+        service.assign(created.ticketNo(), 101L, "售后组");
+        service.close(created.ticketNo());
+        TicketSupplementResult submitted = service.appendSupplementForCustomer(
+                created.ticketNo(),
+                1L,
+                new TicketSupplementRequest(null, null, "pickup", "十分钟后"),
+                "closed-pickup-change-reject-1"
+        );
+
+        var rejected = service.decideChangeRequest(
+                created.ticketNo(),
+                submitted.changeRequest().requestNo(),
+                101L,
+                "REJECT",
+                "当前安排暂无法调整，如仍需协助请联系人工客服。"
+        );
+        SupportTicket unchanged = service.detail(created.ticketNo());
+
+        assertEquals("REJECTED", rejected.status());
+        assertEquals("CLOSED", unchanged.status());
+        assertEquals("明天上午九点", unchanged.pickupTimeWindow());
+    }
+
     private static SupportTicket returnTicketRequest() {
         return new SupportTicket(
                 null,

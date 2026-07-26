@@ -4,14 +4,34 @@
 和当前会话的客户可见消息提供；模型只负责组织语气、同理表达与清晰的下一步说明。
 """
 
+import logging
 import os
 import re
-from typing import Any, Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
+from dotenv import load_dotenv
 from langchain_core.prompts import ChatPromptTemplate
 
 from services.llm_model_factory import ChatModelConfig, build_chat_model
 from services.resilient_client import ResilientClient, ResilientInvoker
+
+
+# 座席草稿服务既可能由 FastAPI 加载，也可能被单独测试或脚本调用；显式读取服务目录的配置，
+# 避免因启动目录不同导致明明配置了模型却被误判为“未配置”。
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class StaffReplyDraftResult:
+    """座席草稿生成结果，向调用方说明是否真实使用模型以及安全降级原因。"""
+
+    draft_message: str
+    generation_mode: str
+    fallback_reason: str | None = None
 
 
 class StaffReplyDraftService:
@@ -30,23 +50,52 @@ class StaffReplyDraftService:
             ResilientClient(
                 downstream="staff_reply_draft_llm",
                 # 草稿是辅助能力，超过短时限直接回退，不能让坐席界面因重试长时间无反馈。
-                total_timeout=float(os.getenv("STAFF_REPLY_DRAFT_LLM_TOTAL_TIMEOUT", "5")),
-                max_retries=int(os.getenv("STAFF_REPLY_DRAFT_LLM_MAX_RETRIES", "0")),
+                # 草稿允许一次受控重试，覆盖模型供应商的短暂网络波动；它不影响在线客户 Agent 舱壁。
+                total_timeout=float(os.getenv("STAFF_REPLY_DRAFT_LLM_TOTAL_TIMEOUT", "8")),
+                max_retries=int(os.getenv("STAFF_REPLY_DRAFT_LLM_MAX_RETRIES", "1")),
             )
         )
 
     def generate(self, *, ticket: dict[str, Any], processing_result: str, messages: list[dict[str, Any]]) -> tuple[str, str]:
-        """生成草稿并返回内容与来源；模型失败只回退话术，不阻塞坐席工作台。"""
+        """兼容旧调用方的草稿入口，只返回正文与生成来源。"""
+        result = self.generate_with_metadata(
+            ticket=ticket,
+            processing_result=processing_result,
+            messages=messages,
+        )
+        return result.draft_message, result.generation_mode
+
+    def generate_with_metadata(
+        self,
+        *,
+        ticket: dict[str, Any],
+        processing_result: str,
+        messages: list[dict[str, Any]],
+    ) -> StaffReplyDraftResult:
+        """生成草稿并保留安全的降级原因，避免模板回退被误认为模型已经生成。"""
         facts = self.build_safe_facts(ticket=ticket, processing_result=processing_result, messages=messages)
-        if self.model is not None:
-            try:
-                draft = self._generate_with_llm(facts)
-                if self._is_safe_draft(draft):
-                    return draft, "llm"
-            except Exception:
-                # 草稿失败不应影响人工处理；后续由确定性模板保留真实处理结果。
-                pass
-        return self._fallback_draft(facts), "fallback"
+        if self.model is None:
+            return StaffReplyDraftResult(self._fallback_draft(facts), "fallback", "not_configured")
+        try:
+            draft = self._generate_with_llm(facts)
+            if self._is_safe_draft(draft):
+                return StaffReplyDraftResult(draft, "llm")
+            # 模型输出越过客服承诺边界时宁可回退；不记录原文，避免日志保留客户可见内容。
+            logger.warning("座席草稿模型输出未通过安全校验，已使用安全草稿")
+            return StaffReplyDraftResult(self._fallback_draft(facts), "fallback", "unsafe_output")
+        except Exception as exc:
+            reason = self._safe_error_reason(exc)
+            # 仅记录标准错误类别，不能把模型响应、凭证或 Prompt 写进日志。
+            logger.warning("座席草稿模型调用失败，已使用安全草稿：%s", reason)
+            return StaffReplyDraftResult(self._fallback_draft(facts), "fallback", reason)
+
+    @staticmethod
+    def _safe_error_reason(exc: Exception) -> str:
+        """把下游异常归并为可展示给座席的安全原因，不泄露供应商细节。"""
+        error_type = getattr(exc, "error_type", None)
+        if error_type in {"timeout", "rate_limit_429", "circuit_open", "network_error", "5xx"}:
+            return str(error_type)
+        return "generation_error"
 
     def build_safe_facts(self, *, ticket: dict[str, Any], processing_result: str, messages: list[dict[str, Any]]) -> dict[str, Any]:
         """构造可提供给模型的最小事实集，避免客户身份、地址和内部字段进入 Prompt。"""
@@ -130,7 +179,8 @@ class StaffReplyDraftService:
                 model_name=model_name,
                 api_key=api_key,
                 base_url=base_url,
-                timeout=float(os.getenv("STAFF_REPLY_DRAFT_LLM_TOTAL_TIMEOUT", "5")),
+                timeout=float(os.getenv("STAFF_REPLY_DRAFT_LLM_TOTAL_TIMEOUT", "8")),
+                # SDK 自身不重试，统一由 ResilientClient 处理重试、熔断与舱壁。
                 max_retries=0,
             ),
             temperature=float(os.getenv("STAFF_REPLY_DRAFT_LLM_TEMPERATURE", "0.35")),

@@ -3,9 +3,11 @@ package com.example.business.controller;
 import com.example.business.dto.TicketAssignRequest;
 import com.example.business.dto.TicketCloseRequest;
 import com.example.business.dto.TicketStatusUpdateRequest;
+import com.example.business.dto.TicketChangeDecisionRequest;
 import com.example.business.dto.CurrentUser;
 import com.example.business.entity.SupportTicket;
 import com.example.business.entity.TicketStatus;
+import com.example.business.entity.TicketChangeRequest;
 import com.example.business.service.AuthService;
 import com.example.business.service.TicketService;
 import org.springframework.http.HttpStatus;
@@ -141,6 +143,42 @@ public class StaffTicketController {
         CurrentUser user = authService.requireStaff(authorization);
         assertTicketOwnedByStaff(ticketService.detail(ticketNo), user);
         return ticketService.close(ticketNo);
+    }
+
+    /** 查询本人负责工单下待审核或历史履约变更申请。 */
+    @GetMapping("/{ticketNo}/change-requests")
+    public List<TicketChangeRequest> changeRequests(
+            @PathVariable("ticketNo") String ticketNo,
+            @RequestHeader("Authorization") String authorization
+    ) {
+        CurrentUser user = authService.requireStaff(authorization);
+        assertTicketOwnedByStaff(ticketService.detail(ticketNo), user);
+        return ticketService.listChangeRequests(ticketNo);
+    }
+
+    /**
+     * 座席审核履约变更申请。
+     * <p>审核同意才会恢复原工单并应用新的取件偏好，不能由页面直接修改原工单字段。</p>
+     */
+    @PostMapping("/{ticketNo}/change-requests/{requestNo}/decision")
+    public TicketChangeRequest decideChangeRequest(
+            @PathVariable("ticketNo") String ticketNo,
+            @PathVariable("requestNo") String requestNo,
+            @RequestBody TicketChangeDecisionRequest request,
+            @RequestHeader("Authorization") String authorization
+    ) {
+        CurrentUser user = authService.requireStaff(authorization);
+        assertTicketOwnedByStaff(ticketService.detail(ticketNo), user);
+        if (request == null || request.decision() == null || request.decision().isBlank()) {
+            throw new IllegalArgumentException("请选择履约变更审核结果");
+        }
+        return ticketService.decideChangeRequest(
+                ticketNo,
+                requestNo,
+                user.userId(),
+                request.decision(),
+                request.customerMessage()
+        );
     }
 
     /**

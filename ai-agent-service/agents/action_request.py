@@ -754,6 +754,17 @@ def enrich_action_analysis(
 
     missing_slots = compute_missing_slots(action_type, slots)
     next_action = "collect_slots" if missing_slots else rule["default_next_action"]
+    # 用户只补充上门取件方式或时间、没有重新表达退货原因时，语义是修改既有售后履约信息，
+    # 不能误当成一笔缺少原因的新退货申请；后续仍需通过 Java 核验可关联工单。
+    fulfillment_change_only = (
+        action_type == "return_goods"
+        and not pending
+        and bool({"return_method", "pickup_time_window"}.intersection(slots))
+        and not slots.get("after_sale_reason")
+    )
+    if fulfillment_change_only:
+        missing_slots = []
+        next_action = "update_existing_ticket"
     normalized.intent = rule["intent"]
     normalized.user_goal = "action_request"
     normalized.action_type = action_type
@@ -783,6 +794,11 @@ def enrich_action_analysis(
     if next_action == "create_ticket":
         pending_payload["status"] = "ready"
         pending_payload["flow_state"] = "READY"
+    elif next_action == "update_existing_ticket":
+        # 该状态仅允许关联已有工单写入受审计的变更申请，禁止走新建退货工单分支。
+        pending_payload["status"] = "ready"
+        pending_payload["flow_state"] = "READY"
+        pending_payload["fulfillment_change_only"] = True
     return normalized, pending_payload
 
 
@@ -1009,8 +1025,8 @@ def _continue_pending_action(
     normalized.next_action = next_action
     normalized.order_related = bool(slots.get("order_no"))
     normalized.need_order_query = bool(slots.get("order_no")) and bool((rule or {}).get("need_order_validation"))
-    normalized.need_human = next_action == "create_ticket"
-    normalized.need_ticket = next_action == "create_ticket"
+    normalized.need_human = next_action in {"create_ticket", "update_existing_ticket"}
+    normalized.need_ticket = next_action in {"create_ticket", "update_existing_ticket"}
     normalized.risk_reasons = [item for item in normalized.risk_reasons if item != "complaint"]
     order_no = slots.get("order_no")
     if order_no and str(order_no) not in normalized.order_no:
@@ -1349,6 +1365,18 @@ def _extract_pickup_time_window(message: str) -> str | None:
     ]
     if not _contains_any(text, time_terms):
         return None
+    # 优先抽取最小时间短语，避免“把上门取件改成明天下午三点”被完整保存为取件时间。
+    precise_time = re.search(
+        r"(?:(?:今天|明天|后天|周[一二三四五六日天]|星期[一二三四五六日天])"
+        r"(?:上午|中午|下午|晚上)?[0-9零一二三四五六七八九十两]{1,3}点(?:[0-9零一二三四五六七八九十两]{1,3}分|半)?"
+        r"|(?:今天|明天|后天|周[一二三四五六日天]|星期[一二三四五六日天])(?:上午|中午|下午|晚上)"
+        r"|(?:今天|明天|后天|周[一二三四五六日天]|星期[一二三四五六日天])"
+        r"|(?:上午|中午|下午|晚上)[0-9零一二三四五六七八九十两]{1,3}点(?:[0-9零一二三四五六七八九十两]{1,3}分|半)?"
+        r"|[0-9零一二三四五六七八九十两]{1,3}点(?:[0-9零一二三四五六七八九十两]{1,3}分|半)?)",
+        text,
+    )
+    if precise_time:
+        return precise_time.group(0)
     # 优先定位包含时间的最小分句，避免把退货动作和原因一并保存到 pickup_time_window。
     clauses = [item.strip() for item in re.split(r"[，,。；;！？!?]", text) if item.strip()]
     time_clause = next((item for item in clauses if _contains_any(item, time_terms)), text)

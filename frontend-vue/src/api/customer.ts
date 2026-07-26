@@ -1,5 +1,5 @@
 import { agentHttp } from './http'
-import type { AgentReply, AgentStatus, ChatSession, ChatSessionDetail, CustomerFollowup, CustomerNotification, CustomerOrder, CustomerOrderDetail, CustomerOrderLogistics, RouteTarget, Ticket } from '@/types/api'
+import type { AgentReply, AgentStatus, ChatSession, ChatSessionDetail, CustomerFollowup, CustomerNotification, CustomerOrder, CustomerOrderDetail, CustomerOrderLogistics, RouteTarget, Ticket, TicketChangeRequest } from '@/types/api'
 
 export const customerApi = {
   async streamReply(
@@ -106,6 +106,10 @@ export const customerApi = {
   },
   ticket(ticketNo: string) {
     return agentHttp.get<Ticket>(`/customer/tickets/${ticketNo}`)
+  },
+  /** 查询客户当前工单的改约申请进度，不包含座席内部审核信息。 */
+  ticketChangeRequests(ticketNo: string) {
+    return agentHttp.get<TicketChangeRequest[]>(`/customer/tickets/${ticketNo}/change-requests`)
   },
   urgeTicket(ticketNo: string, reason: string) {
     return agentHttp.post<Ticket>(`/customer/tickets/${ticketNo}/urge`, { reason })

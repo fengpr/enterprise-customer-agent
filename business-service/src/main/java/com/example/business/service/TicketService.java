@@ -3,6 +3,7 @@ package com.example.business.service;
 import com.example.business.dto.TicketSupplementRequest;
 import com.example.business.dto.TicketSupplementResult;
 import com.example.business.entity.SupportTicket;
+import com.example.business.entity.TicketChangeRequest;
 import com.example.business.entity.TicketStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
@@ -59,6 +60,27 @@ public class TicketService {
             nullableInteger(rs, "urge_count"),
             toLocalDateTime(rs.getTimestamp("last_urged_at")),
             rs.getString("last_urge_reason"),
+            toLocalDateTime(rs.getTimestamp("created_at")),
+            toLocalDateTime(rs.getTimestamp("updated_at"))
+    );
+    /** 已锁定或已关闭工单的履约变更申请映射，原工单与申请保持独立。 */
+    private final RowMapper<TicketChangeRequest> ticketChangeRequestRowMapper = (rs, rowNum) -> new TicketChangeRequest(
+            nullableLong(rs, "id"),
+            rs.getString("request_no"),
+            rs.getString("parent_ticket_no"),
+            nullableLong(rs, "customer_id"),
+            rs.getString("external_session_no"),
+            rs.getString("change_type"),
+            rs.getString("previous_return_method"),
+            rs.getString("previous_pickup_time_window"),
+            rs.getString("requested_return_method"),
+            rs.getString("requested_pickup_time_window"),
+            rs.getString("parent_ticket_status"),
+            rs.getString("status"),
+            rs.getString("idempotency_key"),
+            nullableLong(rs, "reviewed_by"),
+            rs.getString("customer_message"),
+            toLocalDateTime(rs.getTimestamp("reviewed_at")),
             toLocalDateTime(rs.getTimestamp("created_at")),
             toLocalDateTime(rs.getTimestamp("updated_at"))
     );
@@ -354,9 +376,6 @@ public class TicketService {
             throw new IllegalArgumentException("追加工单信息必须提供 Idempotency-Key");
         }
         SupportTicket ticket = detailForCustomer(ticketNo, customerId);
-        if (TicketStatus.CLOSED.name().equals(ticket.status())) {
-            throw new IllegalArgumentException("工单已关闭，不能继续追加信息：" + ticketNo);
-        }
 
         String content = cleanSupplementValue(request == null ? null : request.content(), 1000);
         String reason = cleanSupplementValue(request == null ? null : request.afterSaleReason(), 500);
@@ -384,10 +403,15 @@ public class TicketService {
         boolean fulfillmentUpdated = fulfillmentChangeRequested
                 && DIRECT_FULFILLMENT_UPDATE_STATUSES.contains(ticket.status())
                 && !fulfillmentLocked;
+        // 已关闭工单只能生成独立的履约变更申请，普通补充不允许改写历史工单。
+        boolean changeRequestRequired = fulfillmentChangeRequested && !fulfillmentUpdated;
+        if (TicketStatus.CLOSED.name().equals(ticket.status()) && !changeRequestRequired) {
+            throw new IllegalArgumentException("已关闭工单仅支持提交取件方式或取件时间变更申请");
+        }
         boolean hasNewInformation = reasonIsNew || contentIsNew || fulfillmentChangeRequested;
         String updateMode = !hasNewInformation
                 ? "UNCHANGED"
-                : (fulfillmentChangeRequested && !fulfillmentUpdated ? "REVIEW_REQUIRED" : "APPLIED");
+                : (changeRequestRequired ? "REVIEW_REQUIRED" : "APPLIED");
 
         LocalDateTime now = LocalDateTime.now();
         String normalizedKey = idempotencyKey.trim();
@@ -417,17 +441,27 @@ public class TicketService {
                     ticketNo,
                     normalizedKey
             );
+            String resolvedMode = existingMode == null ? "APPLIED" : existingMode;
             return new TicketSupplementResult(
                     detailForCustomer(ticketNo, customerId),
-                    existingMode == null ? "APPLIED" : existingMode,
-                    "APPLIED".equals(existingMode) && fulfillmentChangeRequested,
-                    true
+                    resolvedMode,
+                    "APPLIED".equals(resolvedMode) && fulfillmentChangeRequested,
+                    true,
+                    findChangeRequest(ticketNo, normalizedKey)
             );
         }
 
         if ("UNCHANGED".equals(updateMode)) {
             // 完全重复的业务信息只留下幂等审计，不改写工单正文和更新时间。
-            return new TicketSupplementResult(ticket, updateMode, false, false);
+            return new TicketSupplementResult(ticket, updateMode, false, false, null);
+        }
+
+        TicketChangeRequest changeRequest = changeRequestRequired
+                ? createOrReuseChangeRequest(ticket, returnMethod, pickupTimeWindow, normalizedKey, now)
+                : null;
+        if (TicketStatus.CLOSED.name().equals(ticket.status())) {
+            // 已关闭工单只新增子申请与审计记录，绝不改写原工单内容、状态或履约字段。
+            return new TicketSupplementResult(ticket, updateMode, false, false, changeRequest);
         }
 
         String supplementSummary = buildSupplementSummary(
@@ -480,7 +514,8 @@ public class TicketService {
                 detailForCustomer(ticketNo, customerId),
                 updateMode,
                 fulfillmentUpdated,
-                false
+                false,
+                changeRequest
         );
     }
 
@@ -679,6 +714,191 @@ public class TicketService {
         return result.isEmpty() ? null : result.get(0);
     }
 
+    /**
+     * 为不可直接修改的履约字段创建或复用变更申请。
+     *
+     * <p>变更申请以“父工单 + 幂等键”去重，避免客户重复发送或 Agent 重试时产生多条改约任务。</p>
+     */
+    private TicketChangeRequest createOrReuseChangeRequest(
+            SupportTicket ticket,
+            String requestedReturnMethod,
+            String requestedPickupTimeWindow,
+            String idempotencyKey,
+            LocalDateTime now
+    ) {
+        TicketChangeRequest existing = findChangeRequest(ticket.ticketNo(), idempotencyKey);
+        if (existing != null) {
+            return existing;
+        }
+        String requestNo = "CR" + now.format(DateTimeFormatter.ofPattern("yyyyMMddHHmmss"))
+                + String.format("%06d", Math.abs(System.nanoTime() % 1_000_000));
+        String changeType = requestedPickupTimeWindow != null ? "PICKUP_TIME_CHANGE" : "RETURN_METHOD_CHANGE";
+        jdbcTemplate.update(
+                """
+                INSERT INTO ticket_change_request (
+                    request_no, parent_ticket_no, customer_id, external_session_no, change_type,
+                    previous_return_method, previous_pickup_time_window,
+                    requested_return_method, requested_pickup_time_window,
+                    parent_ticket_status, status, idempotency_key, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(parent_ticket_no, idempotency_key) DO NOTHING
+                """,
+                requestNo,
+                ticket.ticketNo(),
+                ticket.customerId(),
+                ticket.externalSessionNo(),
+                changeType,
+                ticket.returnMethod(),
+                ticket.pickupTimeWindow(),
+                requestedReturnMethod,
+                requestedPickupTimeWindow,
+                ticket.status(),
+                "PENDING_REVIEW",
+                idempotencyKey,
+                toTimestamp(now),
+                toTimestamp(now)
+        );
+        TicketChangeRequest created = findChangeRequest(ticket.ticketNo(), idempotencyKey);
+        if (created == null) {
+            throw new IllegalStateException("履约变更申请创建失败");
+        }
+        return created;
+    }
+
+    /** 查询当前客户已提交的同一幂等变更申请，避免跨工单或跨客户读取。 */
+    private TicketChangeRequest findChangeRequest(String ticketNo, String idempotencyKey) {
+        List<TicketChangeRequest> requests = jdbcTemplate.query(
+                """
+                SELECT * FROM ticket_change_request
+                WHERE parent_ticket_no = ? AND idempotency_key = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                ticketChangeRequestRowMapper,
+                ticketNo,
+                idempotencyKey
+        );
+        return requests.isEmpty() ? null : requests.get(0);
+    }
+
+    /**
+     * 查询某张工单下的履约变更申请。
+     * <p>归属校验由 Controller 在调用前完成，避免 Service 混入访问者身份语义。</p>
+     */
+    public List<TicketChangeRequest> listChangeRequests(String ticketNo) {
+        return jdbcTemplate.query(
+                """
+                SELECT * FROM ticket_change_request
+                WHERE parent_ticket_no = ?
+                ORDER BY updated_at DESC, id DESC
+                """,
+                ticketChangeRequestRowMapper,
+                ticketNo
+        );
+    }
+
+    /**
+     * 座席审核已锁定或已关闭工单的履约变更。
+     * <p>同意后才恢复原工单并写入新的客户偏好；拒绝和补充材料不会改写原工单。</p>
+     */
+    @Transactional
+    public TicketChangeRequest decideChangeRequest(
+            String ticketNo,
+            String requestNo,
+            Long staffId,
+            String decision,
+            String customerMessage
+    ) {
+        SupportTicket parentTicket = mustFind(ticketNo);
+        TicketChangeRequest request = findChangeRequestByRequestNo(ticketNo, requestNo);
+        if (request == null) {
+            throw new IllegalArgumentException("履约变更申请不存在或不属于该工单");
+        }
+        if (!"PENDING_REVIEW".equals(request.status())) {
+            throw new IllegalArgumentException("该履约变更申请当前不可重复审核");
+        }
+
+        String normalizedDecision = decision == null ? "" : decision.trim().toUpperCase();
+        String normalizedMessage = cleanSupplementValue(customerMessage, 500);
+        String targetStatus = switch (normalizedDecision) {
+            case "APPROVE", "APPROVED" -> "APPROVED";
+            case "REJECT", "REJECTED" -> "REJECTED";
+            case "NEED_MORE_INFO", "WAITING_CUSTOMER" -> "WAITING_CUSTOMER";
+            default -> throw new IllegalArgumentException("不支持的履约变更审核结果");
+        };
+        LocalDateTime now = LocalDateTime.now();
+
+        // 只有审核同意才允许恢复原工单并应用新的履约偏好，避免客户消息直接覆盖既有安排。
+        if ("APPROVED".equals(targetStatus)) {
+            String returnMethod = request.requestedReturnMethod() == null
+                    ? parentTicket.returnMethod() : request.requestedReturnMethod();
+            String pickupTime = "self_ship".equalsIgnoreCase(returnMethod)
+                    ? null
+                    : (request.requestedPickupTimeWindow() == null
+                    ? parentTicket.pickupTimeWindow() : request.requestedPickupTimeWindow());
+            String pickupStatus = "self_ship".equalsIgnoreCase(returnMethod)
+                    ? "NOT_REQUIRED" : "PREFERENCE_RECORDED";
+            String restoredStatus = TicketStatus.CLOSED.name().equals(parentTicket.status())
+                    ? TicketStatus.REOPENED.name() : parentTicket.status();
+            String audit = "\n\n[履约变更已审核 "
+                    + now.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
+                    + "] 变更申请：" + request.requestNo()
+                    + "；退回方式：" + (returnMethod == null ? "未变更" : returnMethod)
+                    + "；取件时间偏好：" + (pickupTime == null ? "不适用" : pickupTime);
+            jdbcTemplate.update(
+                    """
+                    UPDATE support_ticket
+                    SET return_method = ?, pickup_time_window = ?, pickup_status = ?,
+                        status = ?, content = ?, ai_summary = ?, updated_at = ?
+                    WHERE ticket_no = ?
+                    """,
+                    returnMethod,
+                    pickupTime,
+                    pickupStatus,
+                    restoredStatus,
+                    appendText(parentTicket.content(), audit),
+                    appendText(parentTicket.aiSummary(), audit),
+                    toTimestamp(now),
+                    ticketNo
+            );
+        }
+
+        jdbcTemplate.update(
+                """
+                UPDATE ticket_change_request
+                SET status = ?, reviewed_by = ?, customer_message = ?, reviewed_at = ?, updated_at = ?
+                WHERE request_no = ? AND parent_ticket_no = ?
+                """,
+                targetStatus,
+                staffId,
+                normalizedMessage,
+                toTimestamp(now),
+                toTimestamp(now),
+                requestNo,
+                ticketNo
+        );
+        TicketChangeRequest updated = findChangeRequestByRequestNo(ticketNo, requestNo);
+        if (updated == null) {
+            throw new IllegalStateException("履约变更审核结果保存失败");
+        }
+        return updated;
+    }
+
+    /** 通过申请编号查找父工单下的子申请，防止跨工单审核。 */
+    private TicketChangeRequest findChangeRequestByRequestNo(String ticketNo, String requestNo) {
+        List<TicketChangeRequest> requests = jdbcTemplate.query(
+                """
+                SELECT * FROM ticket_change_request
+                WHERE parent_ticket_no = ? AND request_no = ?
+                LIMIT 1
+                """,
+                ticketChangeRequestRowMapper,
+                ticketNo,
+                requestNo
+        );
+        return requests.isEmpty() ? null : requests.get(0);
+    }
+
     private void initTables() {
         jdbcTemplate.execute(
                 """
@@ -744,6 +964,31 @@ public class TicketService {
         );
         jdbcTemplate.execute(
                 """
+                CREATE TABLE IF NOT EXISTS ticket_change_request (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_no VARCHAR(64) NOT NULL UNIQUE,
+                    parent_ticket_no VARCHAR(64) NOT NULL,
+                    customer_id BIGINT NOT NULL,
+                    external_session_no VARCHAR(128),
+                    change_type VARCHAR(32) NOT NULL,
+                    previous_return_method VARCHAR(32),
+                    previous_pickup_time_window VARCHAR(128),
+                    requested_return_method VARCHAR(32),
+                    requested_pickup_time_window VARCHAR(128),
+                    parent_ticket_status VARCHAR(32) NOT NULL,
+                    status VARCHAR(32) NOT NULL,
+                    idempotency_key VARCHAR(128) NOT NULL,
+                    reviewed_by BIGINT,
+                    customer_message VARCHAR(500),
+                    reviewed_at TIMESTAMP,
+                    created_at TIMESTAMP NOT NULL,
+                    updated_at TIMESTAMP NOT NULL,
+                    UNIQUE(parent_ticket_no, idempotency_key)
+                )
+                """
+        );
+        jdbcTemplate.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_ticket_urge_log_ticket_created
                 ON ticket_urge_log(ticket_no, created_at)
                 """
@@ -752,6 +997,12 @@ public class TicketService {
                 """
                 CREATE INDEX IF NOT EXISTS idx_ticket_supplement_ticket_created
                 ON ticket_supplement(ticket_no, created_at)
+                """
+        );
+        jdbcTemplate.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_ticket_change_request_parent_updated
+                ON ticket_change_request(parent_ticket_no, updated_at)
                 """
         );
         jdbcTemplate.execute(
@@ -783,6 +1034,10 @@ public class TicketService {
         ensureColumn("return_method", "VARCHAR(32)");
         ensureColumn("pickup_time_window", "VARCHAR(128)");
         ensureColumn("pickup_status", "VARCHAR(32)");
+        // SQLite 本地开发库也需要补齐子申请审核字段，避免升级后读取旧表时报列不存在。
+        ensureChangeRequestColumn("reviewed_by", "BIGINT");
+        ensureChangeRequestColumn("customer_message", "VARCHAR(500)");
+        ensureChangeRequestColumn("reviewed_at", "TIMESTAMP");
     }
 
     private void insertDraft(SupportTicket ticket) {
@@ -994,6 +1249,24 @@ public class TicketService {
         );
         if (!Boolean.TRUE.equals(exists)) {
             jdbcTemplate.execute("ALTER TABLE support_ticket ADD COLUMN " + columnName + " " + columnType);
+        }
+    }
+
+    /** 为本地 SQLite 的履约变更申请表补齐增量审核字段。 */
+    private void ensureChangeRequestColumn(String columnName, String columnType) {
+        Boolean exists = jdbcTemplate.query(
+                "PRAGMA table_info(ticket_change_request)",
+                rs -> {
+                    while (rs.next()) {
+                        if (columnName.equalsIgnoreCase(rs.getString("name"))) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+        );
+        if (!Boolean.TRUE.equals(exists)) {
+            jdbcTemplate.execute("ALTER TABLE ticket_change_request ADD COLUMN " + columnName + " " + columnType);
         }
     }
 

@@ -61,6 +61,9 @@ const humanMessages = computed(() =>
     return false
   })
 )
+// 工单座席可能直接向关联会话发送客户可见消息，而不一定先创建人工排队状态。
+// 因此只要已有人工消息，就必须开放人工页签，避免消息已落库却被前端过滤不可见。
+const hasHumanConversation = computed(() => hasHumanSession.value || humanMessages.value.length > 0)
 const visibleMessages = computed(() => (activeTab.value === 'human' ? humanMessages.value : aiMessages.value))
 const visibleMessageEntries = computed(() =>
   visibleMessages.value.map((message, index, list) => ({
@@ -75,7 +78,7 @@ const visibleMessageEntries = computed(() =>
  */
 function switchConversationChannel(target: RouteTarget | string) {
   if (target !== 'ai' && target !== 'human') return
-  if (target === 'human' && !hasHumanSession.value) return
+  if (target === 'human' && !hasHumanConversation.value) return
   activeTab.value = target
   // 同步通知父组件，不能仅依赖 watch 在下一个渲染周期更新。
   emit('update:routeTarget', target)
@@ -290,9 +293,20 @@ watch(
   () => props.routeTarget,
   (target) => {
     // 父组件从快捷操作、取消人工排队等入口改写目标时，同步修正当前展示页签。
-    if (target === 'ai' || hasHumanSession.value) activeTab.value = target
+    if (target === 'ai' || hasHumanConversation.value) activeTab.value = target
   },
   { immediate: true }
+)
+
+watch(
+  () => humanMessages.value.length,
+  (current, previous) => {
+    // 新到达的座席消息应直接呈现在人工通道，不能继续停留在智能助手页签造成“没有收到”的错觉。
+    // 仅切换展示通道，不修改客户后续输入的默认投递目标。
+    if (current > previous && activeTab.value !== 'human') {
+      switchConversationChannel('human')
+    }
+  }
 )
 
 watch(
@@ -335,7 +349,7 @@ watch(
           :model-value="activeTab"
           :options="[
             { label: `智能助手 ${aiMessages.length}`, value: 'ai' },
-            { label: `人工客服 ${humanMessages.length}`, value: 'human', disabled: !hasHumanSession }
+            { label: `人工客服 ${humanMessages.length}`, value: 'human', disabled: !hasHumanConversation }
           ]"
           class="chat-channel-tabs"
           @update:model-value="switchConversationChannel($event)"

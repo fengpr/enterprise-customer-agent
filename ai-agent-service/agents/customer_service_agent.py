@@ -202,6 +202,12 @@ class CustomerServiceAgent:
             return self._compose_human_request_answer(state)
 
         if decision_type == "review_required":
+            if (state.get("ticket_result") or {}).get("status") == "no_matching_ticket":
+                # 改约只能作用于现有且归属已校验的售后工单，不能为了“有回复”而新建退货工单。
+                return (
+                    "暂未找到可关联的退货或售后工单，因此无法直接变更取件安排。"
+                    "请提供对应工单号，或联系人工客服核实后再提交变更申请。"
+                )
             ticket_text = self._format_customer_ticket_text(state.get("ticket_result"))
             if (
                 is_delivery_not_received_message(state.get("message", ""))
@@ -263,9 +269,13 @@ class CustomerServiceAgent:
                         else "本次说明已追加到原工单。"
                     )
                     if update_mode == "REVIEW_REQUIRED":
+                        # 关闭或处理中工单的履约信息只能形成子变更申请，不能让客户误以为原安排已被直接覆盖。
+                        change_request = supplement_data.get("changeRequest") or {}
+                        request_no = str(change_request.get("requestNo") or "").strip()
+                        request_text = f"变更申请编号为 {request_no}，" if request_no else ""
                         return (
                             f"已关联您现有的退货工单。{ticket_text}{reason_text}"
-                            "由于工单或取件已经进入处理阶段，新的取件方式/时间仅登记为变更申请，"
+                            f"由于工单或取件已经进入处理阶段，新的取件方式/时间仅登记为变更申请，{request_text}"
                             "不会直接覆盖原安排，请以工作人员或承运方后续确认为准。"
                         )
                     if supplement_result:

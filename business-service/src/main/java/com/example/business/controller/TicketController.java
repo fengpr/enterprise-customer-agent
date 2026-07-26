@@ -4,6 +4,7 @@ import com.example.business.entity.SupportTicket;
 import com.example.business.dto.TicketUrgeRequest;
 import com.example.business.dto.TicketSupplementRequest;
 import com.example.business.dto.TicketSupplementResult;
+import com.example.business.dto.TicketChangeRequestCustomerView;
 import com.example.business.service.AuthService;
 import com.example.business.service.AgentExecutionCredentialService;
 import com.example.business.service.TicketService;
@@ -91,6 +92,26 @@ public class TicketController {
     ) {
         Long customerId = resolveCustomerId(authorization, executionCredential, agentCustomerId, requestId);
         return ticketService.detailForCustomer(ticketNo, customerId);
+    }
+
+    /**
+     * 查询当前客户在该工单下提交的履约变更申请。
+     * <p>仅返回客户安全视图，不暴露审核座席、幂等键和内部审计字段。</p>
+     */
+    @GetMapping("/{ticketNo}/change-requests")
+    public List<TicketChangeRequestCustomerView> changeRequests(
+            @PathVariable("ticketNo") String ticketNo,
+            @RequestHeader(value = "Authorization", required = false) String authorization,
+            @RequestHeader(value = "X-Agent-Execution-Credential", required = false) String executionCredential,
+            @RequestHeader(value = "X-Agent-Customer-ID", required = false) Long agentCustomerId,
+            @RequestHeader(value = "X-Request-ID", required = false) String requestId
+    ) {
+        Long customerId = resolveCustomerId(authorization, executionCredential, agentCustomerId, requestId);
+        // 先验证父工单归属，再读取子申请，禁止通过工单号枚举他人的改约记录。
+        ticketService.detailForCustomer(ticketNo, customerId);
+        return ticketService.listChangeRequests(ticketNo).stream()
+                .map(TicketChangeRequestCustomerView::from)
+                .toList();
     }
 
     /**

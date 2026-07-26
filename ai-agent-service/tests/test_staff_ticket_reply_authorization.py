@@ -75,7 +75,13 @@ def test_ticket_owner_can_generate_customer_reply_draft(monkeypatch) -> None:
     monkeypatch.setattr(
         app,
         "staff_reply_draft_service",
-        SimpleNamespace(generate=lambda **_: ("您好，问题已处理完成，后续进展会在当前会话同步。", "fallback")),
+        SimpleNamespace(
+            generate_with_metadata=lambda **_: SimpleNamespace(
+                draft_message="您好，问题已处理完成，后续进展会在当前会话同步。",
+                generation_mode="fallback",
+                fallback_reason="not_configured",
+            )
+        ),
     )
     client = TestClient(app.app)
 

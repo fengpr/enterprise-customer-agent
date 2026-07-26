@@ -769,7 +769,7 @@ def draft_staff_ticket_reply(
     close_reason = str(payload.get("close_reason") or payload.get("processing_result") or "").strip()
     # 仅传入关联会话中客户可见的最近消息；草稿服务会继续脱敏并过滤内部字段。
     messages = chat_messages.list_by_session(context["session"]["session_id"])
-    draft_message, generation_mode = staff_reply_draft_service.generate(
+    draft_result = staff_reply_draft_service.generate_with_metadata(
         ticket=ticket,
         processing_result=close_reason,
         messages=messages,
@@ -777,9 +777,11 @@ def draft_staff_ticket_reply(
     return {
         "ticket_no": ticket_no,
         "session_id": context["session"]["session_id"],
-        "draft_message": draft_message,
+        "draft_message": draft_result.draft_message,
         # 仅向坐席展示生成来源，方便判断是否需要重点润色；不向客户侧透出。
-        "generation_mode": generation_mode,
+        "generation_mode": draft_result.generation_mode,
+        # 仅向已鉴权座席说明安全降级类别，便于重新生成或人工编辑；不包含供应商原始异常。
+        "fallback_reason": draft_result.fallback_reason,
     }
 
 

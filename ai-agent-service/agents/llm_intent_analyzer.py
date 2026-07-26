@@ -194,6 +194,7 @@ need_human, priority, confidence, summary, risk_reasons, action_type, action_slo
 19. 槽位命名使用通用字段：order_no, product_name, description, after_sale_reason, return_method, pickup_time_window, fault_description, invoice_title, invoice_type, tax_no, evidence_hint。
 20. 退货时必须从整条消息一次提取全部已提供信息：原因写入 after_sale_reason；“上门取件”写 return_method=pickup；“自行寄回/自己寄回”写 return_method=self_ship；客户提供的取件时间只截取时间短语写入 pickup_time_window。
 21. “商品有问题、用不上了、不合适、不喜欢”等可以作为 after_sale_reason，但单独出现时不代表客户已经授权创建退货工单；是否执行由后端状态机判断。
+22. 当用户已经提交过退货或售后工单，当前消息表达“改约、调整、变更上门取件时间/退回方式”等履约变更时，输出 user_goal=action_request、action_type=return_goods，并从整句提取 return_method 和 pickup_time_window。不要识别为新投诉或普通规则咨询，也不要声称原取件安排已经变更成功。
 22. “最近买了什么、一共几件、总计花费多少、统计本月消费”等购买汇总问题用 user_goal=info_query、order_related=true、need_order_query=true，不要归为 how_to，也不要让客户自行统计。
 22. 信息不全时 next_action=collect_slots；信息齐全时可以建议 create_ticket，但最终是否查单或建单只能由后端确定性规则决定。
 23. 如果输入上下文明确说明“当前前端已选中一笔订单”，且用户使用“这款商品怎么样、适合什么场景、值不值、有什么用途、评价如何”等自然表达，

@@ -6,7 +6,7 @@ import { useRouter } from 'vue-router'
 
 import { staffHandoffApi, staffReplyApi, staffTicketApi } from '@/api/staff'
 import { useAuthStore } from '@/stores/auth'
-import type { ChatMessage, StaffHandoffDetail, StaffHandoffSession, Ticket } from '@/types/api'
+import type { ChatMessage, StaffHandoffDetail, StaffHandoffSession, Ticket, TicketChangeRequest } from '@/types/api'
 import { statusType } from '@/utils/ticket'
 
 const router = useRouter()
@@ -20,6 +20,11 @@ const handoffHistoryAvailable = ref(false)
 const handoffHistoryAccessAllowed = ref(false)
 const handoffHistoryLoading = ref(false)
 const selectedTicketNo = ref<string | null>(null)
+// 履约改约仍归属于原工单；座席只能在自己领取的原工单内审核。
+const ticketChangeRequests = ref<TicketChangeRequest[]>([])
+const loadingChangeRequests = ref(false)
+const decidingChangeRequestNo = ref<string | null>(null)
+const changeRequestMessages = ref<Record<string, string>>({})
 const selectedHandoffSessionId = ref<string | null>(null)
 const loading = ref(false)
 const handoffLoading = ref(false)
@@ -27,6 +32,9 @@ const acting = ref(false)
 const generatingDraft = ref(false)
 const closeReason = ref('问题已处理完成')
 const draftMessage = ref('')
+// 明确区分真实模型草稿与安全回退，避免座席把固定模板误认为 AI 已完成润色。
+const draftGenerationMode = ref<'llm' | 'fallback' | null>(null)
+const draftFallbackReason = ref<string | null>(null)
 const handoffReply = ref('')
 const handoffCloseMessage = ref('人工服务已结束，后续可继续由智能助手协助。')
 const workMode = ref<'tickets' | 'handoff'>('tickets')
@@ -71,6 +79,53 @@ async function loadTickets() {
     }
   } finally {
     loading.value = false
+  }
+}
+
+/** 读取已领取工单的改约子申请；无权限或网络异常不影响工单主界面。 */
+async function loadChangeRequests(ticketNo = selectedTicketNo.value) {
+  if (!ticketNo || !canOperate.value) {
+    ticketChangeRequests.value = []
+    return
+  }
+  loadingChangeRequests.value = true
+  try {
+    const { data } = await staffTicketApi.changeRequests(ticketNo)
+    if (selectedTicketNo.value === ticketNo) ticketChangeRequests.value = data
+  } catch {
+    if (selectedTicketNo.value === ticketNo) ticketChangeRequests.value = []
+  } finally {
+    loadingChangeRequests.value = false
+  }
+}
+
+function changeRequestStatusLabel(status: string) {
+  const labels: Record<string, string> = {
+    PENDING_REVIEW: '待审核',
+    WAITING_CUSTOMER: '待客户补充',
+    APPROVED: '已同意',
+    REJECTED: '已拒绝'
+  }
+  return labels[status] || status
+}
+
+/** 座席以客户可见说明审核改约；页面不提供直接覆写原工单字段的入口。 */
+async function decideChangeRequest(request: TicketChangeRequest, decision: 'APPROVE' | 'REJECT' | 'NEED_MORE_INFO') {
+  const ticket = selectedTicket.value
+  if (!ticket || !canOperate.value || decidingChangeRequestNo.value) return
+  decidingChangeRequestNo.value = request.requestNo
+  try {
+    const { data } = await staffTicketApi.decideChangeRequest(
+      ticket.ticketNo,
+      request.requestNo,
+      decision,
+      changeRequestMessages.value[request.requestNo] || ''
+    )
+    ElMessage.success(`履约变更申请已处理：${changeRequestStatusLabel(data.status)}`)
+    await loadTickets()
+    await loadChangeRequests(ticket.ticketNo)
+  } finally {
+    decidingChangeRequestNo.value = null
   }
 }
 
@@ -210,7 +265,14 @@ function handleStaffVisibility() {
 function selectTicket(ticket: Ticket) {
   selectedTicketNo.value = ticket.ticketNo
   draftMessage.value = ''
+  draftGenerationMode.value = null
+  draftFallbackReason.value = null
+  void loadChangeRequests(ticket.ticketNo)
 }
+
+watch([selectedTicketNo, canOperate], () => {
+  void loadChangeRequests()
+})
 
 async function selectHandoff(session: StaffHandoffSession) {
   selectedHandoffSessionId.value = session.session_id
@@ -226,6 +288,7 @@ async function claimTicket() {
     ElMessage.success(`已领取工单，当前状态：${data.status}`)
     queueScope.value = 'mine'
     await loadTickets()
+    await loadChangeRequests()
   } finally {
     acting.value = false
   }
@@ -238,6 +301,7 @@ async function startTicket() {
     const { data } = await staffTicketApi.start(selectedTicket.value.ticketNo)
     ElMessage.success(`已开始处理，当前状态：${data.status}`)
     await loadTickets()
+    await loadChangeRequests()
   } finally {
     acting.value = false
   }
@@ -250,6 +314,7 @@ async function closeTicket() {
     const { data } = await staffTicketApi.close(selectedTicket.value.ticketNo, closeReason.value)
     ElMessage.success(`已关闭工单，当前状态：${data.status}`)
     await loadTickets()
+    await loadChangeRequests()
   } finally {
     acting.value = false
   }
@@ -261,6 +326,8 @@ async function generateDraft() {
   try {
     const { data } = await staffReplyApi.draft(selectedTicket.value.ticketNo, closeReason.value)
     draftMessage.value = data.draft_message
+    draftGenerationMode.value = data.generation_mode ?? 'fallback'
+    draftFallbackReason.value = data.fallback_reason ?? null
     // 模型暂不可用时后端会安全回退，明确提示坐席仍需按真实处理结果审核后发送。
     ElMessage.success(data.generation_mode === 'llm' ? '已根据工单与会话生成 AI 话术草稿' : '已生成安全话术草稿，请结合处理结果确认')
   } finally {
@@ -597,6 +664,31 @@ onBeforeUnmount(() => {
 
             <h3>AI 摘要</h3>
             <p class="plain-text">{{ selectedTicket.aiSummary || '暂无 AI 摘要' }}</p>
+
+            <section class="staff-change-requests" v-loading="loadingChangeRequests">
+              <div class="staff-change-requests__title">
+                <h3>履约变更申请</h3>
+                <span>仅审核已关联原工单的改约请求</span>
+              </div>
+              <el-empty v-if="canOperate && !ticketChangeRequests.length && !loadingChangeRequests" :image-size="44" description="暂无待审核的履约变更申请" />
+              <article v-for="request in ticketChangeRequests" :key="request.requestNo" class="staff-change-request">
+                <header>
+                  <div><b>{{ request.requestNo }}</b><span>{{ request.changeType === 'RETURN_METHOD_CHANGE' ? '退回方式调整' : '取件时间调整' }}</span></div>
+                  <el-tag size="small" :type="request.status === 'APPROVED' ? 'success' : request.status === 'REJECTED' ? 'danger' : 'warning'">{{ changeRequestStatusLabel(request.status) }}</el-tag>
+                </header>
+                <p>原偏好：{{ request.previousReturnMethod || '未登记' }}{{ request.previousPickupTimeWindow ? ` / ${request.previousPickupTimeWindow}` : '' }}</p>
+                <p>申请调整为：{{ request.requestedReturnMethod || request.previousReturnMethod || '未变更' }}{{ request.requestedPickupTimeWindow ? ` / ${request.requestedPickupTimeWindow}` : '' }}</p>
+                <p v-if="request.customerMessage" class="staff-change-request__message">客户可见说明：{{ request.customerMessage }}</p>
+                <template v-if="request.status === 'PENDING_REVIEW'">
+                  <el-input v-model="changeRequestMessages[request.requestNo]" :disabled="!canOperate" :rows="2" maxlength="500" placeholder="填写客户可见说明（可选，不要包含内部信息）" type="textarea" />
+                  <div class="action-row staff-change-request__actions">
+                    <el-button :disabled="!canOperate" :loading="decidingChangeRequestNo === request.requestNo" type="success" @click="decideChangeRequest(request, 'APPROVE')">同意调整</el-button>
+                    <el-button :disabled="!canOperate" :loading="decidingChangeRequestNo === request.requestNo" @click="decideChangeRequest(request, 'NEED_MORE_INFO')">请客户补充</el-button>
+                    <el-button :disabled="!canOperate" :loading="decidingChangeRequestNo === request.requestNo" type="danger" plain @click="decideChangeRequest(request, 'REJECT')">暂不支持</el-button>
+                  </div>
+                </template>
+              </article>
+            </section>
           </el-card>
 
           <el-card shadow="never">
@@ -626,6 +718,22 @@ onBeforeUnmount(() => {
                 {{ generatingDraft ? '正在基于工单事实生成…' : '生成客户话术草稿' }}
               </el-button>
               <p v-if="generatingDraft" class="draft-generating-hint">正在结合工单处理结果、客户诉求和最近会话生成草稿，通常几秒内完成。</p>
+              <el-alert
+                v-else-if="draftGenerationMode === 'llm'"
+                class="draft-generation-status"
+                :closable="false"
+                show-icon
+                title="已使用大模型结合工单事实与最近会话生成草稿，请在发送前确认具体处理边界。"
+                type="success"
+              />
+              <el-alert
+                v-else-if="draftGenerationMode === 'fallback'"
+                class="draft-generation-status"
+                :closable="false"
+                show-icon
+                :title="`本次模型草稿未生成（${draftFallbackReason || '暂时不可用'}），当前内容为安全兜底模板；可稍后重新生成或手动编辑。`"
+                type="warning"
+              />
               <el-form-item class="reply-editor" label="客户可见内容">
                 <el-input
                   v-model="draftMessage"

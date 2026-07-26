@@ -8,7 +8,8 @@ import type {
   RagEvaluationJob,
   OnlineEvaluationReport,
   SystemMonitorSnapshot,
-  Ticket
+  Ticket,
+  TicketChangeRequest
 } from '@/types/api'
 
 export const ragEvaluationApi = {
@@ -50,6 +51,16 @@ export const staffTicketApi = {
   close(ticketNo: string, closeReason: string) {
     return businessHttp.post<Ticket>(`/staff/tickets/${ticketNo}/close`, {
       closeReason
+    })
+  },
+  /** 仅工单处理人可读取和审核关联的履约变更申请。 */
+  changeRequests(ticketNo: string) {
+    return businessHttp.get<TicketChangeRequest[]>(`/staff/tickets/${ticketNo}/change-requests`)
+  },
+  decideChangeRequest(ticketNo: string, requestNo: string, decision: 'APPROVE' | 'REJECT' | 'NEED_MORE_INFO', customerMessage: string) {
+    return businessHttp.post<TicketChangeRequest>(`/staff/tickets/${ticketNo}/change-requests/${requestNo}/decision`, {
+      decision,
+      customerMessage
     })
   }
 }

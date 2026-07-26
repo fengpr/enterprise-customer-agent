@@ -3,7 +3,7 @@
 from types import SimpleNamespace
 
 import app
-from services.staff_reply_draft_service import StaffReplyDraftService
+from services.staff_reply_draft_service import StaffReplyDraftResult, StaffReplyDraftService
 
 
 def _ticket() -> dict:
@@ -64,6 +64,24 @@ def test_invalid_llm_draft_falls_back_without_false_commitment_or_handoff_wordin
     assert "等待工作人员" not in draft
 
 
+def test_model_network_failure_returns_safe_fallback_reason(monkeypatch) -> None:
+    """模型短暂不可用时应安全回退，并让座席端能够区分模板与模型生成。"""
+    service = StaffReplyDraftService(model=object(), invoker=SimpleNamespace())
+
+    class NetworkFailure(Exception):
+        """模拟已被韧性层归类的网络异常。"""
+
+        error_type = "network_error"
+
+    monkeypatch.setattr(service, "_generate_with_llm", lambda _: (_ for _ in ()).throw(NetworkFailure()))
+
+    result = service.generate_with_metadata(ticket=_ticket(), processing_result="正在核实处理。", messages=[])
+
+    assert result.generation_mode == "fallback"
+    assert result.fallback_reason == "network_error"
+    assert "等待工作人员" not in result.draft_message
+
+
 def test_staff_draft_api_returns_llm_generation_mode(monkeypatch) -> None:
     """草稿接口应把模型生成结果返回给坐席，但不会自动写入客户会话。"""
     monkeypatch.setattr(app, "_current_login_user", lambda _: {"user_id": 101, "role": "staff", "display_name": "客服小王"})
@@ -74,7 +92,12 @@ def test_staff_draft_api_returns_llm_generation_mode(monkeypatch) -> None:
     monkeypatch.setattr(
         app,
         "staff_reply_draft_service",
-        SimpleNamespace(generate=lambda **_: ("很抱歉给您带来不便，我们已记录商品质量问题并继续为您核实。", "llm")),
+        SimpleNamespace(
+            generate_with_metadata=lambda **_: StaffReplyDraftResult(
+                "很抱歉给您带来不便，我们已记录商品质量问题并继续为您核实。",
+                "llm",
+            )
+        ),
     )
 
     from fastapi.testclient import TestClient
@@ -87,4 +110,5 @@ def test_staff_draft_api_returns_llm_generation_mode(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert response.json()["generation_mode"] == "llm"
+    assert response.json()["fallback_reason"] is None
     assert "商品质量问题" in response.json()["draft_message"]

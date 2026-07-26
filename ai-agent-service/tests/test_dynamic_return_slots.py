@@ -501,7 +501,11 @@ def test_processing_ticket_reply_says_pickup_change_needs_review():
             "data": {"ticketNo": "T-EXISTING", "status": "PROCESSING", "orderNo": ORDER_NO},
             "supplement_result": {
                 "status": "success",
-                "data": {"updateMode": "REVIEW_REQUIRED", "fulfillmentUpdated": False},
+                "data": {
+                    "updateMode": "REVIEW_REQUIRED",
+                    "fulfillmentUpdated": False,
+                    "changeRequest": {"requestNo": "CR202607230001", "status": "PENDING_REVIEW"},
+                },
             },
         },
         "tool_results": [],
@@ -512,5 +516,94 @@ def test_processing_ticket_reply_says_pickup_change_needs_review():
     answer = agent._build_customer_message(state)
 
     assert "仅登记为变更申请" in answer
+    assert "CR202607230001" in answer
     assert "不会直接覆盖原安排" in answer
     assert "取件时间偏好已更新" not in answer
+
+
+def test_closed_return_ticket_pickup_change_creates_linked_change_request():
+    """已关闭退货工单的改约必须复用原工单创建变更申请，不能新建无关退货工单。"""
+    message = "把上门取件改成明天下午三点"
+    draft = _draft(
+        message,
+        action_slots={
+            "order_no": ORDER_NO,
+            "return_method": "pickup",
+            "pickup_time_window": "明天下午三点",
+        },
+    )
+    appended: list[tuple[str, dict]] = []
+
+    def prepare_action(state):
+        analysis, pending = enrich_action_analysis(
+            state["analysis"],
+            message=state["message"],
+            selected_order_no=state.get("selected_order_no"),
+            pending_action_request=state.get("pending_action_request"),
+            conversation_context=state.get("conversation_context"),
+        )
+        return {"analysis": analysis, "pending_action_request": pending}
+
+    def append_information(ticket_no, payload, auth_token):
+        appended.append((ticket_no, payload))
+        return {
+            "status": "success",
+            "data": {
+                "ticket": {
+                    "ticketNo": ticket_no,
+                    "ticketType": "refund",
+                    "orderNo": ORDER_NO,
+                    "status": "CLOSED",
+                    "content": "业务动作：return_goods",
+                },
+                "updateMode": "REVIEW_REQUIRED",
+                "fulfillmentUpdated": False,
+                "changeRequest": {"requestNo": "CR-CLOSED-1", "status": "PENDING_REVIEW"},
+            },
+        }
+
+    graph = build_ticket_process_graph(
+        analyzer_chain=RunnableLambda(lambda _: draft),
+        retrieve_knowledge=lambda _: [],
+        query_order=lambda order_no, auth_token: {
+            "status": "success", "query_type": "order_detail", "data": {"orderNo": order_no}
+        },
+        query_customer_orders=lambda customer_id, auth_token: {"status": "success", "data": []},
+        query_order_logistics=lambda order_no, auth_token: {"status": "empty"},
+        create_ticket=lambda payload, auth_token: pytest.fail("关闭工单改约不应新建退货工单"),
+        auto_assign_ticket=lambda ticket_no: {"status": "failed"},
+        list_customer_tickets=lambda auth_token: {
+            "status": "success",
+            "data": [{
+                "ticketNo": "T-CLOSED",
+                "ticketType": "refund",
+                "orderNo": ORDER_NO,
+                "status": "CLOSED",
+                "content": "业务动作：return_goods",
+            }],
+        },
+        query_ticket_status=lambda ticket_no, auth_token: {"status": "empty"},
+        urge_ticket=lambda ticket_no, reason, auth_token: {"status": "empty"},
+        prepare_action=prepare_action,
+        compose_answer=lambda state: "已登记变更申请",
+        log_tool_call=lambda tool_name, input_data, output_data: None,
+        append_ticket_information=append_information,
+    )
+
+    result = graph.invoke({
+        "message": message,
+        "customer_id": 1,
+        "session_id": "S-CLOSED-CHANGE",
+        "selected_order_no": ORDER_NO,
+        "tool_results": [],
+        "citations": [],
+    })
+
+    assert result["analysis"].next_action == "update_existing_ticket"
+    assert result["analysis"].need_human is True
+    assert appended
+    assert appended[0][0] == "T-CLOSED"
+    assert appended[0][1]["returnMethod"] == "pickup"
+    assert appended[0][1]["pickupTimeWindow"] == "明天下午三点"
+    assert result["ticket_result"]["deduplicated"] is True
+    assert result["ticket_result"]["supplement_result"]["data"]["changeRequest"]["requestNo"] == "CR-CLOSED-1"

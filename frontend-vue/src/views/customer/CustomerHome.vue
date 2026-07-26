@@ -688,7 +688,18 @@ async function applyRouteContext() {
     }
     // 关联标识必须先经过当前客户已加载列表校验，不能直接信任 URL 参数。
     if (orderNo && orders.value.some((item) => item.orderNo === orderNo)) selectedOrderNo.value = orderNo
-    if (ticketNo && tickets.value.some((item) => item.ticketNo === ticketNo)) selectedTicketNo.value = ticketNo
+    if (ticketNo) {
+      const linkedTicket = tickets.value.find((item) => item.ticketNo === ticketNo)
+      if (linkedTicket) {
+        selectedTicketNo.value = ticketNo
+        // 从工单页进入客服页时，优先打开该工单绑定的会话。
+        // 座席回复按 externalSessionNo 持久化；不做这一步会让客户留在无关会话而误以为未收到消息。
+        const linkedSessionId = String(linkedTicket.externalSessionNo || '')
+        if (!sessionId && linkedSessionId && sessions.value.some((item) => item.session_id === linkedSessionId)) {
+          await selectSession(linkedSessionId)
+        }
+      }
+    }
     if (typeof route.query.message === 'string') messageText.value = route.query.message
   } catch (error) {
     // 处理失败时释放占用，允许用户再次进入或刷新后重试。

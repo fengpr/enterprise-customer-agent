@@ -241,6 +241,18 @@ def build_ticket_process_graph(
                     "auto_send": True,
                     "risk_reasons": risk_reasons,
                 }
+            if analysis.next_action == "update_existing_ticket":
+                # 履约改约属于受控写入：订单归属已校验后才进入“查找既有工单并登记变更申请”的节点。
+                # 它不是人工转接，也不能因为没有知识库片段而跳过工单关联。
+                if _has_success_order_detail(state):
+                    analysis.need_human = True
+                    analysis.need_ticket = True
+                    return {
+                        "analysis": analysis,
+                        "need_human": True,
+                        "auto_send": False,
+                        "risk_reasons": risk_reasons,
+                    }
             if _action_requires_order(analysis) and not _has_success_order_detail(state):
                 # 订单归属或订单号未通过 Java 校验时不能建单，避免把他人订单写进工单。
                 # 订单号已经存在但 Java 校验失败时，不能谎报为“缺少订单号”并反复追问。
@@ -331,7 +343,7 @@ def build_ticket_process_graph(
             return {"ticket_result": None}
         if not (analysis.need_ticket or analysis.need_human):
             return {"ticket_result": None}
-        if analysis.user_goal == "action_request" and analysis.next_action != "create_ticket":
+        if analysis.user_goal == "action_request" and analysis.next_action not in {"create_ticket", "update_existing_ticket"}:
             # 动作闭环必须等槽位齐全且订单校验完成后才能建单。
             return {"ticket_result": None}
 
@@ -373,6 +385,19 @@ def build_ticket_process_graph(
                 pending["completed"] = not supplement_failed
                 pending["ticket_no"] = duplicate.get("ticketNo")
             return {"ticket_result": duplicate_result, "tool_results": tool_results, "pending_action_request": pending}
+
+        if analysis.next_action == "update_existing_ticket":
+            # 仅修改履约偏好的请求没有可关联售后工单时，不能退化为新建退货单，避免错误发起售后。
+            pending = dict(state.get("pending_action_request") or {})
+            if pending:
+                pending["status"] = "waiting_for_user_input"
+                pending["flow_state"] = "COLLECTING"
+                pending["completed"] = False
+                pending["next_action"] = "select_existing_ticket"
+            return {
+                "ticket_result": {"status": "no_matching_ticket", "data": None},
+                "pending_action_request": pending or state.get("pending_action_request"),
+            }
 
         payload = _build_ticket_payload(state)
         result = _call_tool(state, create_ticket, payload, state.get("auth_token"))
@@ -693,11 +718,22 @@ def _find_duplicate_ticket(
     tickets = result.get("data") if result.get("status") == "success" else []
     ticket_type = _resolve_ticket_type(analysis)
     active_statuses = {"PENDING_ASSIGN", "PENDING_PROCESS", "PROCESSING"}
+    # 已关闭工单不能被常规“再次退货”请求复用；只有明确补充取件方式或时间时，
+    # 才允许关联原售后工单并由 Java 创建独立的履约变更申请。
+    fulfillment_change_requested = bool(
+        {"return_method", "pickup_time_window"}.intersection(slots)
+    )
     for ticket in tickets or []:
         if (
             ticket.get("ticketType") == ticket_type
             and str(ticket.get("orderNo") or "").lower() == str(order_no).lower()
-            and ticket.get("status") in active_statuses
+            and (
+                ticket.get("status") in active_statuses
+                or (
+                    fulfillment_change_requested
+                    and ticket.get("status") == "CLOSED"
+                )
+            )
             and (
                 _ticket_has_same_action(ticket, str(analysis.action_type or ""))
                 if not delivery_exception

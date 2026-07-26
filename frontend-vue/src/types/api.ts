@@ -81,6 +81,22 @@ export interface Ticket {
   updatedAt?: string
 }
 
+/** 已提交履约变更的受控子申请；客户侧不会拿到审核人和幂等键。 */
+export interface TicketChangeRequest {
+  requestNo: string
+  parentTicketNo?: string
+  changeType: string
+  previousReturnMethod?: string | null
+  previousPickupTimeWindow?: string | null
+  requestedReturnMethod?: string | null
+  requestedPickupTimeWindow?: string | null
+  parentTicketStatus?: string
+  status: 'PENDING_REVIEW' | 'WAITING_CUSTOMER' | 'APPROVED' | 'REJECTED' | string
+  customerMessage?: string | null
+  createdAt?: string
+  updatedAt?: string
+}
+
 export interface TicketResult {
   status: 'success' | 'failed' | string
   data?: Ticket
@@ -173,6 +189,8 @@ export interface StaffReplyDraft {
   draft_message: string
   /** 草稿生成来源，仅供坐席判断是否需要重点润色。 */
   generation_mode?: 'llm' | 'fallback'
+  /** 模型未可用时的安全原因，不返回供应商异常或请求详情。 */
+  fallback_reason?: 'not_configured' | 'timeout' | 'rate_limit_429' | 'circuit_open' | 'network_error' | '5xx' | 'unsafe_output' | 'generation_error' | null
 }
 
 export interface RagCitationValidation {

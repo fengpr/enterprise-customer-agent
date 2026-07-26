@@ -10,7 +10,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { customerApi } from '@/api/customer'
 import CustomerSidebar from '@/components/customer/CustomerSidebar.vue'
 import { useCustomerSessionStore } from '@/stores/customerSessions'
-import type { Ticket } from '@/types/api'
+import type { Ticket, TicketChangeRequest } from '@/types/api'
 
 type StatusGroup = 'ALL' | 'PROCESSING' | 'SUPPLEMENT' | 'ASSIGN' | 'COMPLETED' | 'CLOSED'
 type TicketTone = 'processing' | 'supplement' | 'assign' | 'completed' | 'closed'
@@ -22,6 +22,8 @@ const { sessions } = storeToRefs(sessionStore)
 const tickets = ref<Ticket[]>([])
 const selectedTicketNo = ref<string | null>(null)
 const selectedDetail = ref<Ticket | null>(null)
+// 改约申请是原工单的受控子记录，客户只能查看状态与客户可见说明。
+const changeRequests = ref<TicketChangeRequest[]>([])
 const loading = ref(false)
 const loadingDetail = ref(false)
 const urgingTicketNo = ref<string | null>(null)
@@ -80,6 +82,21 @@ function resetFilters() { keyword.value = ''; activeStatus.value = 'ALL'; select
 function selectStatus(value: StatusGroup) { activeStatus.value = value; page.value = 1 }
 function isClosed(ticket: Ticket) { return ['CLOSED', 'CANCELLED', 'REJECTED'].includes(ticket.status || '') }
 function needsSupplement(ticket: Ticket) { return ['WAITING_SUPPLEMENT', 'PENDING_SUPPLEMENT'].includes(ticket.status || '') }
+function changeRequestLabel(status: string) {
+  const labels: Record<string, string> = {
+    PENDING_REVIEW: '待人工审核',
+    WAITING_CUSTOMER: '待补充信息',
+    APPROVED: '已同意并更新工单',
+    REJECTED: '暂不支持调整'
+  }
+  return labels[status] || status
+}
+function changeRequestTagType(status: string) {
+  if (status === 'APPROVED') return 'success'
+  if (status === 'REJECTED') return 'danger'
+  if (status === 'WAITING_CUSTOMER') return 'warning'
+  return 'warning'
+}
 
 /** 清理问题描述中的结构化内部标签，客户页只保留用户原始诉求。 */
 function safeContent(value?: string | null) {
@@ -145,9 +162,13 @@ async function selectTicket(ticketNo: string, force = false) {
   try {
     const result = await customerApi.ticket(ticketNo)
     selectedDetail.value = result.data
+    // 子申请与工单详情一起刷新，避免客户误以为改约已直接生效。
+    const changeResult = await customerApi.ticketChangeRequests(ticketNo)
+    if (selectedTicketNo.value === ticketNo) changeRequests.value = changeResult.data
   } catch {
     const fallback = tickets.value.find((item) => item.ticketNo === ticketNo)
     if (!selectedDetail.value && fallback) selectedDetail.value = fallback
+    if (selectedTicketNo.value === ticketNo) changeRequests.value = []
   } finally {
     loadingDetail.value = false
   }
@@ -167,7 +188,7 @@ async function loadPage(showFeedback = false) {
     const targetTicketNo = typeof route.query.ticketNo === 'string' ? route.query.ticketNo : selectedTicketNo.value
     const target = tickets.value.find((item) => item.ticketNo === targetTicketNo) || tickets.value[0]
     if (target) await selectTicket(target.ticketNo, true)
-    else { selectedTicketNo.value = null; selectedDetail.value = null }
+    else { selectedTicketNo.value = null; selectedDetail.value = null; changeRequests.value = [] }
     if (showFeedback) ElMessage.success('工单数据已刷新')
   } catch {
     // 接口错误已统一提示；页面继续展示上一次成功结果。
@@ -250,6 +271,15 @@ onActivated(() => { if (!tickets.value.length) void loadPage() })
             <p><span>关联订单</span>{{ selectedDetail.orderNo || '暂无关联订单' }}</p><p><span>提交时间</span>{{ formatTime(selectedDetail.createdAt) }}</p><p><span>更新时间</span>{{ formatTime(selectedDetail.updatedAt) }}</p>
             <section class="ticket-detail-section"><div v-for="step in timeline" :key="step.label" :class="['ticket-timeline-step', step.state]"><i><CircleCheckFilled v-if="step.state === 'done'" /></i><div><b>{{ step.label }}</b><time v-if="step.time">{{ formatTime(step.time) }}</time><p>{{ step.desc }}</p></div></div></section>
             <section class="ticket-detail-section ticket-safe-fields"><p><span>问题类型</span>{{ ticketTypeLabel(selectedDetail.ticketType) }}</p><p><span>问题描述</span>{{ safeContent(selectedDetail.content || selectedDetail.title) }}</p><p><span>期望解决</span>{{ expectedResolution(selectedDetail) }}</p><p><span>附件</span>暂无客户上传附件</p><p><span>催办记录</span>{{ selectedDetail.urgeCount ? `已催办 ${selectedDetail.urgeCount} 次，最近 ${formatTime(selectedDetail.lastUrgedAt)}` : '暂无催办记录' }}</p><template v-if="selectedDetail.returnMethod || selectedDetail.pickupTimeWindow || selectedDetail.pickupStatus"><p><span>退货方式</span>{{ selectedDetail.returnMethod || '暂无' }}</p><p><span>取件时间</span>{{ selectedDetail.pickupTimeWindow || '暂无' }}</p><p><span>履约状态</span>{{ selectedDetail.pickupStatus || '暂无' }}</p></template><p><span>当前说明</span>{{ statusExplanation(selectedDetail) }}</p></section>
+            <section v-if="changeRequests.length" class="ticket-detail-section ticket-change-requests">
+              <h3>取件/退回方式调整</h3>
+              <article v-for="request in changeRequests" :key="request.requestNo" class="ticket-change-request">
+                <div><b>{{ request.requestedReturnMethod === 'self_ship' ? '自行寄回' : '上门取件' }}</b><el-tag size="small" :type="changeRequestTagType(request.status)">{{ changeRequestLabel(request.status) }}</el-tag></div>
+                <p v-if="request.requestedPickupTimeWindow">期望取件时间：{{ request.requestedPickupTimeWindow }}</p>
+                <p v-if="request.customerMessage" class="ticket-change-message">{{ request.customerMessage }}</p>
+                <small>申请时间：{{ formatTime(request.createdAt) }} · 申请编号：{{ request.requestNo }}</small>
+              </article>
+            </section>
             <el-button class="ticket-detail-contact" type="primary" plain @click="openService({ ticket: selectedDetail, newSession: true })">查看工单详情</el-button>
           </template>
           <el-empty v-else description="请选择一个工单" />
