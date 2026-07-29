@@ -56,12 +56,21 @@ followup_notifications = agent_execution_service.followup_notifications
 BUSINESS_SERVICE_URL = os.getenv("BUSINESS_SERVICE_URL", "http://localhost:8081")
 AGENT_INTERNAL_SECRET = os.getenv("AGENT_INTERNAL_SECRET", "enterprise-customer-agent-demo-internal-secret")
 handoff_recovery_task: asyncio.Task | None = None
+startup_ready_file = os.getenv("AGENT_STARTUP_READY_FILE", "").strip()
 
 
 @app.on_event("startup")
 def startup_checks() -> None:
     """服务启动时只检查外部依赖状态，禁止在线 API 进程承载评测 Worker。"""
     agent.rag.check_startup()
+    if startup_ready_file:
+        # 就绪文件仅在显式配置时生成；用于 loopback 健康探测受限的本地 Windows 环境。
+        ready_path = Path(startup_ready_file).resolve()
+        ready_path.parent.mkdir(parents=True, exist_ok=True)
+        ready_path.write_text(
+            f"pid={os.getpid()}\nready_at={datetime.now(timezone.utc).isoformat()}\n",
+            encoding="utf-8",
+        )
 
 
 @app.on_event("startup")
@@ -80,6 +89,8 @@ async def stop_handoff_recovery() -> None:
             await handoff_recovery_task
         except asyncio.CancelledError:
             pass
+    if startup_ready_file:
+        Path(startup_ready_file).resolve().unlink(missing_ok=True)
 
 
 @app.middleware("http")
@@ -273,7 +284,8 @@ def send_handoff_message(payload: AgentReplyRequest, authorization: str | None =
         }
     )
     try:
-        return agent_execution_service.execute(execution_payload)
+        # 人工通道使用专用持久化入口，避免未来 execute() 新增节点时误进入 AI 链路。
+        return agent_execution_service.save_handoff_message(execution_payload)
     except AgentExecutionAccessDenied as exc:
         # 不能通过人工通道跨会话写入客户消息。
         raise HTTPException(status_code=403, detail=str(exc)) from exc
@@ -587,7 +599,7 @@ def cancel_customer_handoff(session_id: str, authorization: str | None = Header(
         sender_type="system",
         sender_id="handoff",
         content="您已取消人工客服排队，可继续使用智能助手。",
-        extra_data={"message_source": "handoff_cancelled", "customer_visible": True},
+        extra_data={"route_target": "human", "message_source": "handoff_cancelled", "customer_visible": True},
     )
     return {"status": "success", "session": _customer_session_payload(session)}
 
@@ -624,6 +636,30 @@ def list_customer_tickets(authorization: str | None = Header(default=None)) -> l
     if result.get("status") == "success":
         return result["data"]
     raise HTTPException(status_code=503, detail="业务工单列表服务暂时不可用")
+
+
+@app.post("/api/internal/tickets/status-sync")
+def sync_ticket_status_to_conversation(payload: dict[str, Any], internal_secret: str | None = Header(default=None, alias="X-Agent-Internal-Secret")) -> dict[str, Any]:
+    """接收 Java 工单状态回调，并写入同一关联客户会话。"""
+    if internal_secret != AGENT_INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="内部服务身份校验失败")
+    ticket_no, session_id = str(payload.get("ticketNo") or "").strip(), str(payload.get("externalSessionNo") or "").strip()
+    if not ticket_no or not session_id:
+        raise HTTPException(status_code=400, detail="工单状态同步缺少必要关联字段")
+    session = chat_sessions.get_by_session_no(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="未找到工单关联会话")
+    _ensure_ticket_session_customer_match(ticket_no, payload, session)
+    status = str(payload.get("status") or "PROCESSING").upper()
+    # 同一状态回调允许安全重放，避免网络重试生成重复客户提示。
+    for item in reversed(chat_messages.list_by_session(session_id)):
+        extra = item.get("extra_data") or {}
+        if extra.get("message_source") == "ticket_status_sync" and extra.get("ticket_no") == ticket_no and extra.get("ticket_status") == status:
+            return {"status": "duplicate", "session_id": session_id}
+    label = {"PENDING_ASSIGN": "待分派", "PENDING_PROCESS": "待处理", "PROCESSING": "处理中", "REOPENED": "已重新打开", "CLOSED": "已处理完成"}.get(status, status)
+    chat_messages.save(session_id, "system", f"工单 {ticket_no} 状态已更新为“{label}”。", sender_id="ticket-status-sync", extra_data={"route_target": "human", "message_source": "ticket_status_sync", "customer_visible": True, "ticket_no": ticket_no, "ticket_status": status})
+    chat_sessions.update_status(session_id, "TICKET_STATUS_UPDATED")
+    return {"status": "success", "session_id": session_id}
 
 
 @app.post("/api/customer/tickets/{ticket_no}/urge")
@@ -809,6 +845,8 @@ def send_staff_ticket_reply(
         content=message,
         extra_data={
             "ticket_no": ticket_no,
+            # 通道路由是后端持久化契约，前端不得依据 sender_type 猜测消息应显示在哪个页签。
+            "route_target": "human",
             "customer_visible": True,
             "message_source": "staff_confirmed_reply",
             "staff_user": {
@@ -932,7 +970,7 @@ def accept_staff_handoff_session(session_id: str, authorization: str | None = He
         sender_type="system",
         sender_id="handoff",
         content=f"{staff_user.get('display_name') or '客服坐席'} 已接入人工服务。",
-        extra_data={"message_source": "handoff_accepted", "customer_visible": True},
+        extra_data={"route_target": "human", "message_source": "handoff_accepted", "customer_visible": True},
     )
     return {"status": "success", "session": _handoff_session_payload(accepted)}
 
@@ -955,6 +993,7 @@ def send_staff_handoff_reply(
         sender_id=str(staff_user.get("user_id")),
         content=message,
         extra_data={
+            "route_target": "human",
             "customer_visible": True,
             "message_source": "manual_handoff_reply",
             "staff_user": {
@@ -984,7 +1023,7 @@ def close_staff_handoff_session(
         sender_type="system",
         sender_id="handoff",
         content=content,
-        extra_data={"message_source": "handoff_closed", "customer_visible": True, "target_status": "AI_ONLY"},
+        extra_data={"route_target": "human", "message_source": "handoff_closed", "customer_visible": True, "target_status": "AI_ONLY"},
     )
     return {"status": "success", "session": _handoff_session_payload(closed)}
 
@@ -1034,7 +1073,7 @@ async def _recover_stale_handoffs() -> None:
                     sender_type="system",
                     sender_id="handoff",
                     content="当前人工客服已离线，您的会话已重新进入排队，我们会尽快安排其他客服接入。",
-                    extra_data={"message_source": "handoff_requeued", "customer_visible": True},
+                    extra_data={"route_target": "human", "message_source": "handoff_requeued", "customer_visible": True},
                 )
 
 
@@ -1214,6 +1253,7 @@ def _find_ticket_chat_context(ticket_no: str, ticket: dict | None = None) -> dic
     if external_session_no:
         session = chat_sessions.get_by_session_no(external_session_no)
         if session:
+            _ensure_ticket_session_customer_match(ticket_no, ticket or {}, session)
             # 新工单已强关联 Python 会话编号，坐席回复无需再扫描历史消息扩展字段。
             return {
                 "session": session,
@@ -1224,7 +1264,23 @@ def _find_ticket_chat_context(ticket_no: str, ticket: dict | None = None) -> dic
     context = chat_messages.find_ticket_context(ticket_no)
     if not context:
         raise HTTPException(status_code=404, detail="未找到该工单关联的客户会话")
+    _ensure_ticket_session_customer_match(ticket_no, ticket or {}, context["session"])
     return context
+
+
+def _ensure_ticket_session_customer_match(ticket_no: str, ticket: dict[str, Any], session: dict[str, Any]) -> None:
+    """校验 Java 工单与 Python 会话属于同一客户，阻断错误关联和跨客户消息写入。"""
+    ticket_customer_id = ticket.get("customerId", ticket.get("customer_id"))
+    session_customer_id = session.get("customer_id")
+    # 兼容旧工单缺少 customerId 的历史数据；新数据一旦携带归属就必须严格一致。
+    if ticket_customer_id is None or session_customer_id is None:
+        return
+    try:
+        matched = int(ticket_customer_id) == int(session_customer_id)
+    except (TypeError, ValueError):
+        matched = False
+    if not matched:
+        raise HTTPException(status_code=409, detail=f"工单 {ticket_no} 与关联会话的客户归属不一致")
 
 
 def _build_staff_reply_draft(ticket: dict, close_reason: str) -> str:

@@ -95,7 +95,7 @@ def test_handoff_message_is_persisted_without_creating_agent_queue_job(monkeypat
     called = {}
 
     class FakeExecutionService:
-        def execute(self, payload):
+        def save_handoff_message(self, payload):
             called["payload"] = payload
             return {"session_id": "session-human", "answer": "已记录", "customer_message": "已记录"}
 

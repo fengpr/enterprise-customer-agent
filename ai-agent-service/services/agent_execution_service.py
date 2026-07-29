@@ -85,6 +85,7 @@ class AgentExecutionService:
         session_id = session["session_id"]
         route_target = payload.route_target or "ai"
         if route_target == "human":
+            # 人工通道只保存客户补充信息，绝不能继续进入检索、工具或模型生成链路。
             return self._save_manual_handoff_message(session_id, payload, session)
 
         pending_action_request = self._latest_pending_action_request(session_id)
@@ -411,6 +412,15 @@ class AgentExecutionService:
                 return existing
             raise AgentExecutionAccessDenied("无权访问该会话")
         return self.chat_sessions.create(payload.customer_id, payload.message)
+
+    def save_handoff_message(self, payload: AgentReplyRequest) -> dict[str, Any]:
+        """保存客户发送到人工通道的消息。
+
+        该公开方法是 API 人工消息接口的唯一执行入口：只做会话归属校验、
+        人工接管状态维护与消息持久化，不触发 Agent、RAG、工具调用或 LLM。
+        """
+        session = self._get_or_create_session(payload)
+        return self._save_manual_handoff_message(session["session_id"], payload, session)
 
     def _latest_pending_action_request(self, session_id: str) -> dict[str, Any] | None:
         """读取最近未完成动作，保持多轮槽位补全行为不变。"""

@@ -17,7 +17,9 @@ $runtimeDir = Join-Path $Root ".runtime"
 $javaPidFile = Join-Path $runtimeDir "business-service.json"
 $javaLogFile = Join-Path $runtimeDir "business-service.log"
 $javaErrorLogFile = Join-Path $runtimeDir "business-service-error.log"
+$javaReadyFile = Join-Path $runtimeDir "business-service.ready"
 $agentLogFile = Join-Path $runtimeDir "agent-api.log"
+$agentReadyFile = Join-Path $runtimeDir "agent-api.ready"
 $agentWorkerLogFile = Join-Path $runtimeDir "agent-worker-v2.log"
 $followupWorkerLogFile = Join-Path $runtimeDir "followup-worker-v2.log"
 $summaryWorkerLogFile = Join-Path $runtimeDir "conversation-summary-worker-v1.log"
@@ -29,9 +31,11 @@ function Test-PortOpen {
         try {
             # Get-NetTCPConnection 在普通 Windows 用户下可能无权读取，改用实际 TCP 连接判断。
             & $script:python -c "import socket, sys; connection = socket.create_connection(('127.0.0.1', int(sys.argv[1])), timeout=0.8); connection.close()" $Port 2>$null
-            return $LASTEXITCODE -eq 0
+            if ($LASTEXITCODE -eq 0) {
+                return $true
+            }
         } catch {
-            return $false
+            # 受限桌面容器可能禁止 loopback 客户端连接，继续使用监听表进行只读兜底。
         }
     }
     return [bool](Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
@@ -45,6 +49,27 @@ function Wait-PortOpen {
     }
     Write-Warning "$Name did not listen on port $Port within $TimeoutSeconds seconds."
     return $false
+}
+
+function Test-ProcessReadyMarker {
+    param([string]$MarkerPath)
+    if (-not (Test-Path $MarkerPath)) {
+        return $false
+    }
+    try {
+        $content = Get-Content -Raw -Path $MarkerPath
+        $pidMatch = [regex]::Match($content, "(?m)^pid=(\d+)$")
+        if (-not $pidMatch.Success) {
+            Remove-Item -Path $MarkerPath -Force -ErrorAction SilentlyContinue
+            return $false
+        }
+        $process = Get-Process -Id ([int]$pidMatch.Groups[1].Value) -ErrorAction Stop
+        return $null -ne $process
+    } catch {
+        # 进程异常退出时清除旧标记，防止后续启动误判为服务仍然可用。
+        Remove-Item -Path $MarkerPath -Force -ErrorAction SilentlyContinue
+        return $false
+    }
 }
 
 function Test-TcpEndpoint {
@@ -105,16 +130,84 @@ function Wait-TcpEndpoint {
     return $false
 }
 
+function Start-CleanPowerShellProcess {
+    param(
+        [string]$Title,
+        [string]$WorkingDirectory,
+        [string]$Command,
+        [string]$StandardOutputLog = "",
+        [string]$StandardErrorLog = ""
+    )
+    # Codex、IDE 或旧终端有时会同时注入 Path/PATH。PowerShell 5.1 的 Start-Process
+    # 会把它们放入大小写不敏感字典，从而在真正启动服务前直接报重复键异常。
+    # 通过 cmd 的 start 命令脱离当前 PowerShell 进程，可避免该已知兼容问题。
+    New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
+    $safeTitle = ($Title -replace "[^a-zA-Z0-9]+", "-").Trim("-").ToLowerInvariant()
+    $launcherPath = Join-Path $runtimeDir ("launcher-" + $safeTitle + ".ps1")
+    $outputPath = if ($StandardOutputLog) { $StandardOutputLog } else { Join-Path $runtimeDir ("$safeTitle.log") }
+    $errorPath = if ($StandardErrorLog) { $StandardErrorLog } else { $outputPath }
+    $redirection = if ($outputPath -eq $errorPath) {
+        # stdout/stderr 写同一文件时必须使用一个合并重定向，两个 Out-File 句柄会互相抢占。
+        "*>> '$outputPath'"
+    } else {
+        "1>> '$outputPath' 2>> '$errorPath'"
+    }
+
+    # 启动器中只保留服务需要的环境变量和命令，实际输出全部写到 .runtime，便于故障排查。
+    $launcher = @"
+Set-Location '$WorkingDirectory'
+`$ErrorActionPreference = 'Continue'
+try {
+    & {
+        $Command
+    } $redirection
+} catch {
+    `$_ | Out-String | Add-Content -Path '$errorPath' -Encoding UTF8
+}
+"@
+    Set-Content -Path $launcherPath -Value $launcher -Encoding UTF8
+
+    # 直接启动已生成的脚本，避免 cmd start 在宿主作业对象中继承输出句柄后无法返回。
+    return Start-Process -FilePath "powershell.exe" `
+        -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$launcherPath`"") `
+        -WorkingDirectory $WorkingDirectory `
+        -WindowStyle Hidden `
+        -PassThru
+}
+
+function Start-CleanCmdProcess {
+    param(
+        [string]$Title,
+        [string]$WorkingDirectory,
+        [string[]]$EnvironmentLines,
+        [string]$Command,
+        [string]$StandardOutputLog,
+        [string]$StandardErrorLog
+    )
+    # Java/Maven 通过 PowerShell 重定向时会长期占用日志文件，使主启动器无法实时读取就绪标记。
+    # 使用独立 cmd 启动器让原生进程直接写日志，同时避开 Start-Process 的 Path/PATH 重复键问题。
+    New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
+    $safeTitle = ($Title -replace "[^a-zA-Z0-9]+", "-").Trim("-").ToLowerInvariant()
+    $launcherPath = Join-Path $runtimeDir ("launcher-" + $safeTitle + ".cmd")
+    $lines = @(
+        "@echo off",
+        "cd /d `"$WorkingDirectory`""
+    )
+    $lines += $EnvironmentLines
+    $lines += "call $Command 1>>`"$StandardOutputLog`" 2>>`"$StandardErrorLog`""
+    Set-Content -Path $launcherPath -Value $lines -Encoding ASCII
+
+    return Start-Process -FilePath $env:ComSpec `
+        -ArgumentList @("/d", "/c", "`"$launcherPath`"") `
+        -WorkingDirectory $WorkingDirectory `
+        -WindowStyle Hidden `
+        -PassThru
+}
+
 function Start-ServiceWindow {
     param([string]$Title, [string]$WorkingDirectory, [string]$Command, [string]$LogFile = "")
-    # 使用 Transcript 记录子窗口输出。不能用 `*>&1 | Tee-Object`：Uvicorn 会把正常 INFO
-    # 写入 stderr，PowerShell 会将其格式化成 NativeCommandError，造成“启动报错”的误解。
-    if ($LogFile) {
-        $script = "`$Host.UI.RawUI.WindowTitle = '$Title'; Set-Location '$WorkingDirectory'; Start-Transcript -Path '$LogFile' -Append -Force | Out-Null; try { $Command } finally { Stop-Transcript | Out-Null }"
-    } else {
-        $script = "`$Host.UI.RawUI.WindowTitle = '$Title'; Set-Location '$WorkingDirectory'; $Command"
-    }
-    Start-Process powershell.exe -ArgumentList "-NoExit", "-ExecutionPolicy", "Bypass", "-Command", $script -WorkingDirectory $WorkingDirectory -WindowStyle Normal
+    # 服务改为隐藏后台进程运行；可诊断信息统一写入 .runtime，避免多个弹窗和不可读 Transcript。
+    return Start-CleanPowerShellProcess -Title $Title -WorkingDirectory $WorkingDirectory -Command $Command -StandardOutputLog $LogFile
 }
 
 function Test-AgentHealthy {
@@ -131,6 +224,22 @@ function Wait-AgentHealthy {
     param([int]$TimeoutSeconds = 120)
     for ($attempt = 0; $attempt -lt $TimeoutSeconds; $attempt++) {
         if (Test-AgentHealthy) { return $true }
+        if (Test-Path $agentReadyFile) {
+            return $true
+        }
+        if (Test-Path $agentLogFile) {
+            $recentLog = Get-Content -Path $agentLogFile -Tail 40 -ErrorAction SilentlyContinue | Out-String
+            # Codex/MSIX 等受限容器可能同时禁止 loopback、监听表和子进程 PID 映射。
+            # 日志在本次启动前已清空，因此 Uvicorn 明确输出完成标记即可作为本地启动兜底。
+            if ($recentLog -match "Application startup complete") {
+                Write-Warning "Agent health endpoint is unreachable from the launcher; the current startup log confirms readiness."
+                return $true
+            }
+            if ($recentLog -match "Traceback \\(most recent call last\\)|Application startup failed") {
+                Write-Warning "AI Agent API exited before health check completed."
+                return $false
+            }
+        }
         Start-Sleep -Seconds 1
     }
     return $false
@@ -181,14 +290,48 @@ function Stop-ManagedJavaProcess {
 
 function Wait-JavaHealthy {
     # 等待 Spring Boot 完成 Maven 编译、数据库初始化与 Actuator 就绪。
+    # 若 JVM 已明确退出，立即结束等待，不能让用户误以为启动脚本卡死。
     param([int]$TimeoutSeconds = 90)
     for ($attempt = 0; $attempt -lt $TimeoutSeconds; $attempt++) {
         if (Test-JavaHealthy) {
             return $true
         }
+        # Spring ApplicationReadyEvent 写入独立标记，避免受限 Windows 环境无法访问 loopback，
+        # 以及运行中的 Java 独占 stdout 日志导致健康等待无法读取实时内容。
+        if (Test-Path $javaReadyFile) {
+            return $true
+        }
+        if (Test-Path $javaLogFile) {
+            $recentLog = Get-Content -Path $javaLogFile -Tail 20 -ErrorAction SilentlyContinue | Out-String
+            if ($recentLog -match "Started BusinessServiceApplication") {
+                Write-Warning "Java health endpoint is unreachable from the launcher; the current startup log confirms readiness."
+                return $true
+            }
+            if ($recentLog -match "Application run failed|BUILD FAILURE|Process terminated with exit code") {
+                Write-Warning "Java business-service exited before health check completed."
+                return $false
+            }
+        }
         Start-Sleep -Seconds 1
     }
     return $false
+}
+
+function Get-BusinessServiceJavaHome {
+    # 项目编译目标为 Java 17。优先使用 PATH 中的 Java 17，避免 Maven 继承到
+    # 本机其他版本的 JAVA_HOME 后出现 Tomcat/NIO 运行时兼容问题。
+    $javaCommand = Get-Command java.exe -ErrorAction SilentlyContinue
+    if (-not $javaCommand) {
+        return $null
+    }
+    $javaHome = Split-Path -Parent (Split-Path -Parent $javaCommand.Source)
+    $javaExecutable = Join-Path $javaHome "bin\java.exe"
+    if (-not (Test-Path $javaExecutable)) {
+        return $null
+    }
+    # java -version 会把正常版本信息写到 stderr；全局 Stop 策略下会被 PowerShell
+    # 误包装为 NativeCommandError，因此不在这里二次调用 java，直接使用 PATH 解析结果。
+    return $javaHome
 }
 
 function Start-ManagedJavaService {
@@ -206,22 +349,46 @@ function Start-ManagedJavaService {
     }
 
     New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
-    Remove-Item -Path $javaPidFile, $javaLogFile, $javaErrorLogFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $javaPidFile, $javaLogFile, $javaErrorLogFile, $javaReadyFile -Force -ErrorAction SilentlyContinue
     Write-Host "Starting managed Java business-service on port 8081..."
-    # 以 cmd /c 持有 Maven 父进程，关闭时使用 taskkill /T 能同时结束 Maven 与其 Java 子进程。
-    $process = Start-Process -FilePath "cmd.exe" -ArgumentList @("/d", "/c", "mvn spring-boot:run") `
-        -WorkingDirectory (Join-Path $Root "business-service") -WindowStyle Hidden -PassThru `
-        -RedirectStandardOutput $javaLogFile -RedirectStandardError $javaErrorLogFile
-    $metadata = [pscustomobject]@{
-        pid = $process.Id
-        started_at = $process.StartTime.ToUniversalTime().ToString("o")
-        command = "mvn spring-boot:run"
-        working_directory = (Join-Path $Root "business-service")
+    $javaHome = Get-BusinessServiceJavaHome
+    $javaEnvironment = @(
+        # 本地 Windows 可能无法创建 NIO Selector 的内部 loopback Pipe。通过显式环境开关
+        # 启用项目内 NIO2/IOCP 连接器，生产部署未设置该变量时仍使用 Spring Boot 默认协议。
+        'set "BUSINESS_TOMCAT_NIO2_ENABLED=true"',
+        "set `"BUSINESS_STARTUP_READY_FILE=$javaReadyFile`""
+    )
+    if ($javaHome) {
+        # Maven 会优先读取 JAVA_HOME，因此显式锁定到项目声明的 Java 17。
+        $javaEnvironment += "set `"JAVA_HOME=$javaHome`""
+        Write-Host "Using Java 17 runtime: $javaHome"
+    } else {
+        Write-Warning "Java 17 was not found on PATH; Maven will use the current JAVA_HOME."
     }
-    $metadata | ConvertTo-Json | Set-Content -Path $javaPidFile -Encoding UTF8
+    # 以独立 cmd 持有 Maven 父进程，关闭时使用 taskkill /T 能同时结束 Maven 与其 Java 子进程。
+    Start-CleanCmdProcess -Title "business-service :8081" `
+        -WorkingDirectory (Join-Path $Root "business-service") `
+        -EnvironmentLines $javaEnvironment `
+        -Command "mvn spring-boot:run" `
+        -StandardOutputLog $javaLogFile `
+        -StandardErrorLog $javaErrorLogFile
 
     if (Wait-JavaHealthy 90) {
-        Write-Host "Java business-service is healthy (PID $($process.Id))."
+        # 通过实际监听端口获取 JVM PID；脚本中断或重启后也能准确管理该服务。
+        $listener = Get-NetTCPConnection -LocalPort 8081 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+        $process = if ($listener) { Get-Process -Id $listener.OwningProcess -ErrorAction SilentlyContinue } else { $null }
+        if ($process) {
+            $metadata = [pscustomobject]@{
+                pid = $process.Id
+                started_at = $process.StartTime.ToUniversalTime().ToString("o")
+                command = "mvn spring-boot:run"
+                working_directory = (Join-Path $Root "business-service")
+            }
+            $metadata | ConvertTo-Json | Set-Content -Path $javaPidFile -Encoding UTF8
+            Write-Host "Java business-service is healthy (PID $($process.Id))."
+        } else {
+            Write-Host "Java business-service is healthy."
+        }
         return $true
     }
 
@@ -376,14 +543,14 @@ if (-not $SkipDocker) {
     }
 }
 
-$javaReady = $SkipJava -or (Test-JavaHealthy)
+$javaReady = $SkipJava -or (Test-JavaHealthy) -or (Test-ProcessReadyMarker $javaReadyFile)
 if (-not $SkipJava -and -not $javaReady) {
     $javaReady = Start-ManagedJavaService
 } elseif (-not $SkipJava) {
     Write-Host "Java business-service is already healthy on port 8081."
 }
 
-$agentReady = $SkipAgent -or (Test-AgentHealthy)
+$agentReady = $SkipAgent -or (Test-AgentHealthy) -or (Test-ProcessReadyMarker $agentReadyFile)
 if (-not $SkipAgent) {
     if (-not (Test-Path $python)) {
         Write-Warning "Python virtual environment is missing: $python"
@@ -407,9 +574,10 @@ if (-not $SkipAgent) {
                 $agentReady = $false
             } else {
                 New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
-                Remove-Item -Path $agentLogFile -Force -ErrorAction SilentlyContinue
+                Remove-Item -Path $agentLogFile, $agentReadyFile -Force -ErrorAction SilentlyContinue
                 Write-Host "Starting AI Agent API on port 8000..."
-                Start-ServiceWindow "ai-agent-service :8000" $agentDir "`$env:REDIS_URL='$RedisUrl'; `$env:BUSINESS_SERVICE_URL='$BusinessServiceUrl'; `$env:AGENT_EXECUTION_QUEUE_ENABLED='$queueEnabled'; `$env:DB_PROVIDER='$databaseProvider'; `$env:RAG_STORE_BACKEND='$ragStoreBackend'; .\.venv\Scripts\python.exe -m uvicorn app:app --reload --port 8000" $agentLogFile
+                # 一键运行使用单进程 Uvicorn，避免 --reload 的父子进程使停止、PID 和就绪判断不稳定。
+                $null = Start-ServiceWindow "ai-agent-service :8000" $agentDir "`$env:REDIS_URL='$RedisUrl'; `$env:BUSINESS_SERVICE_URL='$BusinessServiceUrl'; `$env:AGENT_STARTUP_READY_FILE='$agentReadyFile'; `$env:AGENT_EXECUTION_QUEUE_ENABLED='$queueEnabled'; `$env:DB_PROVIDER='$databaseProvider'; `$env:RAG_STORE_BACKEND='$ragStoreBackend'; .\.venv\Scripts\python.exe -m uvicorn app:app --port 8000" $agentLogFile
                 # Agent 初始化包含 RAG、Repository 和模型配置加载，必须通过健康检查再启动前端。
                 $agentReady = Wait-AgentHealthy 120
             }
@@ -427,7 +595,7 @@ if (-not $SkipAgent) {
             if (-not $workerAlive) {
                 Write-Host "Starting Agent Worker..."
                 Remove-Item -Path $agentWorkerLogFile -Force -ErrorAction SilentlyContinue
-                Start-ServiceWindow "agent-worker" $agentDir "`$env:REDIS_URL='$RedisUrl'; `$env:BUSINESS_SERVICE_URL='$BusinessServiceUrl'; `$env:AGENT_EXECUTION_QUEUE_ENABLED='true'; `$env:AGENT_WORKER_NAME='local-agent-worker'; `$env:DB_PROVIDER='$databaseProvider'; `$env:RAG_STORE_BACKEND='$ragStoreBackend'; .\.venv\Scripts\python.exe -m rag.agent_execution_worker" $agentWorkerLogFile
+                $null = Start-ServiceWindow "agent-worker" $agentDir "`$env:REDIS_URL='$RedisUrl'; `$env:BUSINESS_SERVICE_URL='$BusinessServiceUrl'; `$env:AGENT_EXECUTION_QUEUE_ENABLED='true'; `$env:AGENT_WORKER_NAME='local-agent-worker'; `$env:DB_PROVIDER='$databaseProvider'; `$env:RAG_STORE_BACKEND='$ragStoreBackend'; .\.venv\Scripts\python.exe -m rag.agent_execution_worker" $agentWorkerLogFile
                 for ($attempt = 0; $attempt -lt 10 -and -not $workerAlive; $attempt++) {
                     Start-Sleep -Seconds 1
                     $workerAlive = Test-AgentWorkerAlive $agentDir
@@ -445,7 +613,7 @@ if (-not $SkipAgent) {
             if (-not $followupWorkerAlive) {
                 Write-Host "Starting Scheduled Follow-up Worker..."
                 Remove-Item -Path $followupWorkerLogFile -Force -ErrorAction SilentlyContinue
-                Start-ServiceWindow "followup-worker" $agentDir "`$env:REDIS_URL='$RedisUrl'; `$env:BUSINESS_SERVICE_URL='$BusinessServiceUrl'; `$env:DB_PROVIDER='$databaseProvider'; .\.venv\Scripts\python.exe -m rag.scheduled_followup_worker" $followupWorkerLogFile
+                $null = Start-ServiceWindow "followup-worker" $agentDir "`$env:REDIS_URL='$RedisUrl'; `$env:BUSINESS_SERVICE_URL='$BusinessServiceUrl'; `$env:DB_PROVIDER='$databaseProvider'; .\.venv\Scripts\python.exe -m rag.scheduled_followup_worker" $followupWorkerLogFile
                 for ($attempt = 0; $attempt -lt 10 -and -not $followupWorkerAlive; $attempt++) {
                     Start-Sleep -Seconds 1
                     $followupWorkerAlive = Test-FollowupWorkerAlive $agentDir
@@ -461,7 +629,7 @@ if (-not $SkipAgent) {
             if (-not $summaryWorkerAlive) {
                 Write-Host "Starting Conversation Summary Worker..."
                 Remove-Item -Path $summaryWorkerLogFile -Force -ErrorAction SilentlyContinue
-                Start-ServiceWindow "conversation-summary-worker" $agentDir "`$env:REDIS_URL='$RedisUrl'; `$env:DB_PROVIDER='$databaseProvider'; `$env:CONVERSATION_SUMMARY_ENABLED='true'; .\.venv\Scripts\python.exe -m rag.conversation_summary_worker" $summaryWorkerLogFile
+                $null = Start-ServiceWindow "conversation-summary-worker" $agentDir "`$env:REDIS_URL='$RedisUrl'; `$env:DB_PROVIDER='$databaseProvider'; `$env:CONVERSATION_SUMMARY_ENABLED='true'; .\.venv\Scripts\python.exe -m rag.conversation_summary_worker" $summaryWorkerLogFile
                 for ($attempt = 0; $attempt -lt 10 -and -not $summaryWorkerAlive; $attempt++) {
                     Start-Sleep -Seconds 1
                     $summaryWorkerAlive = Test-ConversationSummaryWorkerAlive $agentDir
@@ -486,7 +654,7 @@ if (-not $SkipFrontend -and -not (Test-PortOpen 5173)) {
         New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
         Remove-Item -Path $frontendLogFile -Force -ErrorAction SilentlyContinue
         Write-Host "Starting frontend-vue on port 5173..."
-        Start-ServiceWindow "frontend-vue :5173" (Join-Path $Root "frontend-vue") "npm run dev" $frontendLogFile
+        $null = Start-ServiceWindow "frontend-vue :5173" (Join-Path $Root "frontend-vue") "npm run dev" $frontendLogFile
         if (-not (Wait-PortOpen 5173 45 "frontend-vue")) {
             Write-Warning "frontend-vue did not become ready. See $frontendLogFile"
             Get-Content -Path $frontendLogFile -Tail 40 -ErrorAction SilentlyContinue | ForEach-Object { Write-Warning $_ }

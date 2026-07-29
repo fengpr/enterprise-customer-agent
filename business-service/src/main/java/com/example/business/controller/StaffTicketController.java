@@ -10,6 +10,7 @@ import com.example.business.entity.TicketStatus;
 import com.example.business.entity.TicketChangeRequest;
 import com.example.business.service.AuthService;
 import com.example.business.service.TicketService;
+import com.example.business.service.TicketConversationNotifier;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -37,13 +38,16 @@ import java.util.stream.Collectors;
 public class StaffTicketController {
     private final TicketService ticketService;
     private final AuthService authService;
+    private final TicketConversationNotifier ticketConversationNotifier;
 
     public StaffTicketController(
             TicketService ticketService,
-            AuthService authService
+            AuthService authService,
+            TicketConversationNotifier ticketConversationNotifier
     ) {
         this.ticketService = ticketService;
         this.authService = authService;
+        this.ticketConversationNotifier = ticketConversationNotifier;
     }
 
     /**
@@ -123,7 +127,9 @@ public class StaffTicketController {
     ) {
         CurrentUser user = authService.requireStaff(authorization);
         assertTicketOwnedByStaff(ticketService.detail(ticketNo), user);
-        return ticketService.updateStatus(ticketNo, request.status());
+        SupportTicket updated = ticketService.updateStatus(ticketNo, request.status());
+        ticketConversationNotifier.notifyStatusChanged(updated);
+        return updated;
     }
 
     /**
@@ -142,7 +148,9 @@ public class StaffTicketController {
     ) {
         CurrentUser user = authService.requireStaff(authorization);
         assertTicketOwnedByStaff(ticketService.detail(ticketNo), user);
-        return ticketService.close(ticketNo);
+        SupportTicket closed = ticketService.close(ticketNo);
+        ticketConversationNotifier.notifyStatusChanged(closed);
+        return closed;
     }
 
     /** 查询本人负责工单下待审核或历史履约变更申请。 */
